@@ -128,18 +128,18 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
         event_name: &str,
         _payload: &M,
         microstep_limit: usize,
-    ) {
+    ) -> bool {
         if self.status != InstanceStatus::Running {
-            return;
+            return false;
         }
         let Some(compiled) = self.compiled.as_ref() else {
-            return;
+            return false;
         };
         let Some(event) = compiled.event(event_name) else {
-            return;
+            return false;
         };
         let Some(transition) = self.select_transition(Some(event)) else {
-            return;
+            return false;
         };
 
         self.take_transition(transition);
@@ -147,6 +147,7 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
         if self.status == InstanceStatus::Running {
             self.stabilize(microstep_limit, 1);
         }
+        true
     }
 
     fn stabilize(&mut self, limit: usize, mut transitions_taken: usize) {

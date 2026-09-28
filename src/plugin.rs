@@ -10,6 +10,7 @@ use std::{
 use bevy_app::{App, Plugin};
 use bevy_asset::{AssetApp, AssetServer, Assets};
 use bevy_ecs::{
+    change_detection::DetectChangesMut,
     entity::EntityHashSet,
     event::{EntityEvent, Event},
     prelude::{Commands, Component, Entity, Mut, Query, Res, ResMut, Resource, With},
@@ -518,12 +519,19 @@ fn process_events<D: Send + Sync + 'static>(
 }
 
 fn process_binding<D: Send + Sync + 'static>(
-    instance: &mut StateTreeInstance<D>,
+    instance: &mut Mut<'_, StateTreeInstance<D>>,
     binding: EventBindingId,
     bindings: &StateTreeEventBindings<D>,
     microstep_limit: usize,
 ) {
-    instance.process_event(&bindings.authored_names[binding.0], &(), microstep_limit);
+    let changed = instance.bypass_change_detection().process_event(
+        &bindings.authored_names[binding.0],
+        &(),
+        microstep_limit,
+    );
+    if changed {
+        instance.set_changed();
+    }
 }
 
 #[cfg(test)]
@@ -532,7 +540,7 @@ mod tests {
     use bevy_asset::{AssetPlugin, Assets};
     use bevy_ecs::{
         event::{EntityEvent, Event},
-        prelude::Entity,
+        prelude::{Changed, Entity},
         schedule::ScheduleBuildSettings,
         system::{In, RunSystemOnce},
     };
@@ -557,6 +565,9 @@ mod tests {
 
     #[derive(Event)]
     struct AdvanceAll;
+
+    #[derive(Resource, Default)]
+    struct ChangedInstances(usize);
 
     fn definition() -> StateTreeDefinition {
         let mut builder = StateTreeBuilder::new("messages");
@@ -622,6 +633,13 @@ mod tests {
 
     fn write_advance_all(mut writer: BroadcastStateTreeEventWriter<Simulation, AdvanceAll>) {
         writer.write(AdvanceAll);
+    }
+
+    fn record_changed_instances(
+        instances: Query<(), Changed<StateTreeInstance<Simulation>>>,
+        mut changed: ResMut<ChangedInstances>,
+    ) {
+        changed.0 = instances.iter().count();
     }
 
     fn queue_advance(app: &mut App, entity: Entity) {
@@ -733,6 +751,32 @@ mod tests {
         queue_advance(&mut app, entity);
         app.update();
         assert_eq!(active_leaf(&app, entity), "active");
+    }
+
+    #[test]
+    fn ignored_events_do_not_mark_instances_changed() {
+        let mut app = app();
+        app.init_resource::<ChangedInstances>().add_systems(
+            Update,
+            record_changed_instances.after(StateTreeSet::ProcessEvents),
+        );
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+
+        queue_reset(&mut app, entity);
+        app.update();
+        assert_eq!(app.world().resource::<ChangedInstances>().0, 0);
+
+        queue_advance(&mut app, entity);
+        app.update();
+        assert_eq!(app.world().resource::<ChangedInstances>().0, 1);
     }
 
     #[test]
