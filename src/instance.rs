@@ -11,7 +11,7 @@ use bevy_asset::{AssetId, Handle};
 use bevy_ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld};
 
 use crate::definition::{CompiledDefinition, EventId, StateId, StateKind, Transition};
-use crate::{StateTreeDefinition, plugin::StateTreeEventInbox};
+use crate::{StateTreeDefinition, StateTreeDomain, plugin::StateTreeEventInbox};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -54,7 +54,7 @@ pub enum RuntimeFault {
 #[derive(Component, Debug)]
 #[component(on_remove = release_event_inbox::<D>)]
 #[require(PendingStateTree<D>, StateTreeEventInbox<D>)]
-pub struct StateTreeInstance<D: Send + Sync + 'static> {
+pub struct StateTreeInstance<D: StateTreeDomain> {
     runtime_id: u64,
     definition: Handle<StateTreeDefinition>,
     compiled: Option<Arc<CompiledDefinition>>,
@@ -64,7 +64,7 @@ pub struct StateTreeInstance<D: Send + Sync + 'static> {
     marker: PhantomData<fn() -> D>,
 }
 
-fn release_event_inbox<D: Send + Sync + 'static>(mut world: DeferredWorld, context: HookContext) {
+fn release_event_inbox<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
     let mut entity = world.entity_mut(context.entity);
     let Some(mut inbox) = entity.get_mut::<StateTreeEventInbox<D>>() else {
         return;
@@ -72,7 +72,7 @@ fn release_event_inbox<D: Send + Sync + 'static>(mut world: DeferredWorld, conte
     inbox.release_storage();
 }
 
-impl<D: Send + Sync + 'static> StateTreeInstance<D> {
+impl<D: StateTreeDomain> StateTreeInstance<D> {
     /// Creates an instance waiting for its definition asset.
     pub fn new(definition: Handle<StateTreeDefinition>) -> Self {
         Self {
@@ -247,9 +247,9 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
 }
 
 #[derive(Component, Debug)]
-pub(crate) struct PendingStateTree<D: Send + Sync + 'static>(PhantomData<fn() -> D>);
+pub(crate) struct PendingStateTree<D: StateTreeDomain>(PhantomData<fn() -> D>);
 
-impl<D: Send + Sync + 'static> Default for PendingStateTree<D> {
+impl<D: StateTreeDomain> Default for PendingStateTree<D> {
     fn default() -> Self {
         Self(PhantomData)
     }
@@ -263,6 +263,18 @@ mod tests {
     use crate::StateTreeBuilder;
 
     struct TestDomain;
+
+    struct TestEvents;
+
+    impl crate::StateTreeEvents for TestEvents {
+        fn authored_name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    impl crate::StateTreeDomain for TestDomain {
+        type Event = TestEvents;
+    }
 
     fn instance(definition: &StateTreeDefinition, limit: usize) -> StateTreeInstance<TestDomain> {
         let mut instance = StateTreeInstance::new(Handle::default());

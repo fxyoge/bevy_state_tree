@@ -1,8 +1,8 @@
 //! Asset-backed hierarchical statecharts for Bevy.
 //!
 //! State tree definitions are immutable assets shared by any number of
-//! entity-local instances. Applications connect Rust event types to authored
-//! transition names with [`StateTreeAppExt`].
+//! entity-local instances. Each domain declares its closed external event
+//! protocol with [`StateTreeEvents`](macro@StateTreeEvents).
 //!
 //! # Event ordering
 //!
@@ -24,22 +24,31 @@
 //! its queued entity events are discarded rather than replayed after a later
 //! initialization.
 
+extern crate self as bevy_state_tree;
+
 mod definition;
+mod event;
 mod instance;
 mod plugin;
 
+pub use bevy_state_tree_macros::StateTreeEvents;
 pub use definition::{BuildError, StateId, StateTreeBuilder, StateTreeDefinition};
+pub use event::{
+    BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEventPayload,
+    StateTreeEvents,
+};
 pub use instance::{InstanceStatus, RuntimeFault, StateTreeInstance};
 pub use plugin::{
-    BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeAppExt, StateTreePlugin,
-    StateTreeSet, StateTreeSettings,
+    BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreePlugin, StateTreeSet,
+    StateTreeSettings,
 };
 
 /// Common state-tree imports.
 pub mod prelude {
     pub use crate::{
-        BroadcastStateTreeEventWriter, BuildError, EntityStateTreeEventWriter, InstanceStatus,
-        RuntimeFault, StateId, StateTreeAppExt, StateTreeBuilder, StateTreeDefinition,
+        BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, EntityStateTreeEvent,
+        EntityStateTreeEventWriter, InstanceStatus, RuntimeFault, StateId, StateTreeBuilder,
+        StateTreeDefinition, StateTreeDomain, StateTreeEventPayload, StateTreeEvents,
         StateTreeInstance, StateTreePlugin, StateTreeSet, StateTreeSettings,
     };
 }

@@ -412,8 +412,19 @@ dependencies = [
  "bevy_asset",
  "bevy_ecs",
  "bevy_reflect",
+ "bevy_state_tree_macros",
  "bevy_tasks",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bevy_state_tree_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

@@ -16,10 +16,17 @@ struct Advance {
     entity: Entity,
 }
 
+#[derive(StateTreeEvents)]
+#[state_tree(domain = Simulation)]
+enum SimulationEvents {
+    #[state_tree(name = "advance")]
+    Advance(Advance),
+}
+
 #[derive(Resource)]
 struct Target(Entity);
 
-fn queue_advance(target: Res<Target>, mut events: EntityStateTreeEventWriter<Simulation, Advance>) {
+fn queue_advance(target: Res<Target>, mut events: EntityStateTreeEventWriter<Simulation>) {
     assert!(events.write(Advance { entity: target.0 }));
 }
 
@@ -29,7 +36,6 @@ fn queue_set_delivers_on_a_single_threaded_schedule_without_task_pool_plugin() {
     app.add_plugins(AssetPlugin::default())
         .init_schedule(StateTreeUpdate)
         .add_plugins(StateTreePlugin::<Simulation>::new(StateTreeUpdate))
-        .register_entity_state_tree_event::<Simulation, Advance>("advance")
         .add_systems(
             StateTreeUpdate,
             queue_advance.in_set(StateTreeSet::QueueEvents),

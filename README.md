@@ -15,6 +15,11 @@ The crate currently provides the runtime foundation:
 SCXML loading, activities, behavior-tree composites, guards, parallel regions,
 history, and invocation are planned on top of this foundation.
 
+Each runtime domain owns a closed external event protocol. Tuple variants keep
+the original Rust payload intact through queueing and execution, while the
+derive generates event-name matching and writer conversions. Variants are
+entity-targeted by default; mark domain-wide events with `broadcast`.
+
 ```rust,no_run
 use bevy_app::{App, FixedUpdate};
 use bevy_asset::AssetPlugin;
@@ -28,7 +33,14 @@ struct Wake {
     entity: Entity,
 }
 
-fn wake(mut events: EntityStateTreeEventWriter<Simulation, Wake>) {
+#[derive(StateTreeEvents)]
+#[state_tree(domain = Simulation)]
+enum SimulationEvents {
+    #[state_tree(name = "wake")]
+    Wake(Wake),
+}
+
+fn wake(mut events: EntityStateTreeEventWriter<Simulation>) {
     // In a real system this would be the entity whose tree should wake.
     let entity = Entity::PLACEHOLDER;
     events.write(Wake { entity });
@@ -37,7 +49,6 @@ fn wake(mut events: EntityStateTreeEventWriter<Simulation, Wake>) {
 let mut app = App::new();
 app.add_plugins(AssetPlugin::default())
     .add_plugins(StateTreePlugin::<Simulation>::new(FixedUpdate))
-    .register_entity_state_tree_event::<Simulation, Wake>("wake")
     .add_systems(FixedUpdate, wake.in_set(StateTreeSet::QueueEvents));
 ```
 
