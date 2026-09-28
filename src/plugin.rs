@@ -17,6 +17,7 @@ use bevy_ecs::{
     schedule::{InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemSet},
     system::SystemParam,
 };
+use bevy_tasks::ComputeTaskPool;
 
 use crate::{InstanceStatus, StateTreeDefinition, StateTreeInstance, instance::PendingStateTree};
 
@@ -504,12 +505,21 @@ fn process_events<D: Send + Sync + 'static>(
             }
         };
 
-    if broadcasts.is_empty() {
+    let parallel = ComputeTaskPool::try_get().is_some();
+    if broadcasts.is_empty() && parallel {
         instances
             .par_iter_many_unique_mut(&*dirty_entities)
-            .for_each(process_instance);
+            .for_each(&process_instance);
+    } else if broadcasts.is_empty() {
+        for instance in instances.iter_many_unique_mut(&*dirty_entities) {
+            process_instance(instance);
+        }
+    } else if parallel {
+        instances.par_iter_mut().for_each(&process_instance);
     } else {
-        instances.par_iter_mut().for_each(process_instance);
+        for instance in &mut instances {
+            process_instance(instance);
+        }
     }
 
     broadcasts.clear();
