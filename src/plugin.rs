@@ -12,12 +12,12 @@ use bevy_asset::{AssetApp, AssetServer, Assets};
 use bevy_ecs::{
     entity::EntityHashSet,
     event::{EntityEvent, Event},
-    prelude::{Commands, Component, Entity, Has, Mut, Query, Res, ResMut, Resource, With},
+    prelude::{Commands, Component, Entity, Mut, Query, Res, ResMut, Resource, With},
     schedule::{InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemSet},
     system::SystemParam,
 };
 
-use crate::{StateTreeDefinition, StateTreeInstance, instance::PendingStateTree};
+use crate::{InstanceStatus, StateTreeDefinition, StateTreeInstance, instance::PendingStateTree};
 
 /// Ordered phases installed into each state-tree domain schedule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
@@ -435,7 +435,6 @@ type StateTrees<'w, 's, D> = Query<
     (
         &'static mut StateTreeInstance<D>,
         &'static StateTreeEventInbox<D>,
-        Has<PendingStateTree<D>>,
     ),
 >;
 
@@ -460,43 +459,40 @@ fn process_events<D: Send + Sync + 'static>(
     }
     let microstep_limit = settings.max_microsteps.get();
 
-    let process_instance = |(mut instance, inbox, pending): (
-        Mut<'_, StateTreeInstance<D>>,
-        &StateTreeEventInbox<D>,
-        bool,
-    )| {
-        let mut entity_events = inbox
-            .events
-            .lock()
-            .expect("state-tree event inbox poisoned");
-        if pending {
-            entity_events.clear();
-            return;
-        }
-
-        let mut broadcast_cursor = 0;
-
-        for event in entity_events.drain(..) {
-            if event.instance != instance.runtime_id() || event.batch != batch {
-                continue;
+    let process_instance =
+        |(mut instance, inbox): (Mut<'_, StateTreeInstance<D>>, &StateTreeEventInbox<D>)| {
+            let mut entity_events = inbox
+                .events
+                .lock()
+                .expect("state-tree event inbox poisoned");
+            if instance.status() == &InstanceStatus::Pending {
+                entity_events.clear();
+                return;
             }
-            debug_assert!(event.broadcasts_before <= broadcasts.len());
-            while broadcast_cursor < event.broadcasts_before {
-                process_binding(
-                    &mut instance,
-                    broadcasts[broadcast_cursor].binding,
-                    &bindings,
-                    microstep_limit,
-                );
-                broadcast_cursor += 1;
-            }
-            process_binding(&mut instance, event.binding, &bindings, microstep_limit);
-        }
 
-        for event in &broadcasts[broadcast_cursor..] {
-            process_binding(&mut instance, event.binding, &bindings, microstep_limit);
-        }
-    };
+            let mut broadcast_cursor = 0;
+
+            for event in entity_events.drain(..) {
+                if event.instance != instance.runtime_id() || event.batch != batch {
+                    continue;
+                }
+                debug_assert!(event.broadcasts_before <= broadcasts.len());
+                while broadcast_cursor < event.broadcasts_before {
+                    process_binding(
+                        &mut instance,
+                        broadcasts[broadcast_cursor].binding,
+                        &bindings,
+                        microstep_limit,
+                    );
+                    broadcast_cursor += 1;
+                }
+                process_binding(&mut instance, event.binding, &bindings, microstep_limit);
+            }
+
+            for event in &broadcasts[broadcast_cursor..] {
+                process_binding(&mut instance, event.binding, &bindings, microstep_limit);
+            }
+        };
 
     if broadcasts.is_empty() {
         instances
@@ -528,6 +524,7 @@ mod tests {
     use bevy_ecs::{
         event::{EntityEvent, Event},
         prelude::Entity,
+        schedule::ScheduleBuildSettings,
         system::{In, RunSystemOnce},
     };
 
@@ -756,8 +753,14 @@ mod tests {
     }
 
     #[test]
-    fn events_queued_before_initialization_are_delivered_if_ready_at_dispatch() {
+    fn initialization_delivery_does_not_require_automatic_deferred_application() {
         let mut app = app();
+        app.edit_schedule(Update, |schedule| {
+            schedule.set_build_settings(ScheduleBuildSettings {
+                auto_insert_apply_deferred: false,
+                ..Default::default()
+            });
+        });
         let handle = app
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
