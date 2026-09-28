@@ -7,7 +7,7 @@ The crate currently provides the runtime foundation:
 - immutable `StateTreeDefinition` assets;
 - entity-local, domain-typed `StateTreeInstance` components;
 - atomic, compound, and final states;
-- hierarchical and eventless external transitions;
+- hierarchical, eventless, and compound-completion transitions;
 - bounded iterative macrostep stabilization;
 - ordered per-instance entity and broadcast event queues;
 - parallel event processing across independent instances.

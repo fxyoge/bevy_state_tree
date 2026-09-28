@@ -31,7 +31,10 @@ pub(crate) struct EventId(u32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateKind {
     Atomic,
-    Compound { initial: StateId },
+    Compound {
+        initial: StateId,
+        completion: EventId,
+    },
     Final,
 }
 
@@ -177,6 +180,10 @@ impl StateTreeBuilder {
     }
 
     /// Adds a final child state.
+    ///
+    /// Entering a final child of a nested compound state raises the internal
+    /// event `done.state.<parent-name>`. Entering a final child of the root
+    /// completes the instance.
     pub fn final_state(
         &mut self,
         name: impl Into<Box<str>>,
@@ -242,9 +249,16 @@ impl StateTreeBuilder {
                     }
                     StateKind::Final
                 }
-                DraftKind::Compound { initial } => StateKind::Compound {
-                    initial: initial.ok_or(BuildError::MissingInitial(state_id))?,
-                },
+                DraftKind::Compound { initial } => {
+                    let completion_name: Box<str> = format!("done.state.{}", draft.name).into();
+                    let next =
+                        u32::try_from(events.len()).map_err(|_| BuildError::TooManyEvents)?;
+                    let completion = *events.entry(completion_name).or_insert(EventId(next));
+                    StateKind::Compound {
+                        initial: initial.ok_or(BuildError::MissingInitial(state_id))?,
+                        completion,
+                    }
+                }
             };
 
             let mut transitions = Vec::with_capacity(draft.transitions.len());

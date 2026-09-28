@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     marker::PhantomData,
     sync::{
         Arc,
@@ -24,7 +25,7 @@ pub enum InstanceStatus {
     Pending,
     /// The instance is stable and can receive events.
     Running,
-    /// The instance entered a final state.
+    /// The instance entered a final child of the root state.
     Complete,
     /// Execution stopped because the definition could not stabilize.
     Faulted(RuntimeFault),
@@ -55,6 +56,7 @@ pub struct StateTreeInstance<D: Send + Sync + 'static> {
     definition: Handle<StateTreeDefinition>,
     compiled: Option<Arc<CompiledDefinition>>,
     active: Vec<StateId>,
+    internal_events: VecDeque<EventId>,
     status: InstanceStatus,
     marker: PhantomData<fn() -> D>,
 }
@@ -75,6 +77,7 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
             definition,
             compiled: None,
             active: Vec::new(),
+            internal_events: VecDeque::new(),
             status: InstanceStatus::Pending,
             marker: PhantomData,
         }
@@ -115,6 +118,7 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
     pub(crate) fn initialize(&mut self, compiled: Arc<CompiledDefinition>, microstep_limit: usize) {
         self.compiled = Some(Arc::clone(&compiled));
         self.active.clear();
+        self.internal_events.clear();
         self.status = InstanceStatus::Running;
         self.enter(compiled.root);
         self.update_completion();
@@ -152,8 +156,16 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
 
     fn stabilize(&mut self, limit: usize, mut transitions_taken: usize) {
         loop {
-            let Some(transition) = self.select_transition(None) else {
-                return;
+            let transition = if let Some(transition) = self.select_transition(None) {
+                transition
+            } else {
+                let Some(event) = self.internal_events.pop_front() else {
+                    return;
+                };
+                let Some(transition) = self.select_transition(Some(event)) else {
+                    continue;
+                };
+                transition
             };
             if transitions_taken == limit {
                 self.status =
@@ -200,7 +212,7 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
         self.active.extend(ancestry.into_iter().rev());
 
         let mut cursor = target;
-        while let StateKind::Compound { initial } = compiled.state(cursor).kind {
+        while let StateKind::Compound { initial, .. } = compiled.state(cursor).kind {
             self.active.push(initial);
             cursor = initial;
         }
@@ -210,12 +222,24 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
         let Some(compiled) = self.compiled.as_ref() else {
             return;
         };
-        if self.active.last().is_some_and(|state| {
-            let node = compiled.state(*state);
-            node.kind == StateKind::Final && node.parent == Some(compiled.root)
-        }) {
-            self.status = InstanceStatus::Complete;
+        let Some(final_state) = self.active.last() else {
+            return;
+        };
+        let final_node = compiled.state(*final_state);
+        if final_node.kind != StateKind::Final {
+            return;
         }
+        let Some(parent) = final_node.parent else {
+            return;
+        };
+        if parent == compiled.root {
+            self.status = InstanceStatus::Complete;
+            return;
+        }
+        let StateKind::Compound { completion, .. } = compiled.state(parent).kind else {
+            return;
+        };
+        self.internal_events.push_back(completion);
     }
 }
 
@@ -435,6 +459,55 @@ mod tests {
         assert_eq!(
             instance.active_state_names().collect::<Vec<_>>(),
             ["root", "nested", "done"]
+        );
+    }
+
+    #[test]
+    fn nested_final_state_raises_parent_completion() {
+        let mut builder = StateTreeBuilder::new("nested-completion");
+        let root = builder.compound_root("root").unwrap();
+        let nested = builder.compound("nested", root).unwrap();
+        let running = builder.atomic("running", nested).unwrap();
+        let nested_done = builder.final_state("nested-done", nested).unwrap();
+        let complete = builder.final_state("complete", root).unwrap();
+        builder.initial(root, nested).unwrap();
+        builder.initial(nested, running).unwrap();
+        builder.transition(running, "finish", nested_done).unwrap();
+        builder
+            .transition(nested, "done.state.nested", complete)
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        instance.process_event("finish", &(), 64);
+
+        assert_eq!(instance.status(), &InstanceStatus::Complete);
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "complete"]
+        );
+    }
+
+    #[test]
+    fn initial_nested_final_state_raises_parent_completion() {
+        let mut builder = StateTreeBuilder::new("initial-completion");
+        let root = builder.compound_root("root").unwrap();
+        let nested = builder.compound("nested", root).unwrap();
+        let nested_done = builder.final_state("nested-done", nested).unwrap();
+        let stable = builder.atomic("stable", root).unwrap();
+        builder.initial(root, nested).unwrap();
+        builder.initial(nested, nested_done).unwrap();
+        builder
+            .transition(nested, "done.state.nested", stable)
+            .unwrap();
+        let definition = builder.build().unwrap();
+
+        let instance = instance(&definition, 64);
+
+        assert_eq!(instance.status(), &InstanceStatus::Running);
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "stable"]
         );
     }
 }
