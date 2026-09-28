@@ -17,11 +17,16 @@ history, and invocation are planned on top of this foundation.
 
 The `scxml` module provides a namespace-aware authored-syntax parser that keeps
 SCXML structure, document order, source spans, raw expressions, and foreign
-extensions separate from the current runtime representation. The pinned W3C
-implementation-report corpus under `tests/w3c` currently establishes complete
-corpus acceptance plus targeted authored-data preservation checks; fixtures are
-not lowered into the legacy single-path runtime or reported as conformance
-passes.
+extensions separate from the runtime representation. Its compiler accepts only
+semantics implemented by the production runtime and rejects unsupported syntax
+instead of ignoring it. Compiled definitions contain dense identifiers and
+precomputed transition entry/exit plans; macrosteps do not traverse the SCXML
+tree or resolve authored names.
+
+The pinned W3C implementation-report corpus under `tests/w3c` is parsed and
+attempted through that same compiler and runtime. `tests/w3c/expected.toml`
+records the reviewed pass/fail result for every manifest start resource, and
+normal tests fail on missing cases or any observed result change.
 
 Each runtime domain owns a closed external event protocol. Tuple variants keep
 the original Rust payload intact through queueing and execution, while the

@@ -1,13 +1,18 @@
-//! Namespace-aware SCXML source parsing.
+//! Namespace-aware SCXML parsing and compilation.
 //!
-//! This module is an authored-syntax frontend. It deliberately does not resolve
-//! state ids, evaluate expressions, or build a runtime state tree.
+//! Parsing preserves authored syntax without resolving state ids or evaluating
+//! expressions. [`compile`] separately lowers the supported subset into the
+//! production runtime representation and rejects unsupported semantics.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
+
+mod compile;
+
+pub use compile::{CompileError, compile};
 
 /// The namespace URI defined by the SCXML specification.
 pub const SCXML_NAMESPACE: &str = "http://www.w3.org/2005/07/scxml";

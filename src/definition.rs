@@ -10,6 +10,8 @@ use bevy_asset::Asset;
 use bevy_reflect::TypePath;
 use thiserror::Error;
 
+use crate::StateTreeEvents;
+
 /// A compact state identifier local to one [`StateTreeDefinition`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StateId {
@@ -28,6 +30,44 @@ static NEXT_DEFINITION_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct EventId(u32);
 
+impl EventId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EventSet {
+    words: Box<[u64]>,
+}
+
+impl EventSet {
+    fn for_name(events: &[EventPattern], name: &str) -> Self {
+        let mut words = vec![0; events.len().div_ceil(64)];
+        for (index, pattern) in events.iter().enumerate() {
+            if event_pattern_matches(pattern, name) {
+                words[index / 64] |= 1 << (index % 64);
+            }
+        }
+        Self {
+            words: words.into_boxed_slice(),
+        }
+    }
+
+    pub fn contains(&self, event: EventId) -> bool {
+        let index = event.index();
+        self.words
+            .get(index / 64)
+            .is_some_and(|word| word & (1 << (index % 64)) != 0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum EventPattern {
+    Exact(Box<str>),
+    Descriptor(Box<str>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StateKind {
     Atomic,
@@ -42,6 +82,7 @@ pub(crate) enum StateKind {
 pub(crate) struct StateNode {
     pub name: Box<str>,
     pub parent: Option<StateId>,
+    pub depth: u32,
     pub kind: StateKind,
     pub transitions: Box<[Transition]>,
 }
@@ -50,6 +91,9 @@ pub(crate) struct StateNode {
 pub(crate) struct Transition {
     pub event: Option<EventId>,
     pub target: StateId,
+    pub exit_depth: u32,
+    pub entry_start: u32,
+    pub entry_len: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -58,17 +102,71 @@ pub(crate) struct CompiledDefinition {
     pub name: Box<str>,
     pub root: StateId,
     pub states: Box<[StateNode]>,
-    events: HashMap<Box<str>, EventId>,
+    pub transition_entries: Box<[StateId]>,
+    pub initial_entries: Box<[StateId]>,
+    pub max_depth: usize,
+    events: Box<[EventPattern]>,
 }
 
 impl CompiledDefinition {
+    #[cfg(test)]
     pub fn event(&self, name: &str) -> Option<EventId> {
-        self.events.get(name).copied()
+        self.events
+            .iter()
+            .position(
+                |pattern| matches!(pattern, EventPattern::Exact(value) if value.as_ref() == name),
+            )
+            .and_then(|index| u32::try_from(index).ok())
+            .map(EventId)
     }
 
     pub fn state(&self, id: StateId) -> &StateNode {
         debug_assert_eq!(id.definition, self.identity);
         &self.states[id.index()]
+    }
+
+    pub fn internal_event_matches(&self, candidate: EventId, emitted: EventId) -> bool {
+        let EventPattern::Exact(emitted) = &self.events[emitted.index()] else {
+            return false;
+        };
+        event_pattern_matches(&self.events[candidate.index()], emitted)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LinkedDefinition {
+    pub compiled: Arc<CompiledDefinition>,
+    external_events: Box<[EventSet]>,
+}
+
+impl LinkedDefinition {
+    pub fn new<E: StateTreeEvents>(compiled: Arc<CompiledDefinition>) -> Self {
+        let external_events = E::AUTHORED_NAMES
+            .iter()
+            .map(|name| EventSet::for_name(&compiled.events, name))
+            .collect();
+        Self {
+            compiled,
+            external_events,
+        }
+    }
+
+    pub fn external_event(&self, index: usize) -> Option<&EventSet> {
+        self.external_events.get(index)
+    }
+}
+
+fn event_pattern_matches(pattern: &EventPattern, event: &str) -> bool {
+    match pattern {
+        EventPattern::Exact(name) => name.as_ref() == event,
+        EventPattern::Descriptor(descriptor) => {
+            let descriptor = descriptor.strip_suffix(".*").unwrap_or(descriptor);
+            descriptor == "*"
+                || descriptor == event
+                || event
+                    .strip_prefix(descriptor)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        }
     }
 }
 
@@ -121,7 +219,7 @@ struct DraftState {
 
 #[derive(Clone, Debug)]
 struct DraftTransition {
-    event: Option<Box<str>>,
+    event: Option<EventPattern>,
     target: StateId,
 }
 
@@ -218,7 +316,20 @@ impl StateTreeBuilder {
         if event.is_empty() {
             return Err(BuildError::EmptyEventName);
         }
-        self.add_transition(source, Some(event), target)
+        self.add_transition(source, Some(EventPattern::Exact(event)), target)
+    }
+
+    pub(crate) fn event_descriptor(
+        &mut self,
+        source: StateId,
+        descriptor: impl Into<Box<str>>,
+        target: StateId,
+    ) -> Result<&mut Self, BuildError> {
+        let descriptor = descriptor.into();
+        if descriptor.is_empty() {
+            return Err(BuildError::EmptyEventName);
+        }
+        self.add_transition(source, Some(EventPattern::Descriptor(descriptor)), target)
     }
 
     /// Adds an eventless external transition.
@@ -233,8 +344,19 @@ impl StateTreeBuilder {
         }
         let root = self.root.ok_or(BuildError::MissingRoot)?;
 
-        let mut events = HashMap::<Box<str>, EventId>::new();
+        let mut depths = Vec::with_capacity(self.states.len());
+        for draft in &self.states {
+            let depth = match draft.parent {
+                Some(parent) => depths[parent.index()] + 1,
+                None => 0,
+            };
+            depths.push(depth);
+        }
+
+        let mut events = Vec::<EventPattern>::new();
+        let mut event_ids = HashMap::<EventPattern, EventId>::new();
         let mut states = Vec::with_capacity(self.states.len());
+        let mut transition_entries = Vec::new();
 
         for (index, draft) in self.states.iter().enumerate() {
             let state_id = StateId {
@@ -251,9 +373,8 @@ impl StateTreeBuilder {
                 }
                 DraftKind::Compound { initial } => {
                     let completion_name: Box<str> = format!("done.state.{}", draft.name).into();
-                    let next =
-                        u32::try_from(events.len()).map_err(|_| BuildError::TooManyEvents)?;
-                    let completion = *events.entry(completion_name).or_insert(EventId(next));
+                    let pattern = EventPattern::Exact(completion_name.clone());
+                    let completion = intern_event(&mut events, &mut event_ids, pattern)?;
                     StateKind::Compound {
                         initial: initial.ok_or(BuildError::MissingInitial(state_id))?,
                         completion,
@@ -264,26 +385,45 @@ impl StateTreeBuilder {
             let mut transitions = Vec::with_capacity(draft.transitions.len());
             for transition in &draft.transitions {
                 let event = match &transition.event {
-                    Some(name) => {
-                        let next =
-                            u32::try_from(events.len()).map_err(|_| BuildError::TooManyEvents)?;
-                        Some(*events.entry(name.clone()).or_insert(EventId(next)))
+                    Some(pattern) => {
+                        let event = intern_event(&mut events, &mut event_ids, pattern.clone())?;
+                        Some(event)
                     }
                     None => None,
                 };
                 transitions.push(Transition {
                     event,
                     target: transition.target,
+                    exit_depth: transition_exit_depth(
+                        state_id,
+                        transition.target,
+                        &self.states,
+                        &depths,
+                    ),
+                    entry_start: u32::try_from(transition_entries.len())
+                        .map_err(|_| BuildError::TooManyStates)?,
+                    entry_len: append_transition_entries(
+                        state_id,
+                        transition.target,
+                        &self.states,
+                        &depths,
+                        &mut transition_entries,
+                    )?,
                 });
             }
 
             states.push(StateNode {
                 name: draft.name.clone(),
                 parent: draft.parent,
+                depth: depths[index],
                 kind,
                 transitions: transitions.into_boxed_slice(),
             });
         }
+
+        let mut initial_entries = vec![root];
+        append_initial_descendants(root, &states, &mut initial_entries);
+        let max_depth = depths.iter().copied().max().unwrap_or(0).saturating_add(1) as usize;
 
         Ok(StateTreeDefinition {
             compiled: Arc::new(CompiledDefinition {
@@ -291,7 +431,10 @@ impl StateTreeBuilder {
                 name: self.name,
                 root,
                 states: states.into_boxed_slice(),
-                events,
+                transition_entries: transition_entries.into_boxed_slice(),
+                initial_entries: initial_entries.into_boxed_slice(),
+                max_depth,
+                events: events.into_boxed_slice(),
             }),
         })
     }
@@ -340,7 +483,7 @@ impl StateTreeBuilder {
     fn add_transition(
         &mut self,
         source: StateId,
-        event: Option<Box<str>>,
+        event: Option<EventPattern>,
         target: StateId,
     ) -> Result<&mut Self, BuildError> {
         self.require_state(target)?;
@@ -368,6 +511,102 @@ impl StateTreeBuilder {
         self.states
             .get_mut(id.index())
             .ok_or(BuildError::UnknownState(id))
+    }
+}
+
+fn intern_event(
+    events: &mut Vec<EventPattern>,
+    event_ids: &mut HashMap<EventPattern, EventId>,
+    pattern: EventPattern,
+) -> Result<EventId, BuildError> {
+    if let Some(event) = event_ids.get(&pattern) {
+        return Ok(*event);
+    }
+    let event = EventId(u32::try_from(events.len()).map_err(|_| BuildError::TooManyEvents)?);
+    events.push(pattern.clone());
+    event_ids.insert(pattern, event);
+    Ok(event)
+}
+
+fn transition_domain(
+    source: StateId,
+    target: StateId,
+    states: &[DraftState],
+    depths: &[u32],
+) -> Option<StateId> {
+    let mut source_ancestor = Some(source);
+    let mut source_depth = depths[source.index()];
+    let mut target_ancestor = Some(target);
+    let mut target_depth = depths[target.index()];
+
+    while source_depth > target_depth {
+        source_ancestor = source_ancestor.and_then(|state| states[state.index()].parent);
+        source_depth -= 1;
+    }
+    while target_depth > source_depth {
+        target_ancestor = target_ancestor.and_then(|state| states[state.index()].parent);
+        target_depth -= 1;
+    }
+    while source_ancestor != target_ancestor {
+        source_ancestor = source_ancestor.and_then(|state| states[state.index()].parent);
+        target_ancestor = target_ancestor.and_then(|state| states[state.index()].parent);
+    }
+
+    // External transitions exit and re-enter their source when it is the LCA.
+    if source_ancestor == Some(source) || source_ancestor == Some(target) {
+        source_ancestor.and_then(|state| states[state.index()].parent)
+    } else {
+        source_ancestor
+    }
+}
+
+fn transition_exit_depth(
+    source: StateId,
+    target: StateId,
+    states: &[DraftState],
+    depths: &[u32],
+) -> u32 {
+    transition_domain(source, target, states, depths).map_or(0, |state| depths[state.index()] + 1)
+}
+
+fn append_transition_entries(
+    source: StateId,
+    target: StateId,
+    states: &[DraftState],
+    depths: &[u32],
+    entries: &mut Vec<StateId>,
+) -> Result<u32, BuildError> {
+    let domain = transition_domain(source, target, states, depths);
+    let start = entries.len();
+    let mut reverse = Vec::with_capacity(depths[target.index()] as usize + 1);
+    let mut cursor = Some(target);
+    while cursor != domain {
+        let state = cursor.expect("transition target and source share the definition root");
+        reverse.push(state);
+        cursor = states[state.index()].parent;
+    }
+    entries.extend(reverse.into_iter().rev());
+
+    let mut cursor = target;
+    while let DraftKind::Compound {
+        initial: Some(initial),
+    } = states[cursor.index()].kind
+    {
+        entries.push(initial);
+        cursor = initial;
+    }
+
+    u32::try_from(entries.len() - start).map_err(|_| BuildError::TooManyStates)
+}
+
+fn append_initial_descendants(
+    mut state: StateId,
+    states: &[StateNode],
+    entries: &mut Vec<StateId>,
+) {
+    while let StateKind::Compound { initial, .. } = states[state.index()].kind {
+        entries.push(initial);
+        state = initial;
     }
 }
 

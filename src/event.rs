@@ -38,8 +38,16 @@ pub trait StateTreeDomain: Send + Sync + 'static {
 /// }
 /// ```
 pub trait StateTreeEvents: Send + Sync + 'static {
+    /// Authored event names in the same order as [`Self::event_index`].
+    const AUTHORED_NAMES: &'static [&'static str];
+
+    /// Returns the stable variant index used by linked state-tree definitions.
+    fn event_index(&self) -> usize;
+
     /// Returns the SCXML event name represented by this value.
-    fn authored_name(&self) -> &'static str;
+    fn authored_name(&self) -> &'static str {
+        Self::AUTHORED_NAMES[self.event_index()]
+    }
 }
 
 /// Associates one concrete payload type with a domain event variant.

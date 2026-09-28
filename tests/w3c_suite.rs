@@ -1,16 +1,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    num::NonZeroUsize,
     path::Path,
 };
 
-use bevy_state_tree::scxml;
+use bevy_state_tree::{InstanceStatus, StateTreeEvents, StateTreeExecution, scxml};
 use quick_xml::{Reader, XmlVersion, events::Event};
 use sha2::{Digest, Sha256};
 
 const SUITE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/w3c");
 const VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/w3c/vendor");
 const CONFORMANCE_NAMESPACE: &str = "http://www.w3.org/2005/scxml-conformance";
+const MICROSTEP_LIMIT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 #[derive(Debug)]
 struct ManifestTest {
@@ -18,6 +20,23 @@ struct ManifestTest {
     manual: bool,
     starts: Vec<String>,
     dependencies: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ExecutionResult {
+    passed: bool,
+    category: &'static str,
+    detail: String,
+}
+
+enum NoEvents {}
+
+impl StateTreeEvents for NoEvents {
+    const AUTHORED_NAMES: &'static [&'static str] = &[];
+
+    fn event_index(&self) -> usize {
+        match *self {}
+    }
 }
 
 #[test]
@@ -197,6 +216,278 @@ fn every_conf_construct_is_explicitly_known_to_the_test_profile() {
     let (elements, attributes) = conformance_names();
     assert_eq!(elements, known_elements);
     assert_eq!(attributes, known_attributes);
+}
+
+#[test]
+fn manifest_starts_match_expected_w3c_outcomes() {
+    let tests = parse_manifest();
+    let expected = parse_expected();
+    let manifest_starts: BTreeSet<_> = tests.iter().flat_map(|test| &test.starts).collect();
+    let expected_starts: BTreeSet<_> = expected.keys().collect();
+    let mut mismatches = Vec::new();
+
+    for resource in manifest_starts.difference(&expected_starts) {
+        mismatches.push(format!("missing expected result for {resource}"));
+    }
+    for resource in expected_starts.difference(&manifest_starts) {
+        mismatches.push(format!("stale expected result for {resource}"));
+    }
+
+    let mut observed_passes = 0;
+    let mut categories = BTreeMap::new();
+    for test in &tests {
+        for resource in &test.starts {
+            let result = execute_start(resource, test.manual);
+            observed_passes += usize::from(result.passed);
+            *categories.entry(result.category).or_insert(0usize) += 1;
+            if let Some(expected) = expected.get(resource)
+                && *expected != result.passed
+            {
+                mismatches.push(format!(
+                    "{resource}: expected {expected}, observed {} ({}){}",
+                    result.passed,
+                    result.category,
+                    if result.detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", result.detail)
+                    }
+                ));
+            }
+        }
+    }
+
+    println!(
+        "W3C observed pass count: {observed_passes}/{}; categories: {categories:?}",
+        manifest_starts.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "W3C expected-result mismatches ({}):\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
+fn parse_expected() -> BTreeMap<String, bool> {
+    let source = fs::read_to_string(Path::new(SUITE_ROOT).join("expected.toml")).unwrap();
+    let mut document = source.parse::<toml::Table>().unwrap();
+    let results = document
+        .remove("results")
+        .and_then(|value| match value {
+            toml::Value::Table(table) => Some(table),
+            _ => None,
+        })
+        .expect("expected.toml must contain a [results] table");
+    results
+        .into_iter()
+        .map(|(resource, value)| {
+            (
+                resource,
+                value
+                    .as_bool()
+                    .expect("expected W3C outcomes must be booleans"),
+            )
+        })
+        .collect()
+}
+
+fn execute_start(resource: &str, manual: bool) -> ExecutionResult {
+    if manual {
+        return ExecutionResult {
+            passed: false,
+            category: "manual",
+            detail: "manual start skipped".to_owned(),
+        };
+    }
+    if !resource.ends_with(".txml") {
+        return ExecutionResult {
+            passed: false,
+            category: "non_xml",
+            detail: "non-XML start skipped".to_owned(),
+        };
+    }
+
+    let source_path = Path::new(VENDOR_ROOT).join(resource);
+    let source = match fs::read_to_string(&source_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return ExecutionResult {
+                passed: false,
+                category: "read_error",
+                detail: error.to_string(),
+            };
+        }
+    };
+    let mut document = match scxml::parse(resource, &source) {
+        Ok(document) => document,
+        Err(error) => {
+            return ExecutionResult {
+                passed: false,
+                category: "parse_error",
+                detail: error.to_string(),
+            };
+        }
+    };
+    normalize_test_profile(&mut document);
+    let definition = match scxml::compile(&document) {
+        Ok(definition) => definition,
+        Err(error) => {
+            let category = match error {
+                scxml::CompileError::Unsupported { .. } => "unsupported",
+                _ => "compile_error",
+            };
+            return ExecutionResult {
+                passed: false,
+                category,
+                detail: error.to_string(),
+            };
+        }
+    };
+
+    let execution = StateTreeExecution::<NoEvents>::new(&definition, MICROSTEP_LIMIT);
+    let active: Vec<_> = execution.active_state_names().map(str::to_owned).collect();
+    match execution.status() {
+        InstanceStatus::Complete if active.last().is_some_and(|name| name == "pass") => {
+            ExecutionResult {
+                passed: true,
+                category: "pass",
+                detail: active.join("/"),
+            }
+        }
+        InstanceStatus::Complete if active.last().is_some_and(|name| name == "fail") => {
+            ExecutionResult {
+                passed: false,
+                category: "explicit_fail",
+                detail: active.join("/"),
+            }
+        }
+        InstanceStatus::Complete => ExecutionResult {
+            passed: false,
+            category: "unexpected_terminal",
+            detail: active.join("/"),
+        },
+        InstanceStatus::Faulted(fault) => ExecutionResult {
+            passed: false,
+            category: "fault",
+            detail: format!("{fault:?}; active={}", active.join("/")),
+        },
+        InstanceStatus::Pending | InstanceStatus::Running => ExecutionResult {
+            passed: false,
+            category: "no_outcome",
+            detail: format!(
+                "status={:?}; active={}",
+                execution.status(),
+                active.join("/")
+            ),
+        },
+    }
+}
+
+fn normalize_test_profile(document: &mut scxml::Document) {
+    document
+        .root
+        .attributes
+        .retain(|attribute| !is_conformance_attribute(attribute, "datamodel"));
+    for child in &mut document.root.children {
+        match child {
+            scxml::RootChild::Extension(extension)
+                if extension.namespace.as_deref() == Some(CONFORMANCE_NAMESPACE)
+                    && matches!(extension.local_name.as_str(), "pass" | "fail") =>
+            {
+                let id = extension.local_name.clone();
+                *child = scxml::RootChild::Final(scxml::Final {
+                    span: extension.span,
+                    id: Some(id),
+                    attributes: Vec::new(),
+                    children: Vec::new(),
+                });
+            }
+            _ => {}
+        }
+    }
+    for child in &mut document.root.children {
+        normalize_root_child(child);
+    }
+}
+
+fn normalize_root_child(child: &mut scxml::RootChild) {
+    match child {
+        scxml::RootChild::State(state) => normalize_state(state),
+        scxml::RootChild::Parallel(parallel) => {
+            for child in &mut parallel.children {
+                normalize_parallel_child(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_state(state: &mut scxml::State) {
+    for child in &mut state.children {
+        match child {
+            scxml::StateChild::State(state) => normalize_state(state),
+            scxml::StateChild::Parallel(parallel) => {
+                for child in &mut parallel.children {
+                    normalize_parallel_child(child);
+                }
+            }
+            scxml::StateChild::Initial(initial) => {
+                if let Some(transition) = &mut initial.transition {
+                    normalize_transition(transition);
+                }
+            }
+            scxml::StateChild::History(history) => {
+                for child in &mut history.children {
+                    if let scxml::HistoryChild::Transition(transition) = child {
+                        normalize_transition(transition);
+                    }
+                }
+            }
+            scxml::StateChild::Transition(transition) => normalize_transition(transition),
+            _ => {}
+        }
+    }
+}
+
+fn normalize_parallel_child(child: &mut scxml::ParallelChild) {
+    match child {
+        scxml::ParallelChild::State(state) => normalize_state(state),
+        scxml::ParallelChild::Parallel(parallel) => {
+            for child in &mut parallel.children {
+                normalize_parallel_child(child);
+            }
+        }
+        scxml::ParallelChild::History(history) => {
+            for child in &mut history.children {
+                if let scxml::HistoryChild::Transition(transition) = child {
+                    normalize_transition(transition);
+                }
+            }
+        }
+        scxml::ParallelChild::Transition(transition) => normalize_transition(transition),
+        _ => {}
+    }
+}
+
+fn normalize_transition(transition: &mut scxml::Transition) {
+    let target = transition.attributes.iter().find_map(|attribute| {
+        is_conformance_attribute(attribute, "targetpass")
+            .then_some("pass")
+            .or_else(|| is_conformance_attribute(attribute, "targetfail").then_some("fail"))
+    });
+    if let Some(target) = target {
+        transition.targets = vec![target.to_owned()];
+        transition.attributes.retain(|attribute| {
+            !is_conformance_attribute(attribute, "targetpass")
+                && !is_conformance_attribute(attribute, "targetfail")
+        });
+    }
+}
+
+fn is_conformance_attribute(attribute: &scxml::Attribute, local_name: &str) -> bool {
+    attribute.namespace.as_deref() == Some(CONFORMANCE_NAMESPACE)
+        && attribute.local_name == local_name
 }
 
 fn parse_manifest() -> Vec<ManifestTest> {

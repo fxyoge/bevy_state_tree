@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     marker::PhantomData,
+    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,10 +11,57 @@ use std::{
 use bevy_asset::{AssetId, Handle};
 use bevy_ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld};
 
-use crate::definition::{CompiledDefinition, EventId, StateId, StateKind, Transition};
-use crate::{StateTreeDefinition, StateTreeDomain, plugin::StateTreeEventInbox};
+use crate::definition::{EventId, EventSet, LinkedDefinition, StateId, StateKind, Transition};
+use crate::{StateTreeDefinition, StateTreeDomain, StateTreeEvents, plugin::StateTreeEventInbox};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+enum Trigger<'a> {
+    Eventless,
+    Internal(EventId),
+    External(&'a EventSet),
+}
+
+struct HeadlessDomain<E>(PhantomData<fn() -> E>);
+
+impl<E: StateTreeEvents> StateTreeDomain for HeadlessDomain<E> {
+    type Event = E;
+}
+
+/// A headless execution of one compiled state tree.
+///
+/// This uses the same linked definition and macrostep engine as
+/// [`StateTreeInstance`], without requiring a Bevy [`World`](bevy_ecs::world::World).
+/// Construction performs all definition linking and reserves runtime storage.
+pub struct StateTreeExecution<E: StateTreeEvents> {
+    instance: StateTreeInstance<HeadlessDomain<E>>,
+}
+
+impl<E: StateTreeEvents> StateTreeExecution<E> {
+    /// Links and initializes a definition for headless execution.
+    pub fn new(definition: &StateTreeDefinition, microstep_limit: NonZeroUsize) -> Self {
+        let linked = Arc::new(LinkedDefinition::new::<E>(Arc::clone(&definition.compiled)));
+        let mut instance = StateTreeInstance::new(Handle::default());
+        instance.initialize(linked, microstep_limit.get());
+        Self { instance }
+    }
+
+    /// Returns the current execution status.
+    pub fn status(&self) -> &InstanceStatus {
+        self.instance.status()
+    }
+
+    /// Returns the active root-to-leaf authored state names.
+    pub fn active_state_names(&self) -> impl Iterator<Item = &str> {
+        self.instance.active_state_names()
+    }
+
+    /// Processes one external event through a complete macrostep.
+    pub fn process_event(&mut self, event: &E, microstep_limit: NonZeroUsize) -> bool {
+        self.instance
+            .process_event(event.event_index(), event, microstep_limit.get())
+    }
+}
 
 /// Current execution status of a state-tree instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,7 +105,7 @@ pub enum RuntimeFault {
 pub struct StateTreeInstance<D: StateTreeDomain> {
     runtime_id: u64,
     definition: Handle<StateTreeDefinition>,
-    compiled: Option<Arc<CompiledDefinition>>,
+    linked: Option<Arc<LinkedDefinition>>,
     active: Vec<StateId>,
     internal_events: VecDeque<EventId>,
     status: InstanceStatus,
@@ -78,7 +126,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         Self {
             runtime_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             definition,
-            compiled: None,
+            linked: None,
             active: Vec::new(),
             internal_events: VecDeque::new(),
             status: InstanceStatus::Pending,
@@ -112,18 +160,24 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
     /// Returns the active root-to-leaf authored state names.
     pub fn active_state_names(&self) -> impl Iterator<Item = &str> {
-        let compiled = self.compiled.as_deref();
+        let compiled = self
+            .linked
+            .as_deref()
+            .map(|linked| linked.compiled.as_ref());
         self.active.iter().filter_map(move |state| {
             compiled.map(|definition| definition.state(*state).name.as_ref())
         })
     }
 
-    pub(crate) fn initialize(&mut self, compiled: Arc<CompiledDefinition>, microstep_limit: usize) {
-        self.compiled = Some(Arc::clone(&compiled));
+    pub(crate) fn initialize(&mut self, linked: Arc<LinkedDefinition>, microstep_limit: usize) {
+        let compiled = &linked.compiled;
+        self.linked = Some(Arc::clone(&linked));
         self.active.clear();
+        self.active.reserve(compiled.max_depth);
         self.internal_events.clear();
+        self.internal_events.reserve(compiled.max_depth);
         self.status = InstanceStatus::Running;
-        self.enter(compiled.root);
+        self.active.extend_from_slice(&compiled.initial_entries);
         self.update_completion();
         if self.status == InstanceStatus::Running {
             self.stabilize(microstep_limit, 0);
@@ -132,20 +186,20 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
     pub(crate) fn process_event<M: Send + Sync + 'static>(
         &mut self,
-        event_name: &str,
+        event_index: usize,
         _payload: &M,
         microstep_limit: usize,
     ) -> bool {
         if self.status != InstanceStatus::Running {
             return false;
         }
-        let Some(compiled) = self.compiled.as_ref() else {
+        let Some(linked) = self.linked.as_ref() else {
             return false;
         };
-        let Some(event) = compiled.event(event_name) else {
+        let Some(events) = linked.external_event(event_index) else {
             return false;
         };
-        let Some(transition) = self.select_transition(Some(event)) else {
+        let Some(transition) = self.select_external_transition(events) else {
             return false;
         };
 
@@ -157,15 +211,38 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         true
     }
 
+    #[cfg(test)]
+    fn process_authored_event(&mut self, name: &str, microstep_limit: usize) -> bool {
+        if self.status != InstanceStatus::Running {
+            return false;
+        }
+        let Some(event) = self
+            .linked
+            .as_ref()
+            .and_then(|linked| linked.compiled.event(name))
+        else {
+            return false;
+        };
+        let Some(transition) = self.select_transition(Trigger::Internal(event)) else {
+            return false;
+        };
+        self.take_transition(transition);
+        self.update_completion();
+        if self.status == InstanceStatus::Running {
+            self.stabilize(microstep_limit, 1);
+        }
+        true
+    }
+
     fn stabilize(&mut self, limit: usize, mut transitions_taken: usize) {
         loop {
-            let transition = if let Some(transition) = self.select_transition(None) {
+            let transition = if let Some(transition) = self.select_transition(Trigger::Eventless) {
                 transition
             } else {
                 let Some(event) = self.internal_events.pop_front() else {
                     return;
                 };
-                let Some(transition) = self.select_transition(Some(event)) else {
+                let Some(transition) = self.select_transition(Trigger::Internal(event)) else {
                     continue;
                 };
                 transition
@@ -184,47 +261,52 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
     }
 
-    fn select_transition(&self, event: Option<EventId>) -> Option<Transition> {
-        let compiled = self.compiled.as_ref()?;
+    fn select_transition(&self, trigger: Trigger<'_>) -> Option<Transition> {
+        let compiled = &self.linked.as_ref()?.compiled;
         self.active.iter().rev().find_map(|state| {
             compiled
                 .state(*state)
                 .transitions
                 .iter()
-                .find(|transition| transition.event == event)
+                .find(|transition| match (transition.event, &trigger) {
+                    (None, Trigger::Eventless) => true,
+                    (Some(candidate), Trigger::Internal(emitted)) => {
+                        compiled.internal_event_matches(candidate, *emitted)
+                    }
+                    (Some(event), Trigger::External(events)) => events.contains(event),
+                    _ => false,
+                })
                 .copied()
         })
     }
 
-    fn take_transition(&mut self, transition: Transition) {
-        self.active.clear();
-        self.enter(transition.target);
+    fn select_external_transition(&self, events: &EventSet) -> Option<Transition> {
+        self.select_transition(Trigger::External(events))
     }
 
-    fn enter(&mut self, target: StateId) {
-        let Some(compiled) = self.compiled.as_ref() else {
+    fn take_transition(&mut self, transition: Transition) {
+        let Some(linked) = self.linked.as_ref() else {
             return;
         };
-
-        let mut ancestry = Vec::new();
-        let mut cursor = Some(target);
-        while let Some(state) = cursor {
-            ancestry.push(state);
-            cursor = compiled.state(state).parent;
-        }
-        self.active.extend(ancestry.into_iter().rev());
-
-        let mut cursor = target;
-        while let StateKind::Compound { initial, .. } = compiled.state(cursor).kind {
-            self.active.push(initial);
-            cursor = initial;
-        }
+        let compiled = &linked.compiled;
+        self.active.truncate(transition.exit_depth as usize);
+        let start = transition.entry_start as usize;
+        let end = start + transition.entry_len as usize;
+        self.active
+            .extend_from_slice(&compiled.transition_entries[start..end]);
+        debug_assert!(
+            self.active
+                .iter()
+                .enumerate()
+                .all(|(depth, state)| compiled.state(*state).depth as usize == depth)
+        );
     }
 
     fn update_completion(&mut self) {
-        let Some(compiled) = self.compiled.as_ref() else {
+        let Some(linked) = self.linked.as_ref() else {
             return;
         };
+        let compiled = &linked.compiled;
         let Some(final_state) = self.active.last() else {
             return;
         };
@@ -267,8 +349,10 @@ mod tests {
     struct TestEvents;
 
     impl crate::StateTreeEvents for TestEvents {
-        fn authored_name(&self) -> &'static str {
-            "test"
+        const AUTHORED_NAMES: &'static [&'static str] = &[];
+
+        fn event_index(&self) -> usize {
+            unreachable!()
         }
     }
 
@@ -278,8 +362,43 @@ mod tests {
 
     fn instance(definition: &StateTreeDefinition, limit: usize) -> StateTreeInstance<TestDomain> {
         let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize(Arc::clone(&definition.compiled), limit);
+        instance.initialize(
+            Arc::new(LinkedDefinition::new::<TestEvents>(Arc::clone(
+                &definition.compiled,
+            ))),
+            limit,
+        );
         instance
+    }
+
+    enum DescriptorEvents {
+        Combat,
+    }
+
+    impl crate::StateTreeEvents for DescriptorEvents {
+        const AUTHORED_NAMES: &'static [&'static str] = &["combat.damage"];
+
+        fn event_index(&self) -> usize {
+            match self {
+                Self::Combat => 0,
+            }
+        }
+    }
+
+    #[test]
+    fn linked_external_events_match_scxml_prefix_descriptors() {
+        let mut builder = StateTreeBuilder::new("descriptors");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let done = builder.final_state("done", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder.event_descriptor(waiting, "combat", done).unwrap();
+        let definition = builder.build().unwrap();
+        let mut execution =
+            StateTreeExecution::<DescriptorEvents>::new(&definition, NonZeroUsize::new(8).unwrap());
+
+        assert!(execution.process_event(&DescriptorEvents::Combat, NonZeroUsize::new(8).unwrap()));
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
     }
 
     #[test]
@@ -316,7 +435,7 @@ mod tests {
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_event("advance", &(), 64);
+        instance.process_authored_event("advance", 64);
 
         assert_eq!(
             instance.active_state_names().collect::<Vec<_>>(),
@@ -339,7 +458,7 @@ mod tests {
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 3);
 
-        instance.process_event("advance", &(), 3);
+        instance.process_authored_event("advance", 3);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(
@@ -361,7 +480,7 @@ mod tests {
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 1);
 
-        instance.process_event("advance", &(), 1);
+        instance.process_authored_event("advance", 1);
 
         assert_eq!(
             instance.status(),
@@ -384,7 +503,7 @@ mod tests {
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 1);
 
-        instance.process_event("advance", &(), 1);
+        instance.process_authored_event("advance", 1);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(
@@ -446,7 +565,7 @@ mod tests {
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_event("finish", &(), 64);
+        instance.process_authored_event("finish", 64);
 
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(
@@ -468,7 +587,7 @@ mod tests {
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_event("finish", &(), 64);
+        instance.process_authored_event("finish", 64);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(
@@ -494,7 +613,7 @@ mod tests {
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_event("finish", &(), 64);
+        instance.process_authored_event("finish", 64);
 
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(

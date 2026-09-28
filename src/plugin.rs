@@ -1,8 +1,9 @@
 use std::{
+    collections::HashMap,
     marker::PhantomData,
     num::NonZeroUsize,
     sync::{
-        Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -20,7 +21,9 @@ use bevy_tasks::ComputeTaskPool;
 
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
-    StateTreeDomain, StateTreeEvents, StateTreeInstance, instance::PendingStateTree,
+    StateTreeDomain, StateTreeEvents, StateTreeInstance,
+    definition::{CompiledDefinition, LinkedDefinition},
+    instance::PendingStateTree,
 };
 
 /// Ordered phases installed into each state-tree domain schedule.
@@ -109,6 +112,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
         }
 
         app.init_resource::<StateTreeEventIngress<D>>()
+            .init_resource::<LinkedStateTreeDefinitions<D>>()
             .init_resource::<StateTreeSettings<D>>()
             .configure_sets(
                 self.schedule,
@@ -131,6 +135,37 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
 
 #[derive(Resource)]
 struct StateTreeAssetsInstalled;
+
+#[derive(Resource)]
+struct LinkedStateTreeDefinitions<D: StateTreeDomain> {
+    definitions: HashMap<u64, Weak<LinkedDefinition>>,
+    marker: PhantomData<fn() -> D>,
+}
+
+impl<D: StateTreeDomain> Default for LinkedStateTreeDefinitions<D> {
+    fn default() -> Self {
+        Self {
+            definitions: HashMap::new(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
+    fn get_or_insert(&mut self, compiled: Arc<CompiledDefinition>) -> Arc<LinkedDefinition> {
+        if let Some(linked) = self
+            .definitions
+            .get(&compiled.identity)
+            .and_then(Weak::upgrade)
+        {
+            return linked;
+        }
+        let identity = compiled.identity;
+        let linked = Arc::new(LinkedDefinition::new::<D::Event>(compiled));
+        self.definitions.insert(identity, Arc::downgrade(&linked));
+        linked
+    }
+}
 
 struct EntityEventEntry<E> {
     batch: u64,
@@ -294,6 +329,7 @@ where
 fn initialize_pending<D: StateTreeDomain>(
     mut commands: Commands,
     definitions: Res<Assets<StateTreeDefinition>>,
+    mut linked_definitions: ResMut<LinkedStateTreeDefinitions<D>>,
     settings: Res<StateTreeSettings<D>>,
     mut instances: Query<(Entity, &mut StateTreeInstance<D>), With<PendingStateTree<D>>>,
 ) {
@@ -301,7 +337,10 @@ fn initialize_pending<D: StateTreeDomain>(
         let Some(definition) = definitions.get(instance.definition()) else {
             continue;
         };
-        instance.initialize(definition.compiled.clone(), settings.max_microsteps.get());
+        instance.initialize(
+            linked_definitions.get_or_insert(definition.compiled.clone()),
+            settings.max_microsteps.get(),
+        );
         commands.entity(entity).remove::<PendingStateTree<D>>();
     }
 }
@@ -398,7 +437,7 @@ fn process_external_event<D: StateTreeDomain>(
     microstep_limit: usize,
 ) {
     let changed = instance.bypass_change_detection().process_event(
-        event.authored_name(),
+        event.event_index(),
         event,
         microstep_limit,
     );

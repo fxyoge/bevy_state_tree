@@ -47,11 +47,13 @@ fn expand_state_tree_events_with_runtime(
     let enum_name = &input.ident;
     let mut payloads = HashSet::new();
     let mut name_arms = Vec::new();
+    let mut index_arms = Vec::new();
+    let mut authored_names = Vec::new();
     let mut payload_impls = Vec::new();
     let mut conversion_impls = Vec::new();
     let mut route_impls = Vec::new();
 
-    for variant in &data.variants {
+    for (index, variant) in data.variants.iter().enumerate() {
         let (authored_name, broadcast) = parse_variant(&variant.attrs, variant.span())?;
         let Fields::Unnamed(fields) = &variant.fields else {
             return Err(Error::new(
@@ -78,6 +80,10 @@ fn expand_state_tree_events_with_runtime(
         name_arms.push(quote! {
             Self::#variant_name(_) => #authored_name
         });
+        index_arms.push(quote! {
+            Self::#variant_name(_) => #index
+        });
+        authored_names.push(authored_name.clone());
         payload_impls.push(quote! {
             impl #runtime::StateTreeEventPayload<#enum_name> for #payload {
                 const AUTHORED_NAME: &'static str = #authored_name;
@@ -114,6 +120,14 @@ fn expand_state_tree_events_with_runtime(
 
     Ok(quote! {
         impl #runtime::StateTreeEvents for #enum_name {
+            const AUTHORED_NAMES: &'static [&'static str] = &[#(#authored_names),*];
+
+            fn event_index(&self) -> usize {
+                match self {
+                    #(#index_arms),*
+                }
+            }
+
             fn authored_name(&self) -> &'static str {
                 match self {
                     #(#name_arms),*
@@ -248,6 +262,8 @@ mod tests {
 
         assert!(output.contains("EntityStateTreeEvent"));
         assert!(output.contains("BroadcastStateTreeEvent"));
+        assert!(output.contains("AUTHORED_NAMES"));
+        assert!(output.contains("event_index"));
         assert!(output.contains("damage"));
         assert!(output.contains("reset"));
     }

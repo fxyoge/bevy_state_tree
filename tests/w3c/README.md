@@ -26,3 +26,9 @@ suite demonstrates implementability and interoperability rather than providing
 complete SCXML conformance certification.
 
 Generated SCXML and result reports belong under `target/`, never in `vendor/`.
+
+`expected.toml` records one reviewed boolean outcome for every manifest start
+resource. The integration test requires an exact key-set match and executes
+non-manual XML starts through the production SCXML compiler and state-tree
+runtime. Unsupported features count as failures; no fixture is skipped into a
+passing result.

@@ -39,7 +39,7 @@ pub use event::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEventPayload,
     StateTreeEvents,
 };
-pub use instance::{InstanceStatus, RuntimeFault, StateTreeInstance};
+pub use instance::{InstanceStatus, RuntimeFault, StateTreeExecution, StateTreeInstance};
 pub use plugin::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreePlugin, StateTreeSet,
     StateTreeSettings,
@@ -51,6 +51,6 @@ pub mod prelude {
         BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, EntityStateTreeEvent,
         EntityStateTreeEventWriter, InstanceStatus, RuntimeFault, StateId, StateTreeBuilder,
         StateTreeDefinition, StateTreeDomain, StateTreeEventPayload, StateTreeEvents,
-        StateTreeInstance, StateTreePlugin, StateTreeSet, StateTreeSettings,
+        StateTreeExecution, StateTreeInstance, StateTreePlugin, StateTreeSet, StateTreeSettings,
     };
 }
