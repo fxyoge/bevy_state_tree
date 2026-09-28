@@ -242,6 +242,15 @@ impl<D: Send + Sync + 'static> Default for StateTreeEventInbox<D> {
     }
 }
 
+impl<D: Send + Sync + 'static> StateTreeEventInbox<D> {
+    pub(crate) fn release_storage(&mut self) {
+        *self
+            .events
+            .get_mut()
+            .expect("state-tree event inbox poisoned") = Vec::new();
+    }
+}
+
 #[derive(Resource)]
 struct StateTreeEventIngress<D: Send + Sync + 'static> {
     broadcasts: Mutex<Vec<BroadcastEvent>>,
@@ -828,9 +837,29 @@ mod tests {
         app.update();
 
         queue_advance(&mut app, entity);
+        assert!(
+            app.world()
+                .get::<StateTreeEventInbox<Simulation>>(entity)
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .capacity()
+                > 0
+        );
         app.world_mut()
             .entity_mut(entity)
             .remove::<StateTreeInstance<Simulation>>();
+        assert_eq!(
+            app.world()
+                .get::<StateTreeEventInbox<Simulation>>(entity)
+                .unwrap()
+                .events
+                .lock()
+                .unwrap()
+                .capacity(),
+            0
+        );
         app.world_mut()
             .entity_mut(entity)
             .insert(StateTreeInstance::<Simulation>::new(handle));

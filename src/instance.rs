@@ -7,7 +7,7 @@ use std::{
 };
 
 use bevy_asset::{AssetId, Handle};
-use bevy_ecs::component::Component;
+use bevy_ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld};
 
 use crate::definition::{CompiledDefinition, EventId, StateId, StateKind, Transition};
 use crate::{StateTreeDefinition, plugin::StateTreeEventInbox};
@@ -48,6 +48,7 @@ pub enum RuntimeFault {
 /// reload support can migrate that retained definition without reusing the
 /// initial [`InstanceStatus::Pending`] state or replacing the event inbox.
 #[derive(Component, Debug)]
+#[component(on_remove = release_event_inbox::<D>)]
 #[require(PendingStateTree<D>, StateTreeEventInbox<D>)]
 pub struct StateTreeInstance<D: Send + Sync + 'static> {
     runtime_id: u64,
@@ -56,6 +57,14 @@ pub struct StateTreeInstance<D: Send + Sync + 'static> {
     active: Vec<StateId>,
     status: InstanceStatus,
     marker: PhantomData<fn() -> D>,
+}
+
+fn release_event_inbox<D: Send + Sync + 'static>(mut world: DeferredWorld, context: HookContext) {
+    let mut entity = world.entity_mut(context.entity);
+    let Some(mut inbox) = entity.get_mut::<StateTreeEventInbox<D>>() else {
+        return;
+    };
+    inbox.release_storage();
 }
 
 impl<D: Send + Sync + 'static> StateTreeInstance<D> {
