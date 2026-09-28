@@ -31,6 +31,8 @@ mod event;
 mod instance;
 mod plugin;
 
+pub mod scxml;
+
 pub use bevy_state_tree_macros::StateTreeEvents;
 pub use definition::{BuildError, StateId, StateTreeBuilder, StateTreeDefinition};
 pub use event::{

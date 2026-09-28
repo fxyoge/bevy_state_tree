@@ -15,6 +15,14 @@ The crate currently provides the runtime foundation:
 SCXML loading, activities, behavior-tree composites, guards, parallel regions,
 history, and invocation are planned on top of this foundation.
 
+The `scxml` module provides a namespace-aware authored-syntax parser that keeps
+SCXML structure, document order, source spans, raw expressions, and foreign
+extensions separate from the current runtime representation. The pinned W3C
+implementation-report corpus under `tests/w3c` currently establishes complete
+corpus acceptance plus targeted authored-data preservation checks; fixtures are
+not lowered into the legacy single-path runtime or reported as conformance
+passes.
+
 Each runtime domain owns a closed external event protocol. Tuple variants keep
 the original Rust payload intact through queueing and execution, while the
 derive generates event-name matching and writer conversions. Variants are
