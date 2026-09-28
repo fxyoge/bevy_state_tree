@@ -9,7 +9,8 @@ The crate currently provides the runtime foundation:
 - atomic, compound, and final states;
 - hierarchical and eventless external transitions;
 - bounded iterative macrostep stabilization;
-- direct integration with ordinary targeted and broadcast Bevy messages.
+- ordered per-instance entity and broadcast event queues;
+- parallel event processing across independent instances.
 
 SCXML loading, activities, behavior-tree composites, guards, parallel regions,
 history, and invocation are planned on top of this foundation.
@@ -22,13 +23,29 @@ use bevy_state_tree::prelude::*;
 
 struct Simulation;
 
-#[derive(Message, EntityEvent)]
+#[derive(EntityEvent)]
 struct Wake {
     entity: Entity,
+}
+
+fn wake(mut events: EntityStateTreeEventWriter<Simulation, Wake>) {
+    // In a real system this would be the entity whose tree should wake.
+    let entity = Entity::PLACEHOLDER;
+    events.write(Wake { entity });
 }
 
 let mut app = App::new();
 app.add_plugins(AssetPlugin::default())
     .add_plugins(StateTreePlugin::<Simulation>::new(FixedUpdate))
-    .register_targeted_state_tree_event::<Simulation, Wake>("wake");
+    .register_entity_state_tree_event::<Simulation, Wake>("wake")
+    .add_systems(FixedUpdate, wake.in_set(StateTreeSet::QueueEvents));
 ```
+
+Each state-tree instance observes its own ordered event stream. Entity events
+for different instances have no relative order and those instances are
+processed in parallel. Broadcast events are merged into each instance's stream
+at the point where they were written.
+
+Instances that initialize before event processing receive events queued during
+that schedule run. Instances still waiting for their definition asset receive
+no events, and queued entity events are discarded rather than replayed later.

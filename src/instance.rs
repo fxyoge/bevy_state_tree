@@ -1,15 +1,26 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{
+    marker::PhantomData,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use bevy_asset::{AssetId, Handle};
 use bevy_ecs::component::Component;
 
-use crate::StateTreeDefinition;
 use crate::definition::{CompiledDefinition, EventId, StateId, StateKind, Transition};
+use crate::{StateTreeDefinition, plugin::StateTreeEventInbox};
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Current execution status of a state-tree instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InstanceStatus {
-    /// The definition asset has not been initialized yet.
+    /// The definition asset has never been initialized.
+    ///
+    /// Events are not retained while an instance remains pending at the event
+    /// processing boundary.
     Pending,
     /// The instance is stable and can receive events.
     Running,
@@ -30,9 +41,16 @@ pub enum RuntimeFault {
 ///
 /// `D` identifies an independent runtime domain, allowing an application to
 /// run simulation, UI, or dialogue trees in different schedules.
+///
+/// Initialization retains an [`Arc`] to the compiled definition, so removing
+/// or replacing the source asset cannot invalidate a running instance. Asset
+/// replacement is not currently applied to running instances; future hot
+/// reload support can migrate that retained definition without reusing the
+/// initial [`InstanceStatus::Pending`] state or replacing the event inbox.
 #[derive(Component, Debug)]
-#[require(PendingStateTree<D>)]
+#[require(PendingStateTree<D>, StateTreeEventInbox<D>)]
 pub struct StateTreeInstance<D: Send + Sync + 'static> {
+    runtime_id: u64,
     definition: Handle<StateTreeDefinition>,
     compiled: Option<Arc<CompiledDefinition>>,
     active: Vec<StateId>,
@@ -44,6 +62,7 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
     /// Creates an instance waiting for its definition asset.
     pub fn new(definition: Handle<StateTreeDefinition>) -> Self {
         Self {
+            runtime_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             definition,
             compiled: None,
             active: Vec::new(),
@@ -60,6 +79,10 @@ impl<D: Send + Sync + 'static> StateTreeInstance<D> {
     /// Returns the source definition asset ID.
     pub fn definition_id(&self) -> AssetId<StateTreeDefinition> {
         self.definition.id()
+    }
+
+    pub(crate) fn runtime_id(&self) -> u64 {
+        self.runtime_id
     }
 
     /// Returns the current execution status.
