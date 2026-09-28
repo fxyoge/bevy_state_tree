@@ -28,10 +28,13 @@ pub enum InstanceStatus {
     /// The instance entered a final child of the root state.
     Complete,
     /// Execution stopped because the definition could not stabilize.
+    ///
+    /// Faulted instances ignore subsequent events. Remove this component and
+    /// insert a new [`StateTreeInstance`] to restart execution.
     Faulted(RuntimeFault),
 }
 
-/// A fatal runtime fault requiring an explicit instance reset.
+/// A terminal state-tree execution fault.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFault {
     /// Another transition set was enabled after the macrostep reached its limit.
