@@ -24,9 +24,12 @@ instead of ignoring it. Compiled definitions contain dense identifiers and
 precomputed transition entry/exit plans; macrosteps do not traverse the SCXML
 tree or resolve authored names.
 
+See [SCXML Support Policy](SCXML.md) for the Bevy-first compatibility scope and
+intentional differences from general-purpose SCXML processors.
+
 The pinned W3C implementation-report corpus under `tests/w3c` is parsed and
 attempted through that same compiler and runtime. `tests/w3c/expected.toml`
-records the reviewed pass/fail result for every manifest start resource, and
+records the reviewed expected outcome for every manifest start resource, and
 normal tests fail on missing cases or any observed result change.
 
 Each runtime domain owns a closed external event protocol. Tuple variants keep

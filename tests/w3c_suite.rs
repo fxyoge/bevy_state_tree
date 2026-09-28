@@ -29,6 +29,18 @@ struct ExecutionResult {
     detail: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ExpectedOutcome {
+    Pass,
+    Fail(String),
+}
+
+impl ExpectedOutcome {
+    fn passed(&self) -> bool {
+        matches!(self, Self::Pass)
+    }
+}
+
 enum NoEvents {}
 
 impl StateTreeEvents for NoEvents {
@@ -241,10 +253,16 @@ fn manifest_starts_match_expected_w3c_outcomes() {
             observed_passes += usize::from(result.passed);
             *categories.entry(result.category).or_insert(0usize) += 1;
             if let Some(expected) = expected.get(resource)
-                && *expected != result.passed
+                && expected.passed() != result.passed
             {
+                let expectation = match expected {
+                    ExpectedOutcome::Pass => "expected pass".to_owned(),
+                    ExpectedOutcome::Fail(reason) => {
+                        format!("expected failure because {reason}")
+                    }
+                };
                 mismatches.push(format!(
-                    "{resource}: expected {expected}, observed {} ({}){}",
+                    "{resource}: {expectation}, observed {} ({}){}",
                     result.passed,
                     result.category,
                     if result.detail.is_empty() {
@@ -269,27 +287,68 @@ fn manifest_starts_match_expected_w3c_outcomes() {
     );
 }
 
-fn parse_expected() -> BTreeMap<String, bool> {
+fn parse_expected() -> BTreeMap<String, ExpectedOutcome> {
     let source = fs::read_to_string(Path::new(SUITE_ROOT).join("expected.toml")).unwrap();
-    let mut document = source.parse::<toml::Table>().unwrap();
+    parse_expected_source(&source).unwrap_or_else(|error| panic!("invalid expected.toml: {error}"))
+}
+
+fn parse_expected_source(source: &str) -> Result<BTreeMap<String, ExpectedOutcome>, String> {
+    let mut document = source
+        .parse::<toml::Table>()
+        .map_err(|error| error.to_string())?;
     let results = document
         .remove("results")
         .and_then(|value| match value {
             toml::Value::Table(table) => Some(table),
             _ => None,
         })
-        .expect("expected.toml must contain a [results] table");
+        .ok_or_else(|| "expected a [results] table".to_owned())?;
     results
         .into_iter()
         .map(|(resource, value)| {
-            (
-                resource,
-                value
-                    .as_bool()
-                    .expect("expected W3C outcomes must be booleans"),
-            )
+            let outcome = match value {
+                toml::Value::Boolean(true) => ExpectedOutcome::Pass,
+                toml::Value::String(reason) if !reason.trim().is_empty() => {
+                    ExpectedOutcome::Fail(reason)
+                }
+                toml::Value::Boolean(false) => {
+                    return Err(format!(
+                        "{resource}: use a failure reason string instead of false"
+                    ));
+                }
+                toml::Value::String(_) => {
+                    return Err(format!("{resource}: failure reason must not be empty"));
+                }
+                _ => {
+                    return Err(format!(
+                        "{resource}: expected true or a failure reason string"
+                    ));
+                }
+            };
+            Ok((resource, outcome))
         })
         .collect()
+}
+
+#[test]
+fn expected_outcomes_require_reasons_for_failures() {
+    let expected = parse_expected_source(
+        r#"
+            [results]
+            "pass.txml" = true
+            "fail.txml" = "requires parallel states"
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(expected["pass.txml"], ExpectedOutcome::Pass);
+    assert_eq!(
+        expected["fail.txml"],
+        ExpectedOutcome::Fail("requires parallel states".to_owned())
+    );
+    assert!(parse_expected_source("[results]\n\"test.txml\" = false").is_err());
+    assert!(parse_expected_source("[results]\n\"test.txml\" = \"  \"").is_err());
+    assert!(parse_expected_source("[results]\n\"test.txml\" = 1").is_err());
 }
 
 fn execute_start(resource: &str, manual: bool) -> ExecutionResult {
