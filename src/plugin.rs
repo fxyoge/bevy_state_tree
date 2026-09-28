@@ -91,7 +91,12 @@ impl<D: Send + Sync + 'static> Plugin for StateTreePlugin<D> {
                 app.world().contains_resource::<AssetServer>(),
                 "StateTreePlugin requires Bevy's AssetPlugin to be installed first"
             );
-            app.init_asset::<StateTreeDefinition>();
+            if !app
+                .world()
+                .contains_resource::<Assets<StateTreeDefinition>>()
+            {
+                app.init_asset::<StateTreeDefinition>();
+            }
             app.insert_resource(StateTreeAssetsInstalled);
         }
 
@@ -570,6 +575,25 @@ mod tests {
         .register_broadcast_state_tree_event::<Simulation, ResetAll>("reset")
         .register_broadcast_state_tree_event::<Simulation, AdvanceAll>("advance");
         app
+    }
+
+    #[test]
+    fn plugin_preserves_an_existing_definition_asset_store() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<StateTreeDefinition>();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(definition());
+
+        app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
+
+        assert!(
+            app.world()
+                .resource::<Assets<StateTreeDefinition>>()
+                .contains(handle.id())
+        );
     }
 
     fn write_advance(
