@@ -4,9 +4,9 @@
 "364/test364.txml" = false
 "372/test372.txml" = false
 "570/test570.txml" = false
-"375/test375.txml" = false
+"375/test375.txml" = true
 "376/test376.txml" = false
-"377/test377.txml" = false
+"377/test377.txml" = true
 "378/test378.txml" = false
 "387/test387.txml" = false
 "579/test579.txml" = false
@@ -39,7 +39,7 @@
 "505/test505.txml" = false
 "506/test506.txml" = false
 "533/test533.txml" = false
-"144/test144.txml" = false
+"144/test144.txml" = true
 "147/test147.txml" = false
 "148/test148.txml" = false
 "149/test149.txml" = false

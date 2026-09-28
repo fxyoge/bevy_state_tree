@@ -84,7 +84,16 @@ pub(crate) struct StateNode {
     pub parent: Option<StateId>,
     pub depth: u32,
     pub kind: StateKind,
+    pub entry_raises: Box<[EventId]>,
+    pub exit_raises: Box<[EventId]>,
+    pub initial_raises: Box<[EventId]>,
     pub transitions: Box<[Transition]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Entry {
+    pub state: StateId,
+    pub take_initial: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +103,8 @@ pub(crate) struct Transition {
     pub exit_depth: u32,
     pub entry_start: u32,
     pub entry_len: u32,
+    pub raise_start: u32,
+    pub raise_len: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -102,8 +113,9 @@ pub(crate) struct CompiledDefinition {
     pub name: Box<str>,
     pub root: StateId,
     pub states: Box<[StateNode]>,
-    pub transition_entries: Box<[StateId]>,
-    pub initial_entries: Box<[StateId]>,
+    pub transition_entries: Box<[Entry]>,
+    pub transition_raises: Box<[EventId]>,
+    pub initial_entries: Box<[Entry]>,
     pub max_depth: usize,
     events: Box<[EventPattern]>,
 }
@@ -214,6 +226,9 @@ struct DraftState {
     name: Box<str>,
     parent: Option<StateId>,
     kind: DraftKind,
+    entry_raises: Vec<Box<str>>,
+    exit_raises: Vec<Box<str>>,
+    initial_raises: Vec<Box<str>>,
     transitions: Vec<DraftTransition>,
 }
 
@@ -221,6 +236,7 @@ struct DraftState {
 struct DraftTransition {
     event: Option<EventPattern>,
     target: StateId,
+    raises: Vec<Box<str>>,
 }
 
 /// Builds and validates a [`StateTreeDefinition`].
@@ -316,25 +332,77 @@ impl StateTreeBuilder {
         if event.is_empty() {
             return Err(BuildError::EmptyEventName);
         }
-        self.add_transition(source, Some(EventPattern::Exact(event)), target)
+        self.add_transition(source, Some(EventPattern::Exact(event)), target, Vec::new())
     }
 
+    pub(crate) fn event_descriptor_with_raises(
+        &mut self,
+        source: StateId,
+        descriptor: impl Into<Box<str>>,
+        target: StateId,
+        raises: Vec<Box<str>>,
+    ) -> Result<&mut Self, BuildError> {
+        let descriptor = descriptor.into();
+        if descriptor.is_empty() {
+            return Err(BuildError::EmptyEventName);
+        }
+        self.add_transition(
+            source,
+            Some(EventPattern::Descriptor(descriptor)),
+            target,
+            raises,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn event_descriptor(
         &mut self,
         source: StateId,
         descriptor: impl Into<Box<str>>,
         target: StateId,
     ) -> Result<&mut Self, BuildError> {
-        let descriptor = descriptor.into();
-        if descriptor.is_empty() {
-            return Err(BuildError::EmptyEventName);
-        }
-        self.add_transition(source, Some(EventPattern::Descriptor(descriptor)), target)
+        self.event_descriptor_with_raises(source, descriptor, target, Vec::new())
     }
 
     /// Adds an eventless external transition.
     pub fn eventless(&mut self, source: StateId, target: StateId) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, target)
+        self.add_transition(source, None, target, Vec::new())
+    }
+
+    pub(crate) fn eventless_with_raises(
+        &mut self,
+        source: StateId,
+        target: StateId,
+        raises: Vec<Box<str>>,
+    ) -> Result<&mut Self, BuildError> {
+        self.add_transition(source, None, target, raises)
+    }
+
+    pub(crate) fn entry_raises(
+        &mut self,
+        state: StateId,
+        raises: Vec<Box<str>>,
+    ) -> Result<&mut Self, BuildError> {
+        self.require_state_mut(state)?.entry_raises = raises;
+        Ok(self)
+    }
+
+    pub(crate) fn exit_raises(
+        &mut self,
+        state: StateId,
+        raises: Vec<Box<str>>,
+    ) -> Result<&mut Self, BuildError> {
+        self.require_state_mut(state)?.exit_raises = raises;
+        Ok(self)
+    }
+
+    pub(crate) fn initial_raises(
+        &mut self,
+        state: StateId,
+        raises: Vec<Box<str>>,
+    ) -> Result<&mut Self, BuildError> {
+        self.require_state_mut(state)?.initial_raises = raises;
+        Ok(self)
     }
 
     /// Validates and compiles the definition.
@@ -357,6 +425,7 @@ impl StateTreeBuilder {
         let mut event_ids = HashMap::<EventPattern, EventId>::new();
         let mut states = Vec::with_capacity(self.states.len());
         let mut transition_entries = Vec::new();
+        let mut transition_raises = Vec::new();
 
         for (index, draft) in self.states.iter().enumerate() {
             let state_id = StateId {
@@ -409,6 +478,14 @@ impl StateTreeBuilder {
                         &depths,
                         &mut transition_entries,
                     )?,
+                    raise_start: u32::try_from(transition_raises.len())
+                        .map_err(|_| BuildError::TooManyActions)?,
+                    raise_len: append_raises(
+                        &transition.raises,
+                        &mut events,
+                        &mut event_ids,
+                        &mut transition_raises,
+                    )?,
                 });
             }
 
@@ -417,11 +494,17 @@ impl StateTreeBuilder {
                 parent: draft.parent,
                 depth: depths[index],
                 kind,
+                entry_raises: compile_raises(&draft.entry_raises, &mut events, &mut event_ids)?,
+                exit_raises: compile_raises(&draft.exit_raises, &mut events, &mut event_ids)?,
+                initial_raises: compile_raises(&draft.initial_raises, &mut events, &mut event_ids)?,
                 transitions: transitions.into_boxed_slice(),
             });
         }
 
-        let mut initial_entries = vec![root];
+        let mut initial_entries = vec![Entry {
+            state: root,
+            take_initial: matches!(states[root.index()].kind, StateKind::Compound { .. }),
+        }];
         append_initial_descendants(root, &states, &mut initial_entries);
         let max_depth = depths.iter().copied().max().unwrap_or(0).saturating_add(1) as usize;
 
@@ -432,6 +515,7 @@ impl StateTreeBuilder {
                 root,
                 states: states.into_boxed_slice(),
                 transition_entries: transition_entries.into_boxed_slice(),
+                transition_raises: transition_raises.into_boxed_slice(),
                 initial_entries: initial_entries.into_boxed_slice(),
                 max_depth,
                 events: events.into_boxed_slice(),
@@ -474,6 +558,9 @@ impl StateTreeBuilder {
             name: name.clone(),
             parent,
             kind,
+            entry_raises: Vec::new(),
+            exit_raises: Vec::new(),
+            initial_raises: Vec::new(),
             transitions: Vec::new(),
         });
         self.names.insert(name, id);
@@ -485,13 +572,18 @@ impl StateTreeBuilder {
         source: StateId,
         event: Option<EventPattern>,
         target: StateId,
+        raises: Vec<Box<str>>,
     ) -> Result<&mut Self, BuildError> {
         self.require_state(target)?;
         let state = self.require_state_mut(source)?;
         if matches!(state.kind, DraftKind::Final) {
             return Err(BuildError::FinalHasTransition(source));
         }
-        state.transitions.push(DraftTransition { event, target });
+        state.transitions.push(DraftTransition {
+            event,
+            target,
+            raises,
+        });
         Ok(self)
     }
 
@@ -526,6 +618,34 @@ fn intern_event(
     events.push(pattern.clone());
     event_ids.insert(pattern, event);
     Ok(event)
+}
+
+fn compile_raises(
+    raises: &[Box<str>],
+    events: &mut Vec<EventPattern>,
+    event_ids: &mut HashMap<EventPattern, EventId>,
+) -> Result<Box<[EventId]>, BuildError> {
+    raises
+        .iter()
+        .map(|event| intern_event(events, event_ids, EventPattern::Exact(event.clone())))
+        .collect()
+}
+
+fn append_raises(
+    raises: &[Box<str>],
+    events: &mut Vec<EventPattern>,
+    event_ids: &mut HashMap<EventPattern, EventId>,
+    compiled: &mut Vec<EventId>,
+) -> Result<u32, BuildError> {
+    let start = compiled.len();
+    for event in raises {
+        compiled.push(intern_event(
+            events,
+            event_ids,
+            EventPattern::Exact(event.clone()),
+        )?);
+    }
+    u32::try_from(compiled.len() - start).map_err(|_| BuildError::TooManyActions)
 }
 
 fn transition_domain(
@@ -574,7 +694,7 @@ fn append_transition_entries(
     target: StateId,
     states: &[DraftState],
     depths: &[u32],
-    entries: &mut Vec<StateId>,
+    entries: &mut Vec<Entry>,
 ) -> Result<u32, BuildError> {
     let domain = transition_domain(source, target, states, depths);
     let start = entries.len();
@@ -585,27 +705,36 @@ fn append_transition_entries(
         reverse.push(state);
         cursor = states[state.index()].parent;
     }
-    entries.extend(reverse.into_iter().rev());
+    entries.extend(reverse.into_iter().rev().map(|state| Entry {
+        state,
+        take_initial: false,
+    }));
 
     let mut cursor = target;
     while let DraftKind::Compound {
         initial: Some(initial),
     } = states[cursor.index()].kind
     {
-        entries.push(initial);
+        entries
+            .last_mut()
+            .expect("the transition target is always entered")
+            .take_initial = true;
+        entries.push(Entry {
+            state: initial,
+            take_initial: false,
+        });
         cursor = initial;
     }
 
     u32::try_from(entries.len() - start).map_err(|_| BuildError::TooManyStates)
 }
 
-fn append_initial_descendants(
-    mut state: StateId,
-    states: &[StateNode],
-    entries: &mut Vec<StateId>,
-) {
+fn append_initial_descendants(mut state: StateId, states: &[StateNode], entries: &mut Vec<Entry>) {
     while let StateKind::Compound { initial, .. } = states[state.index()].kind {
-        entries.push(initial);
+        entries.push(Entry {
+            state: initial,
+            take_initial: matches!(states[initial.index()].kind, StateKind::Compound { .. }),
+        });
         state = initial;
     }
 }
@@ -643,6 +772,8 @@ pub enum BuildError {
     TooManyStates,
     #[error("a definition cannot contain more than u32::MAX event names")]
     TooManyEvents,
+    #[error("a definition cannot contain more than u32::MAX executable actions")]
+    TooManyActions,
 }
 
 #[cfg(test)]

@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use super::{
-    Attribute, Document, Final, FinalChild, Initial, OnEntry, OnExit, RootChild, Span, State,
-    StateChild, Transition, TransitionType,
+    Attribute, Document, ExecutableContent, Final, FinalChild, Initial, OnEntry, OnExit, RootChild,
+    Span, State, StateChild, Transition, TransitionType,
 };
 use crate::{BuildError, StateId, StateTreeBuilder, StateTreeDefinition};
 
@@ -152,6 +152,17 @@ impl<'a> Compiler<'a> {
         if let Some(id) = state.id.as_deref() {
             self.ids.insert(id, runtime);
         }
+        let mut entry_raises = Vec::new();
+        let mut exit_raises = Vec::new();
+        for child in &state.children {
+            match child {
+                StateChild::OnEntry(value) => entry_raises.extend(self.entry_raises(value)?),
+                StateChild::OnExit(value) => exit_raises.extend(self.exit_raises(value)?),
+                _ => {}
+            }
+        }
+        self.builder.entry_raises(runtime, entry_raises)?;
+        self.builder.exit_raises(runtime, exit_raises)?;
         self.records.push(Record {
             node: Node::State(state),
             runtime,
@@ -176,8 +187,7 @@ impl<'a> Compiler<'a> {
                 StateChild::Extension(value) => {
                     return self.unsupported(value.span, "foreign extensions");
                 }
-                StateChild::OnEntry(value) => self.check_entry(value)?,
-                StateChild::OnExit(value) => self.check_exit(value)?,
+                StateChild::OnEntry(_) | StateChild::OnExit(_) => {}
                 StateChild::Initial(_) | StateChild::Transition(_) => {}
             }
         }
@@ -188,10 +198,12 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&state.attributes) {
             return self.unsupported(state.span, "foreign final-state attributes");
         }
+        let mut entry_raises = Vec::new();
+        let mut exit_raises = Vec::new();
         for child in &state.children {
             match child {
-                FinalChild::OnEntry(value) => self.check_entry(value)?,
-                FinalChild::OnExit(value) => self.check_exit(value)?,
+                FinalChild::OnEntry(value) => entry_raises.extend(self.entry_raises(value)?),
+                FinalChild::OnExit(value) => exit_raises.extend(self.exit_raises(value)?),
                 FinalChild::DoneData(value) => {
                     return self.unsupported(value.span, "done data");
                 }
@@ -202,6 +214,8 @@ impl<'a> Compiler<'a> {
         }
         let name = self.node_name(state.id.as_deref());
         let runtime = self.builder.final_state(name, parent)?;
+        self.builder.entry_raises(runtime, entry_raises)?;
+        self.builder.exit_raises(runtime, exit_raises)?;
         if let Some(id) = state.id.as_deref() {
             self.ids.insert(id, runtime);
         }
@@ -258,7 +272,8 @@ impl<'a> Compiler<'a> {
             let Some(transition) = initial.transition.as_ref() else {
                 return self.invalid_initial(initial.span);
             };
-            self.check_initial_transition(transition)?;
+            let raises = self.check_initial_transition(transition)?;
+            self.builder.initial_raises(state, raises)?;
             self.target(
                 transition.targets.first().expect("checked target"),
                 transition.span,
@@ -283,19 +298,21 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn check_initial_transition(&self, transition: &Transition) -> Result<(), CompileError> {
+    fn check_initial_transition(
+        &self,
+        transition: &Transition,
+    ) -> Result<Vec<Box<str>>, CompileError> {
         if transition.targets.len() != 1 {
             return self.invalid_initial(transition.span);
         }
         if transition.event.is_some()
             || transition.condition.is_some()
             || transition.transition_type.is_some()
-            || !transition.content.is_empty()
             || has_foreign_attributes(&transition.attributes)
         {
             return self.unsupported(transition.span, "executable initial transitions");
         }
-        Ok(())
+        self.raises(&transition.content, transition.span)
     }
 
     fn compile_transition(
@@ -309,9 +326,7 @@ impl<'a> Compiler<'a> {
         if transition.transition_type == Some(TransitionType::Internal) {
             return self.unsupported(transition.span, "internal transitions");
         }
-        if !transition.content.is_empty() {
-            return self.unsupported(transition.span, "transition executable content");
-        }
+        let raises = self.raises(&transition.content, transition.span)?;
         if has_foreign_attributes(&transition.attributes) {
             return self.unsupported(transition.span, "foreign transition attributes");
         }
@@ -320,30 +335,51 @@ impl<'a> Compiler<'a> {
         }
         let target = self.target(&transition.targets[0], transition.span)?;
         if transition.events.is_empty() {
-            self.builder.eventless(source, target)?;
+            self.builder.eventless_with_raises(source, target, raises)?;
         } else {
             for event in &transition.events {
-                self.builder
-                    .event_descriptor(source, event.clone(), target)?;
+                self.builder.event_descriptor_with_raises(
+                    source,
+                    event.clone(),
+                    target,
+                    raises.clone(),
+                )?;
             }
         }
         Ok(())
     }
 
-    fn check_entry(&self, entry: &OnEntry) -> Result<(), CompileError> {
-        if entry.content.is_empty() && !has_foreign_attributes(&entry.attributes) {
-            Ok(())
-        } else {
-            self.unsupported(entry.span, "onentry executable content")
+    fn entry_raises(&self, entry: &OnEntry) -> Result<Vec<Box<str>>, CompileError> {
+        if has_foreign_attributes(&entry.attributes) {
+            return self.unsupported(entry.span, "foreign onentry attributes");
         }
+        self.raises(&entry.content, entry.span)
     }
 
-    fn check_exit(&self, exit: &OnExit) -> Result<(), CompileError> {
-        if exit.content.is_empty() && !has_foreign_attributes(&exit.attributes) {
-            Ok(())
-        } else {
-            self.unsupported(exit.span, "onexit executable content")
+    fn exit_raises(&self, exit: &OnExit) -> Result<Vec<Box<str>>, CompileError> {
+        if has_foreign_attributes(&exit.attributes) {
+            return self.unsupported(exit.span, "foreign onexit attributes");
         }
+        self.raises(&exit.content, exit.span)
+    }
+
+    fn raises(
+        &self,
+        content: &[ExecutableContent],
+        span: Span,
+    ) -> Result<Vec<Box<str>>, CompileError> {
+        content
+            .iter()
+            .map(|executable| match executable {
+                ExecutableContent::Raise(raise) if !has_foreign_attributes(&raise.attributes) => {
+                    Ok(Box::<str>::from(raise.event.as_str()))
+                }
+                ExecutableContent::Raise(raise) => {
+                    self.unsupported(raise.span, "foreign raise attributes")
+                }
+                _ => self.unsupported(span, "executable content other than raise"),
+            })
+            .collect()
     }
 
     fn target(&self, target: &str, span: Span) -> Result<StateId, CompileError> {
@@ -491,7 +527,9 @@ mod tests {
         assert_eq!(transition.exit_depth, 2);
         assert_eq!(transition.entry_len, 1);
         assert_eq!(
-            compiled.transition_entries[transition.entry_start as usize].index(),
+            compiled.transition_entries[transition.entry_start as usize]
+                .state
+                .index(),
             second
         );
     }
@@ -530,6 +568,91 @@ mod tests {
 
         let execution =
             StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap());
+
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
+    }
+
+    fn execute(source: &str) -> StateTreeExecution<NoEvents> {
+        let document = scxml::parse("raises.scxml", source).unwrap();
+        let definition = compile(&document).unwrap();
+        StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(32).unwrap())
+    }
+
+    #[test]
+    fn executes_initial_and_entry_raises_in_order() {
+        let execution = execute(&format!(
+            r#"<scxml xmlns="{NS}">
+                <state id="parent">
+                    <initial><transition target="leaf"><raise event="first"/></transition></initial>
+                    <state id="leaf">
+                        <onentry><raise event="second"/></onentry>
+                        <transition event="first" target="waiting"/>
+                    </state>
+                    <state id="waiting"><transition event="second" target="pass"/></state>
+                </state>
+                <final id="pass"/>
+            </scxml>"#
+        ));
+
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
+    }
+
+    #[test]
+    fn executes_exit_raises_before_transition_raises() {
+        let execution = execute(&format!(
+            r#"<scxml xmlns="{NS}">
+                <state id="source">
+                    <onentry><raise event="go"/></onentry>
+                    <onexit><raise event="first"/></onexit>
+                    <transition event="go" target="waiting"><raise event="second"/></transition>
+                </state>
+                <state id="waiting"><transition event="first" target="next"/></state>
+                <state id="next"><transition event="second" target="pass"/></state>
+                <final id="pass"/>
+            </scxml>"#
+        ));
+
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
+    }
+
+    #[test]
+    fn final_entry_raises_precede_completion_events() {
+        let execution = execute(&format!(
+            r#"<scxml xmlns="{NS}">
+                <state id="parent">
+                    <transition event="first" target="waiting"/>
+                    <final id="finished"><onentry><raise event="first"/></onentry></final>
+                </state>
+                <state id="waiting"><transition event="done.state.parent" target="pass"/></state>
+                <final id="pass"/>
+            </scxml>"#
+        ));
+
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
+    }
+
+    #[test]
+    fn direct_descendant_targets_do_not_execute_ancestor_initial_actions() {
+        let execution = execute(&format!(
+            r#"<scxml xmlns="{NS}">
+                <state id="source"><transition target="leaf"/></state>
+                <state id="parent">
+                    <initial><transition target="other"><raise event="bad"/></transition></initial>
+                    <state id="other"/>
+                    <state id="leaf">
+                        <onentry><raise event="good"/></onentry>
+                        <transition event="good" target="pass"/>
+                        <transition event="bad" target="fail"/>
+                    </state>
+                </state>
+                <final id="pass"/>
+                <final id="fail"/>
+            </scxml>"#
+        ));
 
         assert_eq!(execution.status(), &InstanceStatus::Complete);
         assert_eq!(execution.active_state_names().last(), Some("pass"));

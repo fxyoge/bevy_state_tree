@@ -11,7 +11,9 @@ use std::{
 use bevy_asset::{AssetId, Handle};
 use bevy_ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld};
 
-use crate::definition::{EventId, EventSet, LinkedDefinition, StateId, StateKind, Transition};
+use crate::definition::{
+    Entry, EventId, EventSet, LinkedDefinition, StateId, StateKind, Transition,
+};
 use crate::{StateTreeDefinition, StateTreeDomain, StateTreeEvents, plugin::StateTreeEventInbox};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -177,7 +179,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.internal_events.clear();
         self.internal_events.reserve(compiled.max_depth);
         self.status = InstanceStatus::Running;
-        self.active.extend_from_slice(&compiled.initial_entries);
+        for entry in &compiled.initial_entries {
+            self.enter_state(compiled, *entry);
+        }
         self.update_completion();
         if self.status == InstanceStatus::Running {
             self.stabilize(microstep_limit, 0);
@@ -285,21 +289,49 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     fn take_transition(&mut self, transition: Transition) {
-        let Some(linked) = self.linked.as_ref() else {
+        let Some(compiled) = self
+            .linked
+            .as_ref()
+            .map(|linked| Arc::clone(&linked.compiled))
+        else {
             return;
         };
-        let compiled = &linked.compiled;
+        for state in self.active[transition.exit_depth as usize..].iter().rev() {
+            self.internal_events
+                .extend(compiled.state(*state).exit_raises.iter().copied());
+        }
         self.active.truncate(transition.exit_depth as usize);
+
+        let raise_start = transition.raise_start as usize;
+        let raise_end = raise_start + transition.raise_len as usize;
+        self.internal_events.extend(
+            compiled.transition_raises[raise_start..raise_end]
+                .iter()
+                .copied(),
+        );
+
         let start = transition.entry_start as usize;
         let end = start + transition.entry_len as usize;
-        self.active
-            .extend_from_slice(&compiled.transition_entries[start..end]);
+        for entry in &compiled.transition_entries[start..end] {
+            self.enter_state(&compiled, *entry);
+        }
         debug_assert!(
             self.active
                 .iter()
                 .enumerate()
                 .all(|(depth, state)| compiled.state(*state).depth as usize == depth)
         );
+    }
+
+    fn enter_state(&mut self, compiled: &crate::definition::CompiledDefinition, entry: Entry) {
+        self.active.push(entry.state);
+        let state = compiled.state(entry.state);
+        self.internal_events
+            .extend(state.entry_raises.iter().copied());
+        if entry.take_initial {
+            self.internal_events
+                .extend(state.initial_raises.iter().copied());
+        }
     }
 
     fn update_completion(&mut self) {
