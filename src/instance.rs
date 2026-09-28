@@ -33,7 +33,7 @@ pub enum InstanceStatus {
 /// A fatal runtime fault requiring an explicit instance reset.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFault {
-    /// More immediate transitions were available than the configured limit.
+    /// Another transition set was enabled after the macrostep reached its limit.
     MicrostepLimitExceeded { limit: usize },
 }
 
@@ -301,6 +301,70 @@ mod tests {
         let mut instance = instance(&definition, 3);
 
         instance.process_event("advance", &(), 3);
+
+        assert_eq!(instance.status(), &InstanceStatus::Running);
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "stable"]
+        );
+    }
+
+    #[test]
+    fn triggering_transition_counts_toward_the_microstep_limit() {
+        let mut builder = StateTreeBuilder::new("event-limit");
+        let root = builder.compound_root("root").unwrap();
+        let idle = builder.atomic("idle", root).unwrap();
+        let first = builder.atomic("first", root).unwrap();
+        let stable = builder.atomic("stable", root).unwrap();
+        builder.initial(root, idle).unwrap();
+        builder.transition(idle, "advance", first).unwrap();
+        builder.eventless(first, stable).unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 1);
+
+        instance.process_event("advance", &(), 1);
+
+        assert_eq!(
+            instance.status(),
+            &InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit: 1 })
+        );
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "first"]
+        );
+    }
+
+    #[test]
+    fn one_triggering_transition_fits_a_limit_of_one() {
+        let mut builder = StateTreeBuilder::new("single-event-step");
+        let root = builder.compound_root("root").unwrap();
+        let idle = builder.atomic("idle", root).unwrap();
+        let stable = builder.atomic("stable", root).unwrap();
+        builder.initial(root, idle).unwrap();
+        builder.transition(idle, "advance", stable).unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 1);
+
+        instance.process_event("advance", &(), 1);
+
+        assert_eq!(instance.status(), &InstanceStatus::Running);
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "stable"]
+        );
+    }
+
+    #[test]
+    fn initialization_receives_the_full_microstep_limit() {
+        let mut builder = StateTreeBuilder::new("initial-limit");
+        let root = builder.compound_root("root").unwrap();
+        let first = builder.atomic("first", root).unwrap();
+        let stable = builder.atomic("stable", root).unwrap();
+        builder.initial(root, first).unwrap();
+        builder.eventless(first, stable).unwrap();
+        let definition = builder.build().unwrap();
+
+        let instance = instance(&definition, 1);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(

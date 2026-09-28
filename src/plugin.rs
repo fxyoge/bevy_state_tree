@@ -40,7 +40,11 @@ pub struct StateTreeSettings<D: Send + Sync + 'static> {
 }
 
 impl<D: Send + Sync + 'static> StateTreeSettings<D> {
-    /// Creates settings with the maximum immediate transitions per macrostep.
+    /// Creates settings with the maximum transition-set microsteps per macrostep.
+    ///
+    /// An external-event transition set counts as the first microstep. Initial
+    /// configuration entry does not count, but subsequent eventless transition
+    /// sets do.
     pub fn new(max_microsteps: NonZeroUsize) -> Self {
         Self {
             max_microsteps,
@@ -48,7 +52,7 @@ impl<D: Send + Sync + 'static> StateTreeSettings<D> {
         }
     }
 
-    /// Returns the maximum immediate transitions per macrostep.
+    /// Returns the maximum transition-set microsteps per macrostep.
     pub fn max_microsteps(&self) -> NonZeroUsize {
         self.max_microsteps
     }
