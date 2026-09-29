@@ -634,41 +634,43 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         effects: &mut S,
         trace: &mut T,
     ) {
-        let compiled = self.linked.as_ref().map(|linked| Arc::clone(&linked.compiled));
+        let compiled = self
+            .linked
+            .as_ref()
+            .map(|linked| Arc::clone(&linked.compiled));
         let mut current_event = context.event_name;
         let mut external_event = context.external_event;
         loop {
-            let transition = match self
-                .select_step(Trigger::Eventless(current_event, external_event))
-            {
-                Ok(Some(transition)) => transition,
-                Ok(None) => {
-                    let Some(event) = self.internal_events.pop_front() else {
-                        return;
-                    };
-                    current_event = compiled
-                        .as_ref()
-                        .and_then(|compiled| compiled.event_name(event));
-                    external_event = None;
-                    if let Some(event_name) = current_event {
-                        trace.record(StateTreeTraceRecord::InternalEventConsumed {
-                            event: event_name,
-                        });
-                    }
-                    match self.select_step(Trigger::Internal(event)) {
-                        Ok(Some(transition)) => transition,
-                        Ok(None) => continue,
-                        Err(fault) => {
-                            self.status = InstanceStatus::Faulted(fault);
+            let transition =
+                match self.select_step(Trigger::Eventless(current_event, external_event)) {
+                    Ok(Some(transition)) => transition,
+                    Ok(None) => {
+                        let Some(event) = self.internal_events.pop_front() else {
                             return;
+                        };
+                        current_event = compiled
+                            .as_ref()
+                            .and_then(|compiled| compiled.event_name(event));
+                        external_event = None;
+                        if let Some(event_name) = current_event {
+                            trace.record(StateTreeTraceRecord::InternalEventConsumed {
+                                event: event_name,
+                            });
+                        }
+                        match self.select_step(Trigger::Internal(event)) {
+                            Ok(Some(transition)) => transition,
+                            Ok(None) => continue,
+                            Err(fault) => {
+                                self.status = InstanceStatus::Faulted(fault);
+                                return;
+                            }
                         }
                     }
-                }
-                Err(fault) => {
-                    self.status = InstanceStatus::Faulted(fault);
-                    return;
-                }
-            };
+                    Err(fault) => {
+                        self.status = InstanceStatus::Faulted(fault);
+                        return;
+                    }
+                };
             if transitions_taken == limit {
                 self.status =
                     InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit });
