@@ -78,6 +78,7 @@ struct LuauWorker {
 
 struct CachedFunction {
     function: Function,
+    environment: Table,
     last_access: u64,
 }
 
@@ -115,6 +116,65 @@ impl LuauWorker {
         event_data: Option<&LuauValue>,
     ) -> Result<LuauValue, Error> {
         self.interrupts.set(0);
+        let (function, environment) = self.function(expression, names)?;
+        environment.clear()?;
+
+        for (name, value) in names.iter().zip(values) {
+            environment.set(name.as_ref(), to_lua(&self.lua, value)?)?;
+        }
+        if let Some(name) = event_name {
+            let event = self.lua.create_table()?;
+            event.set("name", name)?;
+            if let Some(data) = event_data {
+                event.set("data", to_lua(&self.lua, data)?)?;
+            }
+            event.set_readonly(true);
+            environment.set("_event", event)?;
+        }
+
+        let value = function.call(())?;
+        from_lua(value, &mut Conversion::new(), 0)
+    }
+
+    fn function(
+        &mut self,
+        expression: &CompiledLuauExpression,
+        names: &[Box<str>],
+    ) -> Result<(Function, Table), Error> {
+        self.cache_access = self.cache_access.wrapping_add(1);
+        if let Some(cached) = self.functions.get_mut(&expression.identity) {
+            cached.last_access = self.cache_access;
+            return Ok((cached.function.clone(), cached.environment.clone()));
+        }
+
+        if self.functions.len() == FUNCTION_CACHE_CAPACITY {
+            let oldest = self
+                .functions
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_access)
+                .map(|(identity, _)| *identity)
+                .expect("a full function cache is not empty");
+            self.functions.remove(&oldest);
+        }
+        let function = self
+            .lua
+            .load(expression.bytecode.as_ref())
+            .set_mode(ChunkMode::Binary)
+            .into_function()?;
+        let environment = self.environment(names)?;
+        function.set_environment(environment.clone())?;
+        self.functions.insert(
+            expression.identity,
+            CachedFunction {
+                function: function.clone(),
+                environment: environment.clone(),
+                last_access: self.cache_access,
+            },
+        );
+        Ok((function, environment))
+    }
+
+    fn environment(&self, names: &[Box<str>]) -> Result<Table, Error> {
         let environment = self.lua.create_table()?;
         let metatable = self.lua.create_table()?;
         let declared: HashSet<Box<str>> = names.iter().cloned().collect();
@@ -132,55 +192,7 @@ impl LuauWorker {
                 })?,
         )?;
         environment.set_metatable(Some(metatable))?;
-
-        for (name, value) in names.iter().zip(values) {
-            environment.set(name.as_ref(), to_lua(&self.lua, value)?)?;
-        }
-        if let Some(name) = event_name {
-            let event = self.lua.create_table()?;
-            event.set("name", name)?;
-            if let Some(data) = event_data {
-                event.set("data", to_lua(&self.lua, data)?)?;
-            }
-            event.set_readonly(true);
-            environment.set("_event", event)?;
-        }
-
-        let function = self.function(expression)?;
-        function.set_environment(environment)?;
-        let value = function.call(())?;
-        from_lua(value, &mut Conversion::new(), 0)
-    }
-
-    fn function(&mut self, expression: &CompiledLuauExpression) -> Result<Function, Error> {
-        self.cache_access = self.cache_access.wrapping_add(1);
-        if let Some(cached) = self.functions.get_mut(&expression.identity) {
-            cached.last_access = self.cache_access;
-            return Ok(cached.function.clone());
-        }
-
-        if self.functions.len() == FUNCTION_CACHE_CAPACITY {
-            let oldest = self
-                .functions
-                .iter()
-                .min_by_key(|(_, cached)| cached.last_access)
-                .map(|(identity, _)| *identity)
-                .expect("a full function cache is not empty");
-            self.functions.remove(&oldest);
-        }
-        let function = self
-            .lua
-            .load(expression.bytecode.as_ref())
-            .set_mode(ChunkMode::Binary)
-            .into_function()?;
-        self.functions.insert(
-            expression.identity,
-            CachedFunction {
-                function: function.clone(),
-                last_access: self.cache_access,
-            },
-        );
-        Ok(function)
+        Ok(environment)
     }
 }
 
@@ -337,6 +349,25 @@ mod tests {
         );
         assert_eq!(
             evaluate(&inspect, &[], &[], None, None).unwrap(),
+            LuauValue::Nil
+        );
+    }
+
+    #[test]
+    fn cached_evaluation_environments_are_cleared() {
+        let expression = compile_expression(
+            "(function() local result = accidental_global or (_event and _event.name); accidental_global = 42 return result end)()",
+            false,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            evaluate(&expression, &[], &[], Some("tick"), None).unwrap(),
+            LuauValue::String(Box::from("tick"))
+        );
+        assert_eq!(
+            evaluate(&expression, &[], &[], None, None).unwrap(),
             LuauValue::Nil
         );
     }
