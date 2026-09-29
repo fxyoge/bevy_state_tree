@@ -12,3 +12,5 @@ _test-macros:
 _test-lib:
   cargo test
 
+bench:
+  cargo bench --bench execution

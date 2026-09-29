@@ -1,0 +1,7 @@
+datamodel_actions
+external_transition
+faulting_exit
+ignored_event
+implicit_initial
+onentry_order
+onexit_order

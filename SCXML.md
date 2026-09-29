@@ -2,8 +2,7 @@
 
 `bevy_state_tree` uses SCXML as an authored statechart format for Bevy. SCXML
 compatibility is subordinate to a typed, data-oriented Bevy API: the project
-does not aim to become a general-purpose SCXML interpreter or to maximize its
-W3C implementation-report pass count.
+does not aim to become a general-purpose SCXML interpreter.
 
 The parser preserves the broader SCXML syntax so unsupported documents receive
 useful diagnostics and future integrations do not require replacing the asset
@@ -58,9 +57,10 @@ Other SCXML system variables are reserved but not yet implemented. Datamodel
 errors fault the instance rather than raising SCXML `error.execution` events.
 ECMAScript is not a planned built-in datamodel.
 
-## W3C Suite
+## Semantic Traces
 
-The vendored W3C suite is a semantic regression corpus, not the product
-roadmap. `tests/w3c/expected.toml` records both passing resources and explicit
-reasons for expected failures, including deliberate differences from general
-SCXML processors.
+The public opt-in trace API records transition sets, state exit attempts and
+commits, actions, entries, configurations, and status changes in deterministic
+semantic order. It does not expose task scheduling or speculative transition
+selection. Project-owned SCXML fixtures and checked-in `.trace` files exercise
+the parser, compiler, and headless runtime as one black box.

@@ -16,8 +16,8 @@ use crate::definition::{
     StateKind, Transition,
 };
 use crate::{
-    LuauValue, StateTreeDefinition, StateTreeDomain, StateTreeEvents, luau,
-    plugin::StateTreeEventInbox,
+    LuauValue, NoStateTreeTrace, StateTreeDefinition, StateTreeDomain, StateTreeEvents,
+    StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, luau, plugin::StateTreeEventInbox,
 };
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -26,6 +26,12 @@ enum Trigger<'a> {
     Eventless(Option<&'a str>),
     Internal(EventId),
     External(&'a EventSet, &'a str),
+}
+
+#[derive(Clone, Copy)]
+struct SelectedTransition {
+    source: StateId,
+    transition: Transition,
 }
 
 impl<'a> Trigger<'a> {
@@ -56,9 +62,18 @@ pub struct StateTreeExecution<E: StateTreeEvents> {
 impl<E: StateTreeEvents> StateTreeExecution<E> {
     /// Links and initializes a definition for headless execution.
     pub fn new(definition: &StateTreeDefinition, microstep_limit: NonZeroUsize) -> Self {
+        Self::new_traced(definition, microstep_limit, &mut NoStateTreeTrace)
+    }
+
+    /// Links and initializes a definition while writing its semantic trace.
+    pub fn new_traced<T: StateTreeTrace + ?Sized>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        trace: &mut T,
+    ) -> Self {
         let linked = Arc::new(LinkedDefinition::new::<E>(Arc::clone(&definition.compiled)));
         let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize(linked, microstep_limit.get());
+        instance.initialize_traced(linked, microstep_limit.get(), trace);
         Self { instance }
     }
 
@@ -79,7 +94,18 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
 
     /// Processes one external event through a complete macrostep.
     pub fn process_event(&mut self, event: &E, microstep_limit: NonZeroUsize) -> bool {
-        self.instance.process_event(event, microstep_limit.get())
+        self.process_event_traced(event, microstep_limit, &mut NoStateTreeTrace)
+    }
+
+    /// Processes one external event while writing its complete semantic trace.
+    pub fn process_event_traced<T: StateTreeTrace + ?Sized>(
+        &mut self,
+        event: &E,
+        microstep_limit: NonZeroUsize,
+        trace: &mut T,
+    ) -> bool {
+        self.instance
+            .process_event_traced(event, microstep_limit.get(), trace)
     }
 }
 
@@ -215,7 +241,19 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn initialize(&mut self, linked: Arc<LinkedDefinition>, microstep_limit: usize) {
+        self.initialize_traced(linked, microstep_limit, &mut NoStateTreeTrace);
+    }
+
+    fn initialize_traced<T: StateTreeTrace + ?Sized>(
+        &mut self,
+        linked: Arc<LinkedDefinition>,
+        microstep_limit: usize,
+        trace: &mut T,
+    ) {
         let compiled = &linked.compiled;
+        trace.record(StateTreeTraceRecord::MacrostepStarted {
+            trigger: StateTreeTraceTrigger::Initialization,
+        });
         self.linked = Some(Arc::clone(&linked));
         self.active.clear();
         self.active.reserve(compiled.max_depth);
@@ -223,50 +261,75 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.internal_events.reserve(compiled.max_depth);
         self.data.clear();
         self.status = InstanceStatus::Running;
-        if let Err(fault) = self.initialize_datamodel(compiled) {
+        if let Err(fault) = self.initialize_datamodel(compiled, trace) {
             self.status = InstanceStatus::Faulted(fault);
+            self.finish_macrostep(compiled, trace);
             return;
         }
         for entry in &compiled.initial_entries {
-            if let Err(fault) = self.enter_state(compiled, *entry, None) {
+            if let Err(fault) = self.enter_state(compiled, *entry, None, trace) {
                 self.status = InstanceStatus::Faulted(fault);
+                self.finish_macrostep(compiled, trace);
                 return;
             }
         }
-        self.update_completion();
+        self.update_completion(trace);
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 0, None);
+            self.stabilize(microstep_limit, 0, None, trace);
         }
+        self.finish_macrostep(compiled, trace);
     }
 
     pub(crate) fn process_event(&mut self, event: &D::Event, microstep_limit: usize) -> bool {
+        self.process_event_traced(event, microstep_limit, &mut NoStateTreeTrace)
+    }
+
+    fn process_event_traced<T: StateTreeTrace + ?Sized>(
+        &mut self,
+        event: &D::Event,
+        microstep_limit: usize,
+        trace: &mut T,
+    ) -> bool {
         if self.status != InstanceStatus::Running {
             return false;
         }
-        let Some(linked) = self.linked.as_ref() else {
-            return false;
-        };
-        let Some(events) = linked.external_event(event.event_index()) else {
-            return false;
-        };
         let event_name = event.authored_name();
-        let transition = match self.select_external_transition(events, event_name) {
+        let selected = {
+            let Some(linked) = self.linked.as_ref() else {
+                return false;
+            };
+            let Some(events) = linked.external_event(event.event_index()) else {
+                return false;
+            };
+            trace.record(StateTreeTraceRecord::MacrostepStarted {
+                trigger: StateTreeTraceTrigger::ExternalEvent(event_name),
+            });
+            self.select_external_transition(events, event_name)
+        };
+        let transition = match selected {
             Ok(Some(transition)) => transition,
-            Ok(None) => return false,
+            Ok(None) => {
+                self.finish_current_macrostep(trace);
+                return false;
+            }
             Err(fault) => {
                 self.status = InstanceStatus::Faulted(fault);
+                self.finish_current_macrostep(trace);
                 return true;
             }
         };
 
-        if let Err(fault) = self.take_transition(transition, Some(event_name)) {
+        self.trace_transition_set(1, transition, trace);
+        if let Err(fault) = self.take_transition(transition, Some(event_name), trace) {
             self.status = InstanceStatus::Faulted(fault);
+            self.finish_current_macrostep(trace);
             return true;
         }
-        self.update_completion();
+        self.update_completion(trace);
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 1, Some(event_name));
+            self.stabilize(microstep_limit, 1, Some(event_name), trace);
         }
+        self.finish_current_macrostep(trace);
         true
     }
 
@@ -295,22 +358,25 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .as_ref()
             .and_then(|linked| linked.compiled.event_name(event))
             .map(str::to_owned);
-        if let Err(fault) = self.take_transition(transition, name.as_deref()) {
+        self.trace_transition_set(1, transition, &mut NoStateTreeTrace);
+        if let Err(fault) = self.take_transition(transition, name.as_deref(), &mut NoStateTreeTrace)
+        {
             self.status = InstanceStatus::Faulted(fault);
             return true;
         }
-        self.update_completion();
+        self.update_completion(&mut NoStateTreeTrace);
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 1, name.as_deref());
+            self.stabilize(microstep_limit, 1, name.as_deref(), &mut NoStateTreeTrace);
         }
         true
     }
 
-    fn stabilize(
+    fn stabilize<T: StateTreeTrace + ?Sized>(
         &mut self,
         limit: usize,
         mut transitions_taken: usize,
         current_event: Option<&str>,
+        trace: &mut T,
     ) {
         let mut current_event = current_event.map(Box::<str>::from);
         loop {
@@ -326,6 +392,11 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                             .as_ref()
                             .and_then(|linked| linked.compiled.event_name(event))
                             .map(Box::from);
+                        if let Some(event_name) = current_event.as_deref() {
+                            trace.record(StateTreeTraceRecord::InternalEventConsumed {
+                                event: event_name,
+                            });
+                        }
                         match self.select_transition(Trigger::Internal(event)) {
                             Ok(Some(transition)) => transition,
                             Ok(None) => continue,
@@ -345,19 +416,23 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit });
                 return;
             }
-            if let Err(fault) = self.take_transition(transition, current_event.as_deref()) {
+            self.trace_transition_set(transitions_taken + 1, transition, trace);
+            if let Err(fault) = self.take_transition(transition, current_event.as_deref(), trace) {
                 self.status = InstanceStatus::Faulted(fault);
                 return;
             }
             transitions_taken += 1;
-            self.update_completion();
+            self.update_completion(trace);
             if self.status != InstanceStatus::Running {
                 return;
             }
         }
     }
 
-    fn select_transition(&self, trigger: Trigger<'_>) -> Result<Option<Transition>, RuntimeFault> {
+    fn select_transition(
+        &self,
+        trigger: Trigger<'_>,
+    ) -> Result<Option<SelectedTransition>, RuntimeFault> {
         let Some(compiled) = self.linked.as_ref().map(|linked| &linked.compiled) else {
             return Ok(None);
         };
@@ -383,7 +458,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 {
                     continue;
                 }
-                return Ok(Some(*transition));
+                return Ok(Some(SelectedTransition {
+                    source: *state,
+                    transition: *transition,
+                }));
             }
         }
         Ok(None)
@@ -393,14 +471,15 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &self,
         events: &EventSet,
         name: &str,
-    ) -> Result<Option<Transition>, RuntimeFault> {
+    ) -> Result<Option<SelectedTransition>, RuntimeFault> {
         self.select_transition(Trigger::External(events, name))
     }
 
-    fn take_transition(
+    fn take_transition<T: StateTreeTrace + ?Sized>(
         &mut self,
-        transition: Transition,
+        selected: SelectedTransition,
         event_name: Option<&str>,
+        trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         let Some(compiled) = self
             .linked
@@ -409,13 +488,27 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         else {
             return Ok(());
         };
+        let transition = selected.transition;
         let exited: Vec<_> = self.active[transition.exit_depth as usize..]
             .iter()
             .rev()
             .copied()
             .collect();
+        for state in &exited {
+            trace.record(StateTreeTraceRecord::StateExitStarted {
+                state: &compiled.state(*state).name,
+            });
+            self.execute_actions(
+                &compiled,
+                &compiled.state(*state).exit_actions,
+                event_name,
+                trace,
+            )?;
+        }
         for state in exited {
-            self.execute_actions(&compiled, &compiled.state(state).exit_actions, event_name)?;
+            trace.record(StateTreeTraceRecord::StateExited {
+                state: &compiled.state(state).name,
+            });
         }
         self.active.truncate(transition.exit_depth as usize);
 
@@ -425,12 +518,13 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             &compiled,
             &compiled.transition_actions[action_start..action_end],
             event_name,
+            trace,
         )?;
 
         let start = transition.entry_start as usize;
         let end = start + transition.entry_len as usize;
         for entry in &compiled.transition_entries[start..end] {
-            self.enter_state(&compiled, *entry, event_name)?;
+            self.enter_state(&compiled, *entry, event_name, trace)?;
         }
         debug_assert!(
             self.active
@@ -441,22 +535,46 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         Ok(())
     }
 
-    fn enter_state(
+    fn trace_transition_set<T: StateTreeTrace + ?Sized>(
+        &self,
+        microstep: usize,
+        selected: SelectedTransition,
+        trace: &mut T,
+    ) {
+        let Some(compiled) = self.linked.as_ref().map(|linked| linked.compiled.as_ref()) else {
+            return;
+        };
+        trace.record(StateTreeTraceRecord::MicrostepStarted { index: microstep });
+        trace.record(StateTreeTraceRecord::TransitionSelected {
+            source: &compiled.state(selected.source).name,
+        });
+        trace.record(StateTreeTraceRecord::TransitionTarget {
+            state: &compiled.state(selected.transition.target).name,
+        });
+    }
+
+    fn enter_state<T: StateTreeTrace + ?Sized>(
         &mut self,
         compiled: &CompiledDefinition,
         entry: Entry,
         event_name: Option<&str>,
+        trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         self.active.push(entry.state);
         let state = compiled.state(entry.state);
-        self.execute_actions(compiled, &state.entry_actions, event_name)?;
+        trace.record(StateTreeTraceRecord::StateEntered { state: &state.name });
+        self.execute_actions(compiled, &state.entry_actions, event_name, trace)?;
         if entry.take_initial {
-            self.execute_actions(compiled, &state.initial_actions, event_name)?;
+            self.execute_actions(compiled, &state.initial_actions, event_name, trace)?;
         }
         Ok(())
     }
 
-    fn initialize_datamodel(&mut self, compiled: &CompiledDefinition) -> Result<(), RuntimeFault> {
+    fn initialize_datamodel<T: StateTreeTrace + ?Sized>(
+        &mut self,
+        compiled: &CompiledDefinition,
+        trace: &mut T,
+    ) -> Result<(), RuntimeFault> {
         let Some(datamodel) = &compiled.datamodel else {
             return Ok(());
         };
@@ -471,6 +589,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 None,
                 DatamodelOperation::Initialize,
             )?;
+            trace.record(StateTreeTraceRecord::DataAssigned {
+                data: &datamodel.names[index],
+                value: &self.data[index],
+            });
         }
         Ok(())
     }
@@ -513,15 +635,21 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         })
     }
 
-    fn execute_actions(
+    fn execute_actions<T: StateTreeTrace + ?Sized>(
         &mut self,
         compiled: &CompiledDefinition,
         actions: &[Action],
         event_name: Option<&str>,
+        trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         for action in actions {
             match *action {
-                Action::Raise(event) => self.internal_events.push_back(event),
+                Action::Raise(event) => {
+                    self.internal_events.push_back(event);
+                    if let Some(event) = compiled.event_name(event) {
+                        trace.record(StateTreeTraceRecord::InternalEventRaised { event });
+                    }
+                }
                 Action::Assign { data, expression } => {
                     let value = self.evaluate_expression(
                         compiled,
@@ -530,13 +658,21 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                         DatamodelOperation::Assign,
                     )?;
                     self.data[data.index()] = value;
+                    let datamodel = compiled
+                        .datamodel
+                        .as_ref()
+                        .expect("compiled assignments require a datamodel");
+                    trace.record(StateTreeTraceRecord::DataAssigned {
+                        data: &datamodel.names[data.index()],
+                        value: &self.data[data.index()],
+                    });
                 }
             }
         }
         Ok(())
     }
 
-    fn update_completion(&mut self) {
+    fn update_completion<T: StateTreeTrace + ?Sized>(&mut self, trace: &mut T) {
         let Some(linked) = self.linked.as_ref() else {
             return;
         };
@@ -559,6 +695,33 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return;
         };
         self.internal_events.push_back(completion);
+        if let Some(event) = compiled.event_name(completion) {
+            trace.record(StateTreeTraceRecord::InternalEventRaised { event });
+        }
+    }
+
+    fn finish_macrostep<T: StateTreeTrace + ?Sized>(
+        &self,
+        compiled: &CompiledDefinition,
+        trace: &mut T,
+    ) {
+        trace.record(StateTreeTraceRecord::ConfigurationStarted);
+        for state in &self.active {
+            trace.record(StateTreeTraceRecord::ActiveState {
+                state: &compiled.state(*state).name,
+            });
+        }
+        trace.record(StateTreeTraceRecord::Status {
+            status: &self.status,
+        });
+        trace.record(StateTreeTraceRecord::MacrostepEnded);
+    }
+
+    fn finish_current_macrostep<T: StateTreeTrace + ?Sized>(&self, trace: &mut T) {
+        let Some(compiled) = self.linked.as_ref().map(|linked| linked.compiled.as_ref()) else {
+            return;
+        };
+        self.finish_macrostep(compiled, trace);
     }
 }
 

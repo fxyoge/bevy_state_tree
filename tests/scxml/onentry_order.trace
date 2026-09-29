@@ -1,0 +1,25 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "source"
+raise "first"
+raise "second"
+consume internal "first"
+microstep 1
+transition "source"
+target "waiting"
+exit begin "source"
+exit "source"
+enter "waiting"
+consume internal "second"
+microstep 2
+transition "waiting"
+target "done"
+exit begin "waiting"
+exit "waiting"
+enter "done"
+configuration
+active "#document"
+active "done"
+status complete
+macrostep end

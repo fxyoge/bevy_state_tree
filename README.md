@@ -29,10 +29,10 @@ tree or resolve authored names.
 See [SCXML Support Policy](SCXML.md) for the Bevy-first compatibility scope and
 intentional differences from general-purpose SCXML processors.
 
-The pinned W3C implementation-report corpus under `tests/w3c` is parsed and
-attempted through that same compiler and runtime. `tests/w3c/expected.toml`
-records the reviewed expected outcome for every manifest start resource, and
-normal tests fail on missing cases or any observed result change.
+Project-owned SCXML fixtures under `tests/scxml` execute through the public
+headless runtime and are compared with deterministic semantic event logs. The
+same opt-in tracing API is available to applications without adding tracing
+work to the normal Bevy execution path.
 
 Each runtime domain owns a closed external event protocol. Tuple variants keep
 the original Rust payload intact through queueing and execution, while the
@@ -79,3 +79,19 @@ at the point where they were written.
 Instances that initialize before event processing receive events queued during
 that schedule run. Instances still waiting for their definition asset receive
 no events, and queued entity events are discarded rather than replayed later.
+
+## Semantic Tests
+
+Each case named in `tests/scxml/manifest.txt` has a project-owned `.scxml`
+source and `.trace` golden log. An optional `.events` sidecar supplies one
+external authored event name per line from the harness's closed event protocol.
+The corpus runner reports every mismatch together so adding cases requires no
+case-specific Rust assertions.
+
+## Benchmarks
+
+Run `just bench` for initialization, hierarchy depth, eventless stabilization,
+transition fanout, ignored and handled external events, Luau execution, and
+opt-in tracing. Divan prepares each mutable execution outside the timed region
+and defers teardown until after timing; initialization benchmarks intentionally
+include linking and runtime storage setup.

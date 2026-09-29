@@ -1,0 +1,15 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "first"
+microstep 1
+transition "first"
+target "done"
+exit begin "first"
+exit "first"
+enter "done"
+configuration
+active "#document"
+active "done"
+status complete
+macrostep end

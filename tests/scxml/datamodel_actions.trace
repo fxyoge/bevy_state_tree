@@ -1,0 +1,19 @@
+state-tree-trace 1
+macrostep initialize
+assign "count" = 0
+enter "#document"
+enter "source"
+assign "count" = 1
+raise "ready"
+consume internal "ready"
+microstep 1
+transition "source"
+target "done"
+exit begin "source"
+exit "source"
+enter "done"
+configuration
+active "#document"
+active "done"
+status complete
+macrostep end

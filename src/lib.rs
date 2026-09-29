@@ -31,6 +31,7 @@ mod event;
 mod instance;
 mod luau;
 mod plugin;
+mod trace;
 
 pub mod scxml;
 
@@ -48,14 +49,19 @@ pub use plugin::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreePlugin, StateTreeSet,
     StateTreeSettings,
 };
+pub use trace::{
+    NoStateTreeTrace, StateTreeEventLog, StateTreeTrace, StateTreeTraceRecord,
+    StateTreeTraceTrigger,
+};
 
 /// Common state-tree imports.
 pub mod prelude {
     pub use crate::{
         BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, DatamodelOperation,
         EntityStateTreeEvent, EntityStateTreeEventWriter, InstanceStatus, LuauValue, RuntimeFault,
-        StateId, StateTreeBuilder, StateTreeDefinition, StateTreeDomain, StateTreeEventPayload,
-        StateTreeEvents, StateTreeExecution, StateTreeInstance, StateTreePlugin, StateTreeSet,
-        StateTreeSettings,
+        StateId, StateTreeBuilder, StateTreeDefinition, StateTreeDomain, StateTreeEventLog,
+        StateTreeEventPayload, StateTreeEvents, StateTreeExecution, StateTreeInstance,
+        StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTrace, StateTreeTraceRecord,
+        StateTreeTraceTrigger,
     };
 }

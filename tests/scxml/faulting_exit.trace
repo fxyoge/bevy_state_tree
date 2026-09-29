@@ -1,0 +1,14 @@
+state-tree-trace 1
+macrostep initialize
+assign "value" = 0
+enter "#document"
+enter "source"
+microstep 1
+transition "source"
+target "done"
+exit begin "source"
+configuration
+active "#document"
+active "source"
+status faulted datamodel Assign
+macrostep end

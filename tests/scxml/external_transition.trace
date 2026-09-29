@@ -1,0 +1,21 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "idle"
+configuration
+active "#document"
+active "idle"
+status running
+macrostep end
+macrostep external "advance"
+microstep 1
+transition "idle"
+target "done"
+exit begin "idle"
+exit "idle"
+enter "done"
+configuration
+active "#document"
+active "done"
+status complete
+macrostep end

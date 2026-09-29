@@ -1,0 +1,12 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" datamodel="luau">
+  <datamodel>
+    <data id="value" expr="0"/>
+  </datamodel>
+  <state id="source">
+    <onexit>
+      <assign location="value" expr="missing()"/>
+    </onexit>
+    <transition target="done"/>
+  </state>
+  <final id="done"/>
+</scxml>

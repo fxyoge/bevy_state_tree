@@ -1,0 +1,14 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml">
+  <state id="source">
+    <onexit><raise event="first"/></onexit>
+    <onexit><raise event="second"/></onexit>
+    <transition target="waiting"/>
+  </state>
+  <state id="waiting">
+    <transition event="first" target="next"/>
+  </state>
+  <state id="next">
+    <transition event="second" target="done"/>
+  </state>
+  <final id="done"/>
+</scxml>

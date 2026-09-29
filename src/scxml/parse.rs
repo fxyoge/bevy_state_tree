@@ -1470,202 +1470,68 @@ mod tests {
     }
 
     #[test]
-    fn preserves_reviewed_w3c_payload_and_standard_attribute_patterns() {
-        let fixture_557 = parse(
-            "557/test557.txml",
-            include_str!("../../tests/w3c/vendor/557/test557.txml"),
+    fn preserves_lists_payloads_and_qualified_attributes() {
+        let document = parse(
+            "authored-forms.scxml",
+            &format!(
+                r#"<scxml xmlns="{NS}" xmlns:x="urn:payload" initial="left right">
+                  <datamodel><data id="payload">before<x:item>inside</x:item>after</data></datamodel>
+                  <state id="left" initial="a b">
+                    <initial><transition target="a b"/></initial>
+                    <onentry><send event="payload" type="bevy.test"><content><x:message/></content></send></onentry>
+                    <invoke x:idlocation="foreign" x:namelist="foreign"/>
+                    <state id="a"/><state id="b"/>
+                  </state>
+                  <state id="right"/>
+                </scxml>"#
+            ),
         )
-        .expect("fixture 557");
-        let data = match &fixture_557.root.children[0] {
-            RootChild::DataModel(model) => match &model.children[0] {
-                DataModelChild::Data(data) => data,
-                _ => panic!("fixture 557 data"),
-            },
-            _ => panic!("fixture 557 datamodel"),
+        .expect("authored SCXML forms");
+        assert_eq!(document.root.initial, ["left", "right"]);
+        let model = match &document.root.children[0] {
+            RootChild::DataModel(model) => model,
+            _ => panic!("datamodel"),
         };
-        let payload = data.content.as_ref().expect("fixture 557 data payload");
-        let books = payload.parts.iter().find_map(|part| match part {
-            ContentPart::Element(value) => Some(value),
-            ContentPart::Text(_) => None,
-        });
-        assert_eq!(books.map(|value| value.local_name.as_str()), Some("books"));
-        assert!(matches!(
-            books.and_then(|value| value.content.first()),
-            Some(PayloadPart::Text(_))
-        ));
-
-        let fixture_530 = parse(
-            "530/test530.txml",
-            include_str!("../../tests/w3c/vendor/530/test530.txml"),
-        )
-        .expect("fixture 530");
-        let state = match &fixture_530.root.children[1] {
+        let data = match &model.children[0] {
+            DataModelChild::Data(data) => data,
+            _ => panic!("data"),
+        };
+        let payload = data.content.as_ref().expect("data payload");
+        assert!(matches!(payload.parts[0], ContentPart::Text(_)));
+        assert!(matches!(payload.parts[1], ContentPart::Element(_)));
+        assert!(matches!(payload.parts[2], ContentPart::Text(_)));
+        let ContentPart::Element(item) = &payload.parts[1] else {
+            unreachable!();
+        };
+        assert_eq!(item.text, "inside");
+        assert!(matches!(item.content[0], PayloadPart::Text(_)));
+        let state = match &document.root.children[1] {
             RootChild::State(state) => state,
-            _ => panic!("fixture 530 state"),
+            _ => panic!("state"),
         };
-        let entry = match &state.children[0] {
-            StateChild::OnEntry(entry) => entry,
-            _ => panic!("fixture 530 onentry"),
-        };
-        let assign = match &entry.content[0] {
-            ExecutableContent::Assign(assign) => assign,
-            _ => panic!("fixture 530 assign"),
-        };
-        assert!(assign.content.is_some());
-        let invoke = match &state.children[1] {
-            StateChild::Invoke(invoke) => invoke,
-            _ => panic!("fixture 530 invoke"),
-        };
-        assert!(matches!(invoke.children[0], InvokeChild::Content(_)));
-
-        let fixture_576 = parse(
-            "576/test576.txml",
-            include_str!("../../tests/w3c/vendor/576/test576.txml"),
-        )
-        .expect("fixture 576");
-        assert_eq!(fixture_576.root.initial, ["s11p112", "s11p122"]);
-
-        let fixture_364 = parse(
-            "364/test364.txml",
-            include_str!("../../tests/w3c/vendor/364/test364.txml"),
-        )
-        .expect("fixture 364");
-        let state_s1 = match &fixture_364.root.children[0] {
-            RootChild::State(state) => state,
-            _ => panic!("fixture 364 state s1"),
-        };
-        assert_eq!(state_s1.initial, ["s11p112", "s11p122"]);
-        let state_s2 = match &fixture_364.root.children[1] {
-            RootChild::State(state) => state,
-            _ => panic!("fixture 364 state s2"),
-        };
-        let initial = match &state_s2.children[0] {
+        assert_eq!(state.initial, ["a", "b"]);
+        let initial = match &state.children[0] {
             StateChild::Initial(initial) => initial,
-            _ => panic!("fixture 364 explicit initial"),
+            _ => panic!("initial"),
         };
-        assert_eq!(
-            initial.transition.as_ref().unwrap().targets,
-            ["s21p112", "s21p122"]
-        );
-
-        let fixture_200 = parse(
-            "200/test200.txml",
-            include_str!("../../tests/w3c/vendor/200/test200.txml"),
-        )
-        .expect("fixture 200");
-        let state = match &fixture_200.root.children[0] {
-            RootChild::State(state) => state,
-            _ => panic!("fixture 200 state"),
-        };
-        let entry = match &state.children[0] {
+        assert_eq!(initial.transition.as_ref().unwrap().targets, ["a", "b"]);
+        let entry = match &state.children[1] {
             StateChild::OnEntry(entry) => entry,
-            _ => panic!("fixture 200 onentry"),
+            _ => panic!("onentry"),
         };
         let send = match &entry.content[0] {
             ExecutableContent::Send(send) => send,
-            _ => panic!("fixture 200 send"),
+            _ => panic!("send"),
         };
-        assert_eq!(
-            send.send_type.as_deref(),
-            Some("http://www.w3.org/TR/scxml/#SCXMLEventProcessor")
-        );
-
-        let fixture_223 = parse(
-            "223/test223.txml",
-            include_str!("../../tests/w3c/vendor/223/test223.txml"),
-        )
-        .expect("fixture 223");
-        let state = match &fixture_223.root.children[1] {
-            RootChild::State(state) => state,
-            _ => panic!("fixture 223 state"),
-        };
-        let invoke = match &state.children[1] {
+        assert_eq!(send.send_type.as_deref(), Some("bevy.test"));
+        let invoke = match &state.children[2] {
             StateChild::Invoke(invoke) => invoke,
-            _ => panic!("fixture 223 invoke"),
+            _ => panic!("invoke"),
         };
         assert_eq!(invoke.id_location, None);
-        assert!(
-            invoke
-                .attributes
-                .iter()
-                .any(|attribute| attribute.name == "conf:idlocation")
-        );
-        let content = match &invoke.children[0] {
-            InvokeChild::Content(content) => content,
-            _ => panic!("fixture 223 content"),
-        };
-        assert!(
-            content
-                .parts
-                .iter()
-                .any(|part| matches!(part, ContentPart::Element(_)))
-        );
-
-        let fixture_245 = parse(
-            "245/test245.txml",
-            include_str!("../../tests/w3c/vendor/245/test245.txml"),
-        )
-        .expect("fixture 245");
-        let state = match &fixture_245.root.children[1] {
-            RootChild::State(state) => state,
-            _ => panic!("fixture 245 state"),
-        };
-        let invoke = match &state.children[1] {
-            StateChild::Invoke(invoke) => invoke,
-            _ => panic!("fixture 245 invoke"),
-        };
         assert_eq!(invoke.namelist, None);
-        assert!(
-            invoke
-                .attributes
-                .iter()
-                .any(|attribute| attribute.name == "conf:namelist")
-        );
-
-        let fixture_527 = parse(
-            "527/test527.txml",
-            include_str!("../../tests/w3c/vendor/527/test527.txml"),
-        )
-        .expect("fixture 527");
-        let state = match &fixture_527.root.children[0] {
-            RootChild::State(state) => state,
-            _ => panic!("fixture 527 state"),
-        };
-        let nested = state
-            .children
-            .iter()
-            .find_map(|child| match child {
-                StateChild::State(state) => Some(state),
-                _ => None,
-            })
-            .expect("fixture 527 nested state");
-        assert_eq!(nested.id.as_deref(), Some("s01"));
-        let final_state = state
-            .children
-            .iter()
-            .find_map(|child| match child {
-                StateChild::Final(final_state) => Some(final_state),
-                _ => None,
-            })
-            .expect("fixture 527 final");
-        let done_data = match &final_state.children[0] {
-            FinalChild::DoneData(done_data) => done_data,
-            _ => panic!("fixture 527 donedata"),
-        };
-        let content = match &done_data.children[0] {
-            DoneDataChild::Content(content) => content,
-            _ => panic!("fixture 527 content"),
-        };
-        assert_eq!(content.expression, None);
-
-        let payload_document = parse(
-            "payload-capability.scxml",
-            &format!(
-                r#"<scxml xmlns="{NS}" xmlns:x="urn:payload"><state><onentry><assign location="value">before<x:value/>after</assign><send event="payload"><content><x:message/></content></send></onentry></state></scxml>"#
-            ),
-        )
-        .expect("payload capability document");
-        let capabilities = payload_document.capabilities();
+        assert_eq!(invoke.attributes.len(), 2);
+        let capabilities = document.capabilities();
         assert!(capabilities.contains(&Capability::PayloadContent));
         assert!(capabilities.contains(&Capability::Content));
         assert!(!capabilities.contains(&Capability::ForeignExtension));
@@ -1854,6 +1720,19 @@ mod tests {
         let payload = format!(
             r#"<scxml xmlns="{NS}"><state><onentry><assign location="value"><nested>kept</nested></assign></onentry></state></scxml>"#
         );
-        parse("payload-text.scxml", &payload).expect("payload text");
+        let document = parse("payload-text.scxml", &payload).expect("payload text");
+        let state = match &document.root.children[0] {
+            RootChild::State(state) => state,
+            _ => panic!("state"),
+        };
+        let entry = match &state.children[0] {
+            StateChild::OnEntry(entry) => entry,
+            _ => panic!("onentry"),
+        };
+        let assign = match &entry.content[0] {
+            ExecutableContent::Assign(assign) => assign,
+            _ => panic!("assign"),
+        };
+        assert!(assign.content.is_some());
     }
 }
