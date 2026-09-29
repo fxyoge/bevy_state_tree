@@ -946,8 +946,8 @@ impl<'a> XmlParser<'a> {
                 Ok(Event::Empty(element)) => {
                     break self.empty_element(position, &element, &HashMap::new())?;
                 }
-                Ok(Event::Text(text)) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
-                Ok(Event::CData(text)) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+                Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
+                Ok(Event::CData(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
                 Ok(Event::DocType(_)) => {
                     return Err(
                         self.error_at(position, "DOCTYPE and DTD declarations are not supported")
@@ -976,8 +976,8 @@ impl<'a> XmlParser<'a> {
         loop {
             let position = self.position();
             match self.reader.read_event_into(&mut buffer) {
-                Ok(Event::Text(text)) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
-                Ok(Event::CData(text)) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+                Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
+                Ok(Event::CData(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
                 Ok(Event::DocType(_)) => {
                     return Err(
                         self.error_at(position, "DOCTYPE and DTD declarations are not supported")
@@ -1262,7 +1262,7 @@ impl<'a> XmlParser<'a> {
             return Ok(character.to_string());
         }
 
-        match reference.as_ref() {
+        match &**reference {
             b"amp" => Ok("&".to_owned()),
             b"lt" => Ok("<".to_owned()),
             b"gt" => Ok(">".to_owned()),

@@ -10,7 +10,7 @@ use bevy_asset::Asset;
 use bevy_reflect::TypePath;
 use thiserror::Error;
 
-use crate::StateTreeEvents;
+use crate::{StateTreeEvents, luau::CompiledLuauExpression};
 
 /// A compact state identifier local to one [`StateTreeDefinition`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -34,6 +34,33 @@ impl EventId {
     fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataId(u32);
+
+impl DataId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExpressionId(u32);
+
+impl ExpressionId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Action {
+    Raise(EventId),
+    Assign {
+        data: DataId,
+        expression: ExpressionId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -84,9 +111,9 @@ pub(crate) struct StateNode {
     pub parent: Option<StateId>,
     pub depth: u32,
     pub kind: StateKind,
-    pub entry_raises: Box<[EventId]>,
-    pub exit_raises: Box<[EventId]>,
-    pub initial_raises: Box<[EventId]>,
+    pub entry_actions: Box<[Action]>,
+    pub exit_actions: Box<[Action]>,
+    pub initial_actions: Box<[Action]>,
     pub transitions: Box<[Transition]>,
 }
 
@@ -99,12 +126,20 @@ pub(crate) struct Entry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Transition {
     pub event: Option<EventId>,
+    pub condition: Option<ExpressionId>,
     pub target: StateId,
     pub exit_depth: u32,
     pub entry_start: u32,
     pub entry_len: u32,
-    pub raise_start: u32,
-    pub raise_len: u32,
+    pub action_start: u32,
+    pub action_len: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledLuauDataModel {
+    pub names: Box<[Box<str>]>,
+    pub initializers: Box<[Option<ExpressionId>]>,
+    pub expressions: Box<[CompiledLuauExpression]>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,9 +149,10 @@ pub(crate) struct CompiledDefinition {
     pub root: StateId,
     pub states: Box<[StateNode]>,
     pub transition_entries: Box<[Entry]>,
-    pub transition_raises: Box<[EventId]>,
+    pub transition_actions: Box<[Action]>,
     pub initial_entries: Box<[Entry]>,
     pub max_depth: usize,
+    pub datamodel: Option<CompiledLuauDataModel>,
     events: Box<[EventPattern]>,
 }
 
@@ -142,6 +178,13 @@ impl CompiledDefinition {
             return false;
         };
         event_pattern_matches(&self.events[candidate.index()], emitted)
+    }
+
+    pub fn event_name(&self, event: EventId) -> Option<&str> {
+        match &self.events[event.index()] {
+            EventPattern::Exact(name) => Some(name),
+            EventPattern::Descriptor(_) => None,
+        }
     }
 }
 
@@ -226,17 +269,34 @@ struct DraftState {
     name: Box<str>,
     parent: Option<StateId>,
     kind: DraftKind,
-    entry_raises: Vec<Box<str>>,
-    exit_raises: Vec<Box<str>>,
-    initial_raises: Vec<Box<str>>,
+    entry_actions: Vec<DraftAction>,
+    exit_actions: Vec<DraftAction>,
+    initial_actions: Vec<DraftAction>,
     transitions: Vec<DraftTransition>,
 }
 
 #[derive(Clone, Debug)]
 struct DraftTransition {
     event: Option<EventPattern>,
+    condition: Option<ExpressionId>,
     target: StateId,
-    raises: Vec<Box<str>>,
+    actions: Vec<DraftAction>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum DraftAction {
+    Raise(Box<str>),
+    Assign {
+        data: DataId,
+        expression: ExpressionId,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct DraftLuauDataModel {
+    names: Vec<Box<str>>,
+    initializers: Vec<Option<ExpressionId>>,
+    expressions: Vec<CompiledLuauExpression>,
 }
 
 /// Builds and validates a [`StateTreeDefinition`].
@@ -250,6 +310,7 @@ pub struct StateTreeBuilder {
     states: Vec<DraftState>,
     names: HashMap<Box<str>, StateId>,
     root: Option<StateId>,
+    datamodel: Option<DraftLuauDataModel>,
 }
 
 impl StateTreeBuilder {
@@ -261,6 +322,7 @@ impl StateTreeBuilder {
             states: Vec::new(),
             names: HashMap::new(),
             root: None,
+            datamodel: None,
         }
     }
 
@@ -332,15 +394,22 @@ impl StateTreeBuilder {
         if event.is_empty() {
             return Err(BuildError::EmptyEventName);
         }
-        self.add_transition(source, Some(EventPattern::Exact(event)), target, Vec::new())
+        self.add_transition(
+            source,
+            Some(EventPattern::Exact(event)),
+            None,
+            target,
+            Vec::new(),
+        )
     }
 
-    pub(crate) fn event_descriptor_with_raises(
+    pub(crate) fn event_descriptor_with_actions(
         &mut self,
         source: StateId,
         descriptor: impl Into<Box<str>>,
+        condition: Option<ExpressionId>,
         target: StateId,
-        raises: Vec<Box<str>>,
+        actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
         let descriptor = descriptor.into();
         if descriptor.is_empty() {
@@ -349,8 +418,9 @@ impl StateTreeBuilder {
         self.add_transition(
             source,
             Some(EventPattern::Descriptor(descriptor)),
+            condition,
             target,
-            raises,
+            actions,
         )
     }
 
@@ -361,48 +431,103 @@ impl StateTreeBuilder {
         descriptor: impl Into<Box<str>>,
         target: StateId,
     ) -> Result<&mut Self, BuildError> {
-        self.event_descriptor_with_raises(source, descriptor, target, Vec::new())
+        self.event_descriptor_with_actions(source, descriptor, None, target, Vec::new())
     }
 
     /// Adds an eventless external transition.
     pub fn eventless(&mut self, source: StateId, target: StateId) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, target, Vec::new())
+        self.add_transition(source, None, None, target, Vec::new())
     }
 
-    pub(crate) fn eventless_with_raises(
+    pub(crate) fn eventless_with_actions(
         &mut self,
         source: StateId,
+        condition: Option<ExpressionId>,
         target: StateId,
-        raises: Vec<Box<str>>,
+        actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, target, raises)
+        self.add_transition(source, None, condition, target, actions)
     }
 
-    pub(crate) fn entry_raises(
+    pub(crate) fn entry_actions(
         &mut self,
         state: StateId,
-        raises: Vec<Box<str>>,
+        actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.require_state_mut(state)?.entry_raises = raises;
+        self.require_state_mut(state)?.entry_actions = actions;
         Ok(self)
     }
 
-    pub(crate) fn exit_raises(
+    pub(crate) fn exit_actions(
         &mut self,
         state: StateId,
-        raises: Vec<Box<str>>,
+        actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.require_state_mut(state)?.exit_raises = raises;
+        self.require_state_mut(state)?.exit_actions = actions;
         Ok(self)
     }
 
-    pub(crate) fn initial_raises(
+    pub(crate) fn initial_actions(
         &mut self,
         state: StateId,
-        raises: Vec<Box<str>>,
+        actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.require_state_mut(state)?.initial_raises = raises;
+        self.require_state_mut(state)?.initial_actions = actions;
         Ok(self)
+    }
+
+    pub(crate) fn set_luau_datamodel(
+        &mut self,
+        names: Vec<Box<str>>,
+        initializers: Vec<Option<CompiledLuauExpression>>,
+    ) -> Result<Vec<DataId>, BuildError> {
+        if self.datamodel.is_some() {
+            return Err(BuildError::MultipleDataModels);
+        }
+        let mut expressions = Vec::new();
+        let mut initializer_ids = Vec::with_capacity(initializers.len());
+        for initializer in initializers {
+            initializer_ids.push(match initializer {
+                Some(expression) => {
+                    let id = ExpressionId(
+                        u32::try_from(expressions.len())
+                            .map_err(|_| BuildError::TooManyExpressions)?,
+                    );
+                    expressions.push(expression);
+                    Some(id)
+                }
+                None => None,
+            });
+        }
+        let ids = (0..names.len())
+            .map(|index| {
+                u32::try_from(index)
+                    .map(DataId)
+                    .map_err(|_| BuildError::TooManyDataItems)
+            })
+            .collect::<Result<_, _>>()?;
+        self.datamodel = Some(DraftLuauDataModel {
+            names,
+            initializers: initializer_ids,
+            expressions,
+        });
+        Ok(ids)
+    }
+
+    pub(crate) fn luau_expression(
+        &mut self,
+        expression: CompiledLuauExpression,
+    ) -> Result<ExpressionId, BuildError> {
+        let datamodel = self
+            .datamodel
+            .as_mut()
+            .ok_or(BuildError::MissingDataModel)?;
+        let id = ExpressionId(
+            u32::try_from(datamodel.expressions.len())
+                .map_err(|_| BuildError::TooManyExpressions)?,
+        );
+        datamodel.expressions.push(expression);
+        Ok(id)
     }
 
     /// Validates and compiles the definition.
@@ -425,7 +550,7 @@ impl StateTreeBuilder {
         let mut event_ids = HashMap::<EventPattern, EventId>::new();
         let mut states = Vec::with_capacity(self.states.len());
         let mut transition_entries = Vec::new();
-        let mut transition_raises = Vec::new();
+        let mut transition_actions = Vec::new();
 
         for (index, draft) in self.states.iter().enumerate() {
             let state_id = StateId {
@@ -462,6 +587,7 @@ impl StateTreeBuilder {
                 };
                 transitions.push(Transition {
                     event,
+                    condition: transition.condition,
                     target: transition.target,
                     exit_depth: transition_exit_depth(
                         state_id,
@@ -478,13 +604,13 @@ impl StateTreeBuilder {
                         &depths,
                         &mut transition_entries,
                     )?,
-                    raise_start: u32::try_from(transition_raises.len())
+                    action_start: u32::try_from(transition_actions.len())
                         .map_err(|_| BuildError::TooManyActions)?,
-                    raise_len: append_raises(
-                        &transition.raises,
+                    action_len: append_actions(
+                        &transition.actions,
                         &mut events,
                         &mut event_ids,
-                        &mut transition_raises,
+                        &mut transition_actions,
                     )?,
                 });
             }
@@ -494,9 +620,13 @@ impl StateTreeBuilder {
                 parent: draft.parent,
                 depth: depths[index],
                 kind,
-                entry_raises: compile_raises(&draft.entry_raises, &mut events, &mut event_ids)?,
-                exit_raises: compile_raises(&draft.exit_raises, &mut events, &mut event_ids)?,
-                initial_raises: compile_raises(&draft.initial_raises, &mut events, &mut event_ids)?,
+                entry_actions: compile_actions(&draft.entry_actions, &mut events, &mut event_ids)?,
+                exit_actions: compile_actions(&draft.exit_actions, &mut events, &mut event_ids)?,
+                initial_actions: compile_actions(
+                    &draft.initial_actions,
+                    &mut events,
+                    &mut event_ids,
+                )?,
                 transitions: transitions.into_boxed_slice(),
             });
         }
@@ -508,6 +638,12 @@ impl StateTreeBuilder {
         append_initial_descendants(root, &states, &mut initial_entries);
         let max_depth = depths.iter().copied().max().unwrap_or(0).saturating_add(1) as usize;
 
+        let datamodel = self.datamodel.map(|datamodel| CompiledLuauDataModel {
+            names: datamodel.names.into_boxed_slice(),
+            initializers: datamodel.initializers.into_boxed_slice(),
+            expressions: datamodel.expressions.into_boxed_slice(),
+        });
+
         Ok(StateTreeDefinition {
             compiled: Arc::new(CompiledDefinition {
                 identity: self.identity,
@@ -515,9 +651,10 @@ impl StateTreeBuilder {
                 root,
                 states: states.into_boxed_slice(),
                 transition_entries: transition_entries.into_boxed_slice(),
-                transition_raises: transition_raises.into_boxed_slice(),
+                transition_actions: transition_actions.into_boxed_slice(),
                 initial_entries: initial_entries.into_boxed_slice(),
                 max_depth,
+                datamodel,
                 events: events.into_boxed_slice(),
             }),
         })
@@ -558,9 +695,9 @@ impl StateTreeBuilder {
             name: name.clone(),
             parent,
             kind,
-            entry_raises: Vec::new(),
-            exit_raises: Vec::new(),
-            initial_raises: Vec::new(),
+            entry_actions: Vec::new(),
+            exit_actions: Vec::new(),
+            initial_actions: Vec::new(),
             transitions: Vec::new(),
         });
         self.names.insert(name, id);
@@ -571,8 +708,9 @@ impl StateTreeBuilder {
         &mut self,
         source: StateId,
         event: Option<EventPattern>,
+        condition: Option<ExpressionId>,
         target: StateId,
-        raises: Vec<Box<str>>,
+        actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
         self.require_state(target)?;
         let state = self.require_state_mut(source)?;
@@ -581,8 +719,9 @@ impl StateTreeBuilder {
         }
         state.transitions.push(DraftTransition {
             event,
+            condition,
             target,
-            raises,
+            actions,
         });
         Ok(self)
     }
@@ -620,32 +759,44 @@ fn intern_event(
     Ok(event)
 }
 
-fn compile_raises(
-    raises: &[Box<str>],
+fn compile_actions(
+    actions: &[DraftAction],
     events: &mut Vec<EventPattern>,
     event_ids: &mut HashMap<EventPattern, EventId>,
-) -> Result<Box<[EventId]>, BuildError> {
-    raises
+) -> Result<Box<[Action]>, BuildError> {
+    actions
         .iter()
-        .map(|event| intern_event(events, event_ids, EventPattern::Exact(event.clone())))
+        .map(|action| compile_action(action, events, event_ids))
         .collect()
 }
 
-fn append_raises(
-    raises: &[Box<str>],
+fn append_actions(
+    actions: &[DraftAction],
     events: &mut Vec<EventPattern>,
     event_ids: &mut HashMap<EventPattern, EventId>,
-    compiled: &mut Vec<EventId>,
+    compiled: &mut Vec<Action>,
 ) -> Result<u32, BuildError> {
     let start = compiled.len();
-    for event in raises {
-        compiled.push(intern_event(
-            events,
-            event_ids,
-            EventPattern::Exact(event.clone()),
-        )?);
+    for action in actions {
+        compiled.push(compile_action(action, events, event_ids)?);
     }
     u32::try_from(compiled.len() - start).map_err(|_| BuildError::TooManyActions)
+}
+
+fn compile_action(
+    action: &DraftAction,
+    events: &mut Vec<EventPattern>,
+    event_ids: &mut HashMap<EventPattern, EventId>,
+) -> Result<Action, BuildError> {
+    match action {
+        DraftAction::Raise(event) => {
+            intern_event(events, event_ids, EventPattern::Exact(event.clone())).map(Action::Raise)
+        }
+        DraftAction::Assign { data, expression } => Ok(Action::Assign {
+            data: *data,
+            expression: *expression,
+        }),
+    }
 }
 
 fn transition_domain(
@@ -774,6 +925,14 @@ pub enum BuildError {
     TooManyEvents,
     #[error("a definition cannot contain more than u32::MAX executable actions")]
     TooManyActions,
+    #[error("a definition cannot contain more than one datamodel")]
+    MultipleDataModels,
+    #[error("a Luau expression requires a datamodel")]
+    MissingDataModel,
+    #[error("a definition cannot contain more than u32::MAX data items")]
+    TooManyDataItems,
+    #[error("a definition cannot contain more than u32::MAX expressions")]
+    TooManyExpressions,
 }
 
 #[cfg(test)]

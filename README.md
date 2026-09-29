@@ -8,13 +8,15 @@ The crate currently provides the runtime foundation:
 - entity-local, domain-typed `StateTreeInstance` components;
 - atomic, compound, and final states;
 - hierarchical, eventless, and compound-completion transitions;
-- ordered SCXML `raise` actions on entry, exit, initial, and regular transitions;
+- Luau data expressions and transition guards;
+- ordered SCXML `raise` and Luau `assign` actions on entry, exit, initial, and
+  regular transitions;
 - bounded iterative macrostep stabilization;
 - ordered per-instance entity and broadcast event queues;
 - parallel event processing across independent instances.
 
-Activities, behavior-tree composites, guards, parallel regions, history, and
-invocation are planned on top of this foundation.
+Activities, behavior-tree composites, parallel regions, history, and invocation
+are planned on top of this foundation.
 
 The `scxml` module provides a namespace-aware authored-syntax parser that keeps
 SCXML structure, document order, source spans, raw expressions, and foreign

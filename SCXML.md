@@ -38,10 +38,25 @@ an arbitrary string queue.
 
 ## Datamodels
 
-ECMAScript is not a planned built-in datamodel. Guards, actions, and data access
-should integrate with typed Rust and Bevy first. Optional language integrations
-such as Rhai or Lua may be considered without making a scripting engine part of
-the core runtime.
+The compiler supports a root `datamodel="luau"` with early-bound
+`<datamodel><data id="..." expr="..."/></datamodel>` declarations, transition
+`cond` expressions, and `<assign location="..." expr="..."/>` executable
+content. Initializers run in document order, and assignments preserve their
+order relative to `<raise>` actions. Local datamodels, scripts, and the other
+SCXML executable-content elements remain unsupported.
+
+Each instance stores only portable nil, boolean, number, string, sequence, and
+string-keyed record values. Functions, userdata, threads, sparse or mixed-key
+tables, and shared or cyclic table graphs cannot be persisted. Instances never
+retain handles into a Luau VM and may move between Bevy worker threads. Worker
+threads reuse sandboxed VMs with bounded memory, expression interruption, and a
+fresh authored environment for each evaluation; scripts cannot access Bevy's
+`World`.
+
+`_event.name` exposes the currently processed typed event's authored name.
+Other SCXML system variables are reserved but not yet implemented. Datamodel
+errors fault the instance rather than raising SCXML `error.execution` events.
+ECMAScript is not a planned built-in datamodel.
 
 ## W3C Suite
 

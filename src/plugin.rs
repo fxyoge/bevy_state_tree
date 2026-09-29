@@ -21,7 +21,7 @@ use bevy_tasks::ComputeTaskPool;
 
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
-    StateTreeDomain, StateTreeEvents, StateTreeInstance,
+    StateTreeDomain, StateTreeInstance,
     definition::{CompiledDefinition, LinkedDefinition},
     instance::PendingStateTree,
 };
@@ -436,11 +436,9 @@ fn process_external_event<D: StateTreeDomain>(
     event: &D::Event,
     microstep_limit: usize,
 ) {
-    let changed = instance.bypass_change_detection().process_event(
-        event.event_index(),
-        event,
-        microstep_limit,
-    );
+    let changed = instance
+        .bypass_change_detection()
+        .process_event(event, microstep_limit);
     if changed {
         instance.set_changed();
     }

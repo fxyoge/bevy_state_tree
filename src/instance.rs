@@ -12,16 +12,30 @@ use bevy_asset::{AssetId, Handle};
 use bevy_ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld};
 
 use crate::definition::{
-    Entry, EventId, EventSet, LinkedDefinition, StateId, StateKind, Transition,
+    Action, CompiledDefinition, Entry, EventId, EventSet, ExpressionId, LinkedDefinition, StateId,
+    StateKind, Transition,
 };
-use crate::{StateTreeDefinition, StateTreeDomain, StateTreeEvents, plugin::StateTreeEventInbox};
+use crate::{
+    LuauValue, StateTreeDefinition, StateTreeDomain, StateTreeEvents, luau,
+    plugin::StateTreeEventInbox,
+};
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 enum Trigger<'a> {
-    Eventless,
+    Eventless(Option<&'a str>),
     Internal(EventId),
-    External(&'a EventSet),
+    External(&'a EventSet, &'a str),
+}
+
+impl<'a> Trigger<'a> {
+    fn event_name(&self, compiled: &'a CompiledDefinition) -> Option<&'a str> {
+        match self {
+            Self::Eventless(name) => *name,
+            Self::Internal(event) => compiled.event_name(*event),
+            Self::External(_, name) => Some(name),
+        }
+    }
 }
 
 struct HeadlessDomain<E>(PhantomData<fn() -> E>);
@@ -58,10 +72,14 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         self.instance.active_state_names()
     }
 
+    /// Returns one instance-local Luau datamodel value by authored id.
+    pub fn data(&self, name: &str) -> Option<&LuauValue> {
+        self.instance.data(name)
+    }
+
     /// Processes one external event through a complete macrostep.
     pub fn process_event(&mut self, event: &E, microstep_limit: NonZeroUsize) -> bool {
-        self.instance
-            .process_event(event.event_index(), event, microstep_limit.get())
+        self.instance.process_event(event, microstep_limit.get())
     }
 }
 
@@ -89,6 +107,19 @@ pub enum InstanceStatus {
 pub enum RuntimeFault {
     /// Another transition set was enabled after the macrostep reached its limit.
     MicrostepLimitExceeded { limit: usize },
+    /// A Luau datamodel expression failed while the instance was executing.
+    Datamodel {
+        operation: DatamodelOperation,
+        span_start: usize,
+        message: Box<str>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatamodelOperation {
+    Initialize,
+    Condition,
+    Assign,
 }
 
 /// Mutable statechart state attached to one Bevy entity.
@@ -110,6 +141,7 @@ pub struct StateTreeInstance<D: StateTreeDomain> {
     linked: Option<Arc<LinkedDefinition>>,
     active: Vec<StateId>,
     internal_events: VecDeque<EventId>,
+    data: Vec<LuauValue>,
     status: InstanceStatus,
     marker: PhantomData<fn() -> D>,
 }
@@ -131,6 +163,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             linked: None,
             active: Vec::new(),
             internal_events: VecDeque::new(),
+            data: Vec::new(),
             status: InstanceStatus::Pending,
             marker: PhantomData,
         }
@@ -171,6 +204,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         })
     }
 
+    /// Returns one instance-local Luau datamodel value by authored id.
+    pub fn data(&self, name: &str) -> Option<&LuauValue> {
+        let datamodel = self.linked.as_ref()?.compiled.datamodel.as_ref()?;
+        datamodel
+            .names
+            .iter()
+            .position(|candidate| candidate.as_ref() == name)
+            .and_then(|index| self.data.get(index))
+    }
+
     pub(crate) fn initialize(&mut self, linked: Arc<LinkedDefinition>, microstep_limit: usize) {
         let compiled = &linked.compiled;
         self.linked = Some(Arc::clone(&linked));
@@ -178,39 +221,51 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.active.reserve(compiled.max_depth);
         self.internal_events.clear();
         self.internal_events.reserve(compiled.max_depth);
+        self.data.clear();
         self.status = InstanceStatus::Running;
+        if let Err(fault) = self.initialize_datamodel(compiled) {
+            self.status = InstanceStatus::Faulted(fault);
+            return;
+        }
         for entry in &compiled.initial_entries {
-            self.enter_state(compiled, *entry);
+            if let Err(fault) = self.enter_state(compiled, *entry, None) {
+                self.status = InstanceStatus::Faulted(fault);
+                return;
+            }
         }
         self.update_completion();
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 0);
+            self.stabilize(microstep_limit, 0, None);
         }
     }
 
-    pub(crate) fn process_event<M: Send + Sync + 'static>(
-        &mut self,
-        event_index: usize,
-        _payload: &M,
-        microstep_limit: usize,
-    ) -> bool {
+    pub(crate) fn process_event(&mut self, event: &D::Event, microstep_limit: usize) -> bool {
         if self.status != InstanceStatus::Running {
             return false;
         }
         let Some(linked) = self.linked.as_ref() else {
             return false;
         };
-        let Some(events) = linked.external_event(event_index) else {
+        let Some(events) = linked.external_event(event.event_index()) else {
             return false;
         };
-        let Some(transition) = self.select_external_transition(events) else {
-            return false;
+        let event_name = event.authored_name();
+        let transition = match self.select_external_transition(events, event_name) {
+            Ok(Some(transition)) => transition,
+            Ok(None) => return false,
+            Err(fault) => {
+                self.status = InstanceStatus::Faulted(fault);
+                return true;
+            }
         };
 
-        self.take_transition(transition);
+        if let Err(fault) = self.take_transition(transition, Some(event_name)) {
+            self.status = InstanceStatus::Faulted(fault);
+            return true;
+        }
         self.update_completion();
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 1);
+            self.stabilize(microstep_limit, 1, Some(event_name));
         }
         true
     }
@@ -227,36 +282,73 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         else {
             return false;
         };
-        let Some(transition) = self.select_transition(Trigger::Internal(event)) else {
-            return false;
+        let transition = match self.select_transition(Trigger::Internal(event)) {
+            Ok(Some(transition)) => transition,
+            Ok(None) => return false,
+            Err(fault) => {
+                self.status = InstanceStatus::Faulted(fault);
+                return true;
+            }
         };
-        self.take_transition(transition);
+        let name = self
+            .linked
+            .as_ref()
+            .and_then(|linked| linked.compiled.event_name(event))
+            .map(str::to_owned);
+        if let Err(fault) = self.take_transition(transition, name.as_deref()) {
+            self.status = InstanceStatus::Faulted(fault);
+            return true;
+        }
         self.update_completion();
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 1);
+            self.stabilize(microstep_limit, 1, name.as_deref());
         }
         true
     }
 
-    fn stabilize(&mut self, limit: usize, mut transitions_taken: usize) {
+    fn stabilize(
+        &mut self,
+        limit: usize,
+        mut transitions_taken: usize,
+        current_event: Option<&str>,
+    ) {
+        let mut current_event = current_event.map(Box::<str>::from);
         loop {
-            let transition = if let Some(transition) = self.select_transition(Trigger::Eventless) {
-                transition
-            } else {
-                let Some(event) = self.internal_events.pop_front() else {
-                    return;
+            let transition =
+                match self.select_transition(Trigger::Eventless(current_event.as_deref())) {
+                    Ok(Some(transition)) => transition,
+                    Ok(None) => {
+                        let Some(event) = self.internal_events.pop_front() else {
+                            return;
+                        };
+                        current_event = self
+                            .linked
+                            .as_ref()
+                            .and_then(|linked| linked.compiled.event_name(event))
+                            .map(Box::from);
+                        match self.select_transition(Trigger::Internal(event)) {
+                            Ok(Some(transition)) => transition,
+                            Ok(None) => continue,
+                            Err(fault) => {
+                                self.status = InstanceStatus::Faulted(fault);
+                                return;
+                            }
+                        }
+                    }
+                    Err(fault) => {
+                        self.status = InstanceStatus::Faulted(fault);
+                        return;
+                    }
                 };
-                let Some(transition) = self.select_transition(Trigger::Internal(event)) else {
-                    continue;
-                };
-                transition
-            };
             if transitions_taken == limit {
                 self.status =
                     InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit });
                 return;
             }
-            self.take_transition(transition);
+            if let Err(fault) = self.take_transition(transition, current_event.as_deref()) {
+                self.status = InstanceStatus::Faulted(fault);
+                return;
+            }
             transitions_taken += 1;
             self.update_completion();
             if self.status != InstanceStatus::Running {
@@ -265,55 +357,80 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
     }
 
-    fn select_transition(&self, trigger: Trigger<'_>) -> Option<Transition> {
-        let compiled = &self.linked.as_ref()?.compiled;
-        self.active.iter().rev().find_map(|state| {
-            compiled
-                .state(*state)
-                .transitions
-                .iter()
-                .find(|transition| match (transition.event, &trigger) {
-                    (None, Trigger::Eventless) => true,
+    fn select_transition(&self, trigger: Trigger<'_>) -> Result<Option<Transition>, RuntimeFault> {
+        let Some(compiled) = self.linked.as_ref().map(|linked| &linked.compiled) else {
+            return Ok(None);
+        };
+        for state in self.active.iter().rev() {
+            for transition in &compiled.state(*state).transitions {
+                let matches = match (transition.event, &trigger) {
+                    (None, Trigger::Eventless(_)) => true,
                     (Some(candidate), Trigger::Internal(emitted)) => {
                         compiled.internal_event_matches(candidate, *emitted)
                     }
-                    (Some(event), Trigger::External(events)) => events.contains(event),
+                    (Some(event), Trigger::External(events, _)) => events.contains(event),
                     _ => false,
-                })
-                .copied()
-        })
+                };
+                if !matches {
+                    continue;
+                }
+                if let Some(condition) = transition.condition
+                    && !self.evaluate_condition(
+                        compiled,
+                        condition,
+                        trigger.event_name(compiled),
+                    )?
+                {
+                    continue;
+                }
+                return Ok(Some(*transition));
+            }
+        }
+        Ok(None)
     }
 
-    fn select_external_transition(&self, events: &EventSet) -> Option<Transition> {
-        self.select_transition(Trigger::External(events))
+    fn select_external_transition(
+        &self,
+        events: &EventSet,
+        name: &str,
+    ) -> Result<Option<Transition>, RuntimeFault> {
+        self.select_transition(Trigger::External(events, name))
     }
 
-    fn take_transition(&mut self, transition: Transition) {
+    fn take_transition(
+        &mut self,
+        transition: Transition,
+        event_name: Option<&str>,
+    ) -> Result<(), RuntimeFault> {
         let Some(compiled) = self
             .linked
             .as_ref()
             .map(|linked| Arc::clone(&linked.compiled))
         else {
-            return;
+            return Ok(());
         };
-        for state in self.active[transition.exit_depth as usize..].iter().rev() {
-            self.internal_events
-                .extend(compiled.state(*state).exit_raises.iter().copied());
+        let exited: Vec<_> = self.active[transition.exit_depth as usize..]
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        for state in exited {
+            self.execute_actions(&compiled, &compiled.state(state).exit_actions, event_name)?;
         }
         self.active.truncate(transition.exit_depth as usize);
 
-        let raise_start = transition.raise_start as usize;
-        let raise_end = raise_start + transition.raise_len as usize;
-        self.internal_events.extend(
-            compiled.transition_raises[raise_start..raise_end]
-                .iter()
-                .copied(),
-        );
+        let action_start = transition.action_start as usize;
+        let action_end = action_start + transition.action_len as usize;
+        self.execute_actions(
+            &compiled,
+            &compiled.transition_actions[action_start..action_end],
+            event_name,
+        )?;
 
         let start = transition.entry_start as usize;
         let end = start + transition.entry_len as usize;
         for entry in &compiled.transition_entries[start..end] {
-            self.enter_state(&compiled, *entry);
+            self.enter_state(&compiled, *entry, event_name)?;
         }
         debug_assert!(
             self.active
@@ -321,17 +438,102 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 .enumerate()
                 .all(|(depth, state)| compiled.state(*state).depth as usize == depth)
         );
+        Ok(())
     }
 
-    fn enter_state(&mut self, compiled: &crate::definition::CompiledDefinition, entry: Entry) {
+    fn enter_state(
+        &mut self,
+        compiled: &CompiledDefinition,
+        entry: Entry,
+        event_name: Option<&str>,
+    ) -> Result<(), RuntimeFault> {
         self.active.push(entry.state);
         let state = compiled.state(entry.state);
-        self.internal_events
-            .extend(state.entry_raises.iter().copied());
+        self.execute_actions(compiled, &state.entry_actions, event_name)?;
         if entry.take_initial {
-            self.internal_events
-                .extend(state.initial_raises.iter().copied());
+            self.execute_actions(compiled, &state.initial_actions, event_name)?;
         }
+        Ok(())
+    }
+
+    fn initialize_datamodel(&mut self, compiled: &CompiledDefinition) -> Result<(), RuntimeFault> {
+        let Some(datamodel) = &compiled.datamodel else {
+            return Ok(());
+        };
+        self.data.resize(datamodel.names.len(), LuauValue::Nil);
+        for (index, initializer) in datamodel.initializers.iter().enumerate() {
+            let Some(initializer) = initializer else {
+                continue;
+            };
+            self.data[index] = self.evaluate_expression(
+                compiled,
+                *initializer,
+                None,
+                DatamodelOperation::Initialize,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn evaluate_condition(
+        &self,
+        compiled: &CompiledDefinition,
+        expression: ExpressionId,
+        event_name: Option<&str>,
+    ) -> Result<bool, RuntimeFault> {
+        match self.evaluate_expression(
+            compiled,
+            expression,
+            event_name,
+            DatamodelOperation::Condition,
+        )? {
+            LuauValue::Boolean(value) => Ok(value),
+            _ => unreachable!("condition expressions are compiled to booleans"),
+        }
+    }
+
+    fn evaluate_expression(
+        &self,
+        compiled: &CompiledDefinition,
+        expression: ExpressionId,
+        event_name: Option<&str>,
+        operation: DatamodelOperation,
+    ) -> Result<LuauValue, RuntimeFault> {
+        let datamodel = compiled
+            .datamodel
+            .as_ref()
+            .expect("compiled Luau expressions require a datamodel");
+        let expression = &datamodel.expressions[expression.index()];
+        luau::evaluate(expression, &datamodel.names, &self.data, event_name).map_err(|error| {
+            RuntimeFault::Datamodel {
+                operation,
+                span_start: expression.span_start,
+                message: error.to_string().into(),
+            }
+        })
+    }
+
+    fn execute_actions(
+        &mut self,
+        compiled: &CompiledDefinition,
+        actions: &[Action],
+        event_name: Option<&str>,
+    ) -> Result<(), RuntimeFault> {
+        for action in actions {
+            match *action {
+                Action::Raise(event) => self.internal_events.push_back(event),
+                Action::Assign { data, expression } => {
+                    let value = self.evaluate_expression(
+                        compiled,
+                        expression,
+                        event_name,
+                        DatamodelOperation::Assign,
+                    )?;
+                    self.data[data.index()] = value;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_completion(&mut self) {

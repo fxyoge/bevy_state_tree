@@ -29,6 +29,7 @@ extern crate self as bevy_state_tree;
 mod definition;
 mod event;
 mod instance;
+mod luau;
 mod plugin;
 
 pub mod scxml;
@@ -39,7 +40,10 @@ pub use event::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEventPayload,
     StateTreeEvents,
 };
-pub use instance::{InstanceStatus, RuntimeFault, StateTreeExecution, StateTreeInstance};
+pub use instance::{
+    DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeExecution, StateTreeInstance,
+};
+pub use luau::LuauValue;
 pub use plugin::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreePlugin, StateTreeSet,
     StateTreeSettings,
@@ -48,9 +52,10 @@ pub use plugin::{
 /// Common state-tree imports.
 pub mod prelude {
     pub use crate::{
-        BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, EntityStateTreeEvent,
-        EntityStateTreeEventWriter, InstanceStatus, RuntimeFault, StateId, StateTreeBuilder,
-        StateTreeDefinition, StateTreeDomain, StateTreeEventPayload, StateTreeEvents,
-        StateTreeExecution, StateTreeInstance, StateTreePlugin, StateTreeSet, StateTreeSettings,
+        BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, DatamodelOperation,
+        EntityStateTreeEvent, EntityStateTreeEventWriter, InstanceStatus, LuauValue, RuntimeFault,
+        StateId, StateTreeBuilder, StateTreeDefinition, StateTreeDomain, StateTreeEventPayload,
+        StateTreeEvents, StateTreeExecution, StateTreeInstance, StateTreePlugin, StateTreeSet,
+        StateTreeSettings,
     };
 }
