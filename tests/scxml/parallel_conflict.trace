@@ -1,0 +1,37 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "p"
+enter "left"
+enter "left_wait"
+enter "right"
+enter "right_wait"
+configuration
+active "#document"
+active "p"
+active "left"
+active "left_wait"
+active "right"
+active "right_wait"
+status running
+macrostep end
+macrostep external "reset"
+microstep 1
+transition "left_wait"
+target "outside"
+exit begin "left_wait"
+exit begin "right_wait"
+exit begin "left"
+exit begin "right"
+exit begin "p"
+exit "left_wait"
+exit "right_wait"
+exit "left"
+exit "right"
+exit "p"
+enter "outside"
+configuration
+active "#document"
+active "outside"
+status running
+macrostep end

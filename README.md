@@ -6,7 +6,7 @@ The crate currently provides the runtime foundation:
 
 - immutable `StateTreeDefinition` assets;
 - entity-local, domain-typed `StateTreeInstance` components;
-- atomic, compound, and final states;
+- atomic, compound, parallel, and final states;
 - hierarchical, eventless, and compound-completion transitions;
 - Luau data expressions and transition guards;
 - ordered SCXML `raise` and Luau `assign` actions on entry, exit, initial, and
@@ -14,11 +14,12 @@ The crate currently provides the runtime foundation:
 - typed effects that construct and publish concrete Bevy messages;
 - opt-in typed event payload projection through Luau `_event.data`;
 - bounded iterative macrostep stabilization;
+- deterministic transition sets across orthogonal regions;
 - ordered per-instance entity and broadcast event queues;
 - parallel event processing across independent instances.
 
-Activities, behavior-tree composites, parallel regions, history, and invocation
-are planned on top of this foundation.
+Activities, behavior-tree composites, history, and invocation are planned on
+top of this foundation.
 
 The `scxml` module provides a namespace-aware authored-syntax parser that keeps
 SCXML structure, document order, source spans, raw expressions, and foreign

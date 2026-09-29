@@ -1,0 +1,17 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="p">
+  <parallel id="p">
+    <state id="left" initial="left_outer">
+      <state id="left_outer" initial="left_leaf">
+        <state id="left_leaf"/>
+      </state>
+    </state>
+    <parallel id="right">
+      <state id="right_top" initial="right_leaf">
+        <state id="right_leaf"/>
+      </state>
+      <state id="right_bottom" initial="right_leaf2">
+        <state id="right_leaf2"/>
+      </state>
+    </parallel>
+  </parallel>
+</scxml>

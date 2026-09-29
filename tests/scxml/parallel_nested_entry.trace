@@ -1,0 +1,25 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "p"
+enter "left"
+enter "left_outer"
+enter "left_leaf"
+enter "right"
+enter "right_top"
+enter "right_leaf"
+enter "right_bottom"
+enter "right_leaf2"
+configuration
+active "#document"
+active "p"
+active "left"
+active "left_outer"
+active "left_leaf"
+active "right"
+active "right_top"
+active "right_leaf"
+active "right_bottom"
+active "right_leaf2"
+status running
+macrostep end

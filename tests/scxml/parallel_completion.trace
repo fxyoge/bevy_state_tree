@@ -1,0 +1,54 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "p"
+enter "left"
+enter "left_running"
+enter "right"
+enter "right_running"
+configuration
+active "#document"
+active "p"
+active "left"
+active "left_running"
+active "right"
+active "right_running"
+status running
+macrostep end
+macrostep external "finish"
+microstep 1
+transition "left_running"
+target "left_done"
+transition "right_running"
+target "right_done"
+exit begin "left_running"
+exit begin "right_running"
+exit "left_running"
+exit "right_running"
+enter "left_done"
+enter "right_done"
+raise "done.state.left"
+raise "done.state.right"
+raise "done.state.p"
+consume internal "done.state.left"
+consume internal "done.state.right"
+consume internal "done.state.p"
+microstep 2
+transition "p"
+target "after"
+exit begin "left_done"
+exit begin "right_done"
+exit begin "left"
+exit begin "right"
+exit begin "p"
+exit "left_done"
+exit "right_done"
+exit "left"
+exit "right"
+exit "p"
+enter "after"
+configuration
+active "#document"
+active "after"
+status complete
+macrostep end

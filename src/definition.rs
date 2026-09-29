@@ -124,6 +124,9 @@ pub(crate) enum StateKind {
         initial: StateId,
         completion: EventId,
     },
+    Parallel {
+        completion: EventId,
+    },
     Final,
 }
 
@@ -132,7 +135,10 @@ pub(crate) struct StateNode {
     pub name: Box<str>,
     pub parent: Option<StateId>,
     pub depth: u32,
+    pub document_order: u32,
     pub kind: StateKind,
+    pub child_start: u32,
+    pub child_len: u32,
     pub entry_actions: Box<[Action]>,
     pub exit_actions: Box<[Action]>,
     pub initial_actions: Box<[Action]>,
@@ -150,6 +156,7 @@ pub(crate) struct Transition {
     pub event: Option<EventId>,
     pub condition: Option<ExpressionId>,
     pub target: Option<StateId>,
+    pub domain: Option<StateId>,
     pub exit_depth: u32,
     pub entry_start: u32,
     pub entry_len: u32,
@@ -170,11 +177,14 @@ pub(crate) struct CompiledDefinition {
     pub name: Box<str>,
     pub root: StateId,
     pub states: Box<[StateNode]>,
+    pub children: Box<[StateId]>,
     pub transition_entries: Box<[Entry]>,
     pub transition_actions: Box<[Action]>,
     pub effect_arguments: Box<[EffectArgument]>,
     pub initial_entries: Box<[Entry]>,
     pub max_depth: usize,
+    pub max_active: usize,
+    pub has_parallel: bool,
     pub datamodel: Option<CompiledLuauDataModel>,
     events: Box<[EventPattern]>,
     effects: Box<[Box<str>]>,
@@ -195,6 +205,12 @@ impl CompiledDefinition {
     pub fn state(&self, id: StateId) -> &StateNode {
         debug_assert_eq!(id.definition, self.identity);
         &self.states[id.index()]
+    }
+
+    pub fn children(&self, id: StateId) -> &[StateId] {
+        let state = self.state(id);
+        let start = state.child_start as usize;
+        &self.children[start..start + state.child_len as usize]
     }
 
     pub fn internal_event_matches(&self, candidate: EventId, emitted: EventId) -> bool {
@@ -314,6 +330,7 @@ impl StateTreeDefinition {
 enum DraftKind {
     Atomic,
     Compound { initial: Option<StateId> },
+    Parallel,
     Final,
 }
 
@@ -402,6 +419,15 @@ impl StateTreeBuilder {
         parent: StateId,
     ) -> Result<StateId, BuildError> {
         self.add_child(name, parent, DraftKind::Compound { initial: None })
+    }
+
+    /// Adds a parallel child state whose direct children are orthogonal regions.
+    pub fn parallel(
+        &mut self,
+        name: impl Into<Box<str>>,
+        parent: StateId,
+    ) -> Result<StateId, BuildError> {
+        self.add_child(name, parent, DraftKind::Parallel)
     }
 
     /// Adds an atomic child state.
@@ -623,6 +649,28 @@ impl StateTreeBuilder {
         let mut effects = Vec::<Box<str>>::new();
         let mut effect_ids = HashMap::<Box<str>, EffectId>::new();
         let mut effect_arguments = Vec::new();
+        let mut children_by_state = vec![Vec::new(); self.states.len()];
+        for (index, draft) in self.states.iter().enumerate() {
+            if let Some(parent) = draft.parent {
+                children_by_state[parent.index()].push(StateId {
+                    definition: self.identity,
+                    index: u32::try_from(index).map_err(|_| BuildError::TooManyStates)?,
+                });
+            }
+        }
+        let mut children = Vec::with_capacity(self.states.len().saturating_sub(1));
+        let has_parallel = self
+            .states
+            .iter()
+            .any(|state| state.kind == DraftKind::Parallel);
+        let mut document_orders = vec![0; self.states.len()];
+        let mut order = 0u32;
+        let mut pending = vec![root];
+        while let Some(state) = pending.pop() {
+            document_orders[state.index()] = order;
+            order = order.checked_add(1).ok_or(BuildError::TooManyStates)?;
+            pending.extend(children_by_state[state.index()].iter().rev().copied());
+        }
 
         for (index, draft) in self.states.iter().enumerate() {
             let state_id = StateId {
@@ -646,6 +694,18 @@ impl StateTreeBuilder {
                         completion,
                     }
                 }
+                DraftKind::Parallel => {
+                    if children_by_state[index].is_empty() {
+                        return Err(BuildError::ParallelHasNoRegions(state_id));
+                    }
+                    let completion_name: Box<str> = format!("done.state.{}", draft.name).into();
+                    let completion = intern_event(
+                        &mut events,
+                        &mut event_ids,
+                        EventPattern::Exact(completion_name),
+                    )?;
+                    StateKind::Parallel { completion }
+                }
             };
 
             let mut transitions = Vec::with_capacity(draft.transitions.len());
@@ -665,6 +725,7 @@ impl StateTreeBuilder {
                         target,
                         &self.states,
                         &depths,
+                        &children_by_state,
                         &mut transition_entries,
                     )?;
                     (
@@ -679,6 +740,9 @@ impl StateTreeBuilder {
                     event,
                     condition: transition.condition,
                     target: transition.target,
+                    domain: transition.target.and_then(|target| {
+                        transition_domain(state_id, target, &self.states, &depths)
+                    }),
                     exit_depth,
                     entry_start,
                     entry_len,
@@ -696,11 +760,18 @@ impl StateTreeBuilder {
                 });
             }
 
+            let child_start =
+                u32::try_from(children.len()).map_err(|_| BuildError::TooManyStates)?;
+            children.extend_from_slice(&children_by_state[index]);
             states.push(StateNode {
                 name: draft.name.clone(),
                 parent: draft.parent,
                 depth: depths[index],
+                document_order: document_orders[index],
                 kind,
+                child_start,
+                child_len: u32::try_from(children_by_state[index].len())
+                    .map_err(|_| BuildError::TooManyStates)?,
                 entry_actions: compile_actions(
                     &draft.entry_actions,
                     &mut events,
@@ -729,12 +800,34 @@ impl StateTreeBuilder {
             });
         }
 
-        let mut initial_entries = vec![Entry {
-            state: root,
-            take_initial: matches!(states[root.index()].kind, StateKind::Compound { .. }),
-        }];
-        append_initial_descendants(root, &states, &mut initial_entries);
+        let mut initial_entries = Vec::new();
+        append_entry_configuration(
+            root,
+            None,
+            &self.states,
+            &children_by_state,
+            &mut initial_entries,
+        );
         let max_depth = depths.iter().copied().max().unwrap_or(0).saturating_add(1) as usize;
+        let mut max_configurations = vec![1usize; self.states.len()];
+        for index in (0..self.states.len()).rev() {
+            max_configurations[index] = match self.states[index].kind {
+                DraftKind::Atomic | DraftKind::Final => 1,
+                DraftKind::Compound { .. } => {
+                    1 + children_by_state[index]
+                        .iter()
+                        .map(|child| max_configurations[child.index()])
+                        .max()
+                        .unwrap_or(0)
+                }
+                DraftKind::Parallel => {
+                    1 + children_by_state[index]
+                        .iter()
+                        .map(|child| max_configurations[child.index()])
+                        .sum::<usize>()
+                }
+            };
+        }
 
         let datamodel = self.datamodel.map(|datamodel| CompiledLuauDataModel {
             names: datamodel.names.into_boxed_slice(),
@@ -748,11 +841,14 @@ impl StateTreeBuilder {
                 name: self.name,
                 root,
                 states: states.into_boxed_slice(),
+                children: children.into_boxed_slice(),
                 transition_entries: transition_entries.into_boxed_slice(),
                 transition_actions: transition_actions.into_boxed_slice(),
                 effect_arguments: effect_arguments.into_boxed_slice(),
                 initial_entries: initial_entries.into_boxed_slice(),
                 max_depth,
+                max_active: max_configurations[root.index()],
+                has_parallel,
                 datamodel,
                 events: events.into_boxed_slice(),
                 effects: effects.into_boxed_slice(),
@@ -767,7 +863,10 @@ impl StateTreeBuilder {
         kind: DraftKind,
     ) -> Result<StateId, BuildError> {
         let parent_state = self.require_state(parent)?;
-        if !matches!(parent_state.kind, DraftKind::Compound { .. }) {
+        if !matches!(
+            parent_state.kind,
+            DraftKind::Compound { .. } | DraftKind::Parallel
+        ) {
             return Err(BuildError::ChildOfNonCompound(parent));
         }
         self.add_state(name, Some(parent), kind)
@@ -1000,6 +1099,7 @@ fn append_transition_entries(
     target: StateId,
     states: &[DraftState],
     depths: &[u32],
+    children: &[Vec<StateId>],
     entries: &mut Vec<Entry>,
 ) -> Result<u32, BuildError> {
     let domain = transition_domain(source, target, states, depths);
@@ -1011,37 +1111,78 @@ fn append_transition_entries(
         reverse.push(state);
         cursor = states[state.index()].parent;
     }
-    entries.extend(reverse.into_iter().rev().map(|state| Entry {
-        state,
-        take_initial: false,
-    }));
+    reverse.reverse();
 
-    let mut cursor = target;
-    while let DraftKind::Compound {
-        initial: Some(initial),
-    } = states[cursor.index()].kind
-    {
-        entries
-            .last_mut()
-            .expect("the transition target is always entered")
-            .take_initial = true;
-        entries.push(Entry {
-            state: initial,
-            take_initial: false,
-        });
-        cursor = initial;
+    if domain.is_some_and(|state| states[state.index()].kind == DraftKind::Parallel) {
+        let explicit = reverse.first().copied();
+        for child in &children[domain.expect("checked domain").index()] {
+            let path = (Some(*child) == explicit).then_some(reverse.as_slice());
+            append_entry_configuration(*child, path, states, children, entries);
+        }
+    } else {
+        let first = reverse
+            .first()
+            .copied()
+            .expect("an external transition always re-enters at least its target");
+        append_entry_configuration(first, Some(&reverse), states, children, entries);
     }
 
     u32::try_from(entries.len() - start).map_err(|_| BuildError::TooManyStates)
 }
 
-fn append_initial_descendants(mut state: StateId, states: &[StateNode], entries: &mut Vec<Entry>) {
-    while let StateKind::Compound { initial, .. } = states[state.index()].kind {
+fn append_entry_configuration(
+    state: StateId,
+    explicit_path: Option<&[StateId]>,
+    states: &[DraftState],
+    children: &[Vec<StateId>],
+    entries: &mut Vec<Entry>,
+) {
+    #[derive(Clone, Copy)]
+    struct Pending<'a> {
+        state: StateId,
+        explicit_path: Option<&'a [StateId]>,
+    }
+
+    let mut pending = vec![Pending {
+        state,
+        explicit_path,
+    }];
+    while let Some(Pending {
+        state,
+        explicit_path,
+    }) = pending.pop()
+    {
+        let explicit_child = explicit_path.and_then(|path| path.get(1)).copied();
+        let take_initial = matches!(states[state.index()].kind, DraftKind::Compound { .. })
+            && explicit_child.is_none();
         entries.push(Entry {
-            state: initial,
-            take_initial: matches!(states[initial.index()].kind, StateKind::Compound { .. }),
+            state,
+            take_initial,
         });
-        state = initial;
+
+        match states[state.index()].kind {
+            DraftKind::Atomic | DraftKind::Final => {}
+            DraftKind::Compound { initial } => {
+                let child = explicit_child.or(initial);
+                if let Some(child) = child {
+                    pending.push(Pending {
+                        state: child,
+                        explicit_path: explicit_child
+                            .is_some()
+                            .then(|| &explicit_path.expect("explicit child requires a path")[1..]),
+                    });
+                }
+            }
+            DraftKind::Parallel => {
+                for child in children[state.index()].iter().rev() {
+                    pending.push(Pending {
+                        state: *child,
+                        explicit_path: (Some(*child) == explicit_child)
+                            .then(|| &explicit_path.expect("explicit child requires a path")[1..]),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1072,6 +1213,8 @@ pub enum BuildError {
     InitialNotDirectChild { compound: StateId, child: StateId },
     #[error("compound state {0:?} has no initial child")]
     MissingInitial(StateId),
+    #[error("parallel state {0:?} has no regions")]
+    ParallelHasNoRegions(StateId),
     #[error("final state {0:?} cannot have outgoing transitions")]
     FinalHasTransition(StateId),
     #[error("a definition cannot contain more than u32::MAX states")]
@@ -1152,6 +1295,19 @@ mod tests {
         assert_eq!(
             builder.build().unwrap_err(),
             BuildError::MissingInitial(root)
+        );
+    }
+
+    #[test]
+    fn rejects_parallel_states_without_regions() {
+        let mut builder = StateTreeBuilder::new("invalid-parallel");
+        let root = builder.compound_root("root").unwrap();
+        let parallel = builder.parallel("parallel", root).unwrap();
+        builder.initial(root, parallel).unwrap();
+
+        assert_eq!(
+            builder.build().unwrap_err(),
+            BuildError::ParallelHasNoRegions(parallel)
         );
     }
 

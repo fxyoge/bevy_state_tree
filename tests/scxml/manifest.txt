@@ -1,4 +1,5 @@
 benchmark_luau
+benchmark_parallel
 benchmark_toggle
 datamodel_actions
 external_transition
@@ -7,4 +8,14 @@ ignored_event
 implicit_initial
 onentry_order
 onexit_order
+parallel_completion
+parallel_conflict
+parallel_descendant_priority
+parallel_action_order
+parallel_eventless
+parallel_faulting_entry
+parallel_leave
+parallel_nested_entry
+parallel_simultaneous
+parallel_target_entry
 targetless_transition

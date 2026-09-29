@@ -1,0 +1,29 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "outside"
+configuration
+active "#document"
+active "outside"
+status running
+macrostep end
+macrostep external "advance"
+microstep 1
+transition "outside"
+target "left_special"
+exit begin "outside"
+exit "outside"
+enter "p"
+enter "left"
+enter "left_special"
+enter "right"
+enter "right_default"
+configuration
+active "#document"
+active "p"
+active "left"
+active "left_special"
+active "right"
+active "right_default"
+status running
+macrostep end

@@ -1,0 +1,14 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="p">
+  <parallel id="p">
+    <state id="left" initial="left_running">
+      <state id="left_running"><transition event="finish" target="left_done"/></state>
+      <final id="left_done"/>
+    </state>
+    <state id="right" initial="right_running">
+      <state id="right_running"><transition event="finish" target="right_done"/></state>
+      <final id="right_done"/>
+    </state>
+    <transition event="done.state.p" target="after"/>
+  </parallel>
+  <final id="after"/>
+</scxml>

@@ -1,0 +1,12 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="active">
+  <parallel id="active">
+    <state id="movement" initial="movement_left">
+      <state id="movement_left"><transition event="tick" target="movement_right"/></state>
+      <state id="movement_right"><transition event="tick" target="movement_left"/></state>
+    </state>
+    <state id="stance" initial="stance_low">
+      <state id="stance_low"><transition event="tick" target="stance_high"/></state>
+      <state id="stance_high"><transition event="tick" target="stance_low"/></state>
+    </state>
+  </parallel>
+</scxml>

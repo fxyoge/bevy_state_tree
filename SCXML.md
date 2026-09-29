@@ -28,6 +28,21 @@ instance.
 statechart's private internal queue. Its authored name is compiled to a dense
 event identifier and does not escape as a Bevy event.
 
+## Parallel States
+
+`<parallel>` activates every direct region and recursively enters each region's
+initial configuration. Regions are orthogonal, not concurrently executed: one
+event selects a deterministic set of non-conflicting transitions and executes
+the set serially. This keeps Luau assignments, internal raises, and typed
+effects ordered even when multiple regions react to the same event.
+
+Transitions in descendant states take priority over conflicting ancestor
+transitions. Other conflicts are resolved in authored document order. For one
+transition set, exits run deepest-first with document order as a tie breaker,
+then transition actions run in document order, then entries run in document
+order. A parallel state raises `done.state.<id>` after all of its regions have
+completed. Multi-target transitions remain unsupported.
+
 ## Send
 
 SCXML `<send>` will not be supported. Its generic string event, dynamic

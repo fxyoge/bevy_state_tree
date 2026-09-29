@@ -1,0 +1,28 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "p"
+enter "left"
+enter "left_boot"
+enter "right"
+enter "right_boot"
+microstep 1
+transition "left_boot"
+target "left_ready"
+transition "right_boot"
+target "right_ready"
+exit begin "left_boot"
+exit begin "right_boot"
+exit "left_boot"
+exit "right_boot"
+enter "left_ready"
+enter "right_ready"
+configuration
+active "#document"
+active "p"
+active "left"
+active "left_ready"
+active "right"
+active "right_ready"
+status running
+macrostep end

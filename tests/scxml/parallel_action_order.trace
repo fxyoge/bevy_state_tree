@@ -1,0 +1,50 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "p"
+enter "left"
+enter "left_wait"
+enter "right"
+enter "right_wait"
+configuration
+active "#document"
+active "p"
+active "left"
+active "left_wait"
+active "right"
+active "right_wait"
+status running
+macrostep end
+macrostep external "tick"
+microstep 1
+transition "left_wait"
+target "left_done"
+transition "right_wait"
+target "right_done"
+exit begin "left_wait"
+raise "exit.left"
+exit begin "right_wait"
+raise "exit.right"
+exit "left_wait"
+exit "right_wait"
+raise "transition.left"
+raise "transition.right"
+enter "left_done"
+raise "enter.left"
+enter "right_done"
+raise "enter.right"
+consume internal "exit.left"
+consume internal "exit.right"
+consume internal "transition.left"
+consume internal "transition.right"
+consume internal "enter.left"
+consume internal "enter.right"
+configuration
+active "#document"
+active "p"
+active "left"
+active "left_done"
+active "right"
+active "right_done"
+status running
+macrostep end

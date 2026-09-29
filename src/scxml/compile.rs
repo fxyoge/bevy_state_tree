@@ -4,8 +4,8 @@ use thiserror::Error;
 
 use super::{
     Attribute, Content, ContentPart, DataModelChild, Document, ExecutableContent, Extension,
-    ExtensionContent, Final, FinalChild, Initial, OnEntry, OnExit, RootChild, Span, State,
-    StateChild, Transition, TransitionType,
+    ExtensionContent, Final, FinalChild, Initial, OnEntry, OnExit, Parallel, ParallelChild,
+    RootChild, Span, State, StateChild, Transition, TransitionType,
 };
 use crate::{
     BuildError, StateId, StateTreeBuilder, StateTreeDefinition,
@@ -62,6 +62,7 @@ pub enum CompileError {
 #[derive(Clone, Copy)]
 enum Node<'a> {
     State(&'a State),
+    Parallel(&'a Parallel),
     Final,
 }
 
@@ -113,6 +114,7 @@ impl<'a> Compiler<'a> {
         for child in &self.document.root.children {
             match child {
                 RootChild::State(state) => self.add_state(state, root)?,
+                RootChild::Parallel(state) => self.add_parallel(state, root)?,
                 RootChild::Final(state) => self.add_final(state, root)?,
                 _ => {}
             }
@@ -154,8 +156,10 @@ impl<'a> Compiler<'a> {
         }
         for child in &self.document.root.children {
             let (span, feature) = match child {
-                RootChild::State(_) | RootChild::Final(_) | RootChild::DataModel(_) => continue,
-                RootChild::Parallel(value) => (value.span, "parallel states"),
+                RootChild::State(_)
+                | RootChild::Parallel(_)
+                | RootChild::Final(_)
+                | RootChild::DataModel(_) => continue,
                 RootChild::Script(value) => (value.span, "scripts"),
                 RootChild::Extension(value) => (value.span, "foreign extensions"),
             };
@@ -256,7 +260,10 @@ impl<'a> Compiler<'a> {
         let compound = state.children.iter().any(|child| {
             matches!(
                 child,
-                StateChild::State(_) | StateChild::Final(_) | StateChild::Initial(_)
+                StateChild::State(_)
+                    | StateChild::Parallel(_)
+                    | StateChild::Final(_)
+                    | StateChild::Initial(_)
             )
         });
         let name = self.node_name(state.id.as_deref());
@@ -288,9 +295,7 @@ impl<'a> Compiler<'a> {
             match child {
                 StateChild::State(child) => self.add_state(child, runtime)?,
                 StateChild::Final(child) => self.add_final(child, runtime)?,
-                StateChild::Parallel(value) => {
-                    return self.unsupported(value.span, "parallel states");
-                }
+                StateChild::Parallel(value) => self.add_parallel(value, runtime)?,
                 StateChild::History(value) => {
                     return self.unsupported(value.span, "history states");
                 }
@@ -305,6 +310,59 @@ impl<'a> Compiler<'a> {
                 }
                 StateChild::OnEntry(_) | StateChild::OnExit(_) => {}
                 StateChild::Initial(_) | StateChild::Transition(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn add_parallel(
+        &mut self,
+        parallel: &'a Parallel,
+        parent: StateId,
+    ) -> Result<(), CompileError> {
+        if has_foreign_attributes(&parallel.attributes) {
+            return self.unsupported(parallel.span, "foreign parallel attributes");
+        }
+        let name = self.node_name(parallel.id.as_deref());
+        let runtime = self.builder.parallel(name, parent)?;
+        if let Some(id) = parallel.id.as_deref() {
+            self.ids.insert(id, runtime);
+        }
+        let mut entry_actions = Vec::new();
+        let mut exit_actions = Vec::new();
+        for child in &parallel.children {
+            match child {
+                ParallelChild::OnEntry(value) => entry_actions.extend(self.entry_actions(value)?),
+                ParallelChild::OnExit(value) => exit_actions.extend(self.exit_actions(value)?),
+                _ => {}
+            }
+        }
+        self.builder.entry_actions(runtime, entry_actions)?;
+        self.builder.exit_actions(runtime, exit_actions)?;
+        self.records.push(Record {
+            node: Node::Parallel(parallel),
+            runtime,
+            parent,
+        });
+        for child in &parallel.children {
+            match child {
+                ParallelChild::State(child) => self.add_state(child, runtime)?,
+                ParallelChild::Parallel(child) => self.add_parallel(child, runtime)?,
+                ParallelChild::History(value) => {
+                    return self.unsupported(value.span, "history states");
+                }
+                ParallelChild::Invoke(value) => {
+                    return self.unsupported(value.span, "invocation");
+                }
+                ParallelChild::DataModel(value) => {
+                    return self.unsupported(value.span, "datamodels");
+                }
+                ParallelChild::Extension(value) => {
+                    return self.unsupported(value.span, "foreign extensions");
+                }
+                ParallelChild::OnEntry(_)
+                | ParallelChild::OnExit(_)
+                | ParallelChild::Transition(_) => {}
             }
         }
         Ok(())
@@ -347,6 +405,13 @@ impl<'a> Compiler<'a> {
         let node = self.records[index].node;
         let runtime = self.records[index].runtime;
         let Node::State(state) = node else {
+            if let Node::Parallel(parallel) = node {
+                for child in &parallel.children {
+                    if let ParallelChild::Transition(transition) = child {
+                        self.compile_transition(runtime, transition)?;
+                    }
+                }
+            }
             return Ok(());
         };
         let explicit = state.children.iter().find_map(|child| match child {
@@ -743,6 +808,19 @@ fn is_scxml_system_name(value: &str) -> bool {
 }
 
 fn collect_ids(children: &[RootChild], ids: &mut HashSet<String>) {
+    fn collect_parallel(current: &Parallel, ids: &mut HashSet<String>) {
+        if let Some(id) = &current.id {
+            ids.insert(id.clone());
+        }
+        for child in &current.children {
+            match child {
+                ParallelChild::State(child) => collect_state(child, ids),
+                ParallelChild::Parallel(child) => collect_parallel(child, ids),
+                _ => {}
+            }
+        }
+    }
+
     fn collect_state(current: &State, ids: &mut HashSet<String>) {
         if let Some(id) = &current.id {
             ids.insert(id.clone());
@@ -750,6 +828,7 @@ fn collect_ids(children: &[RootChild], ids: &mut HashSet<String>) {
         for child in &current.children {
             match child {
                 StateChild::State(child) => collect_state(child, ids),
+                StateChild::Parallel(child) => collect_parallel(child, ids),
                 StateChild::Final(child) => {
                     if let Some(id) = &child.id {
                         ids.insert(id.clone());
@@ -762,6 +841,7 @@ fn collect_ids(children: &[RootChild], ids: &mut HashSet<String>) {
     for child in children {
         match child {
             RootChild::State(child) => collect_state(child, ids),
+            RootChild::Parallel(child) => collect_parallel(child, ids),
             RootChild::Final(child) => {
                 if let Some(id) = &child.id {
                     ids.insert(id.clone());

@@ -1,0 +1,59 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "active"
+enter "movement"
+enter "movement_left"
+enter "stance"
+enter "stance_low"
+configuration
+active "#document"
+active "active"
+active "movement"
+active "movement_left"
+active "stance"
+active "stance_low"
+status running
+macrostep end
+macrostep external "tick"
+microstep 1
+transition "movement_left"
+target "movement_right"
+transition "stance_low"
+target "stance_high"
+exit begin "movement_left"
+exit begin "stance_low"
+exit "movement_left"
+exit "stance_low"
+enter "movement_right"
+enter "stance_high"
+configuration
+active "#document"
+active "active"
+active "movement"
+active "movement_right"
+active "stance"
+active "stance_high"
+status running
+macrostep end
+macrostep external "tick"
+microstep 1
+transition "movement_right"
+target "movement_left"
+transition "stance_high"
+target "stance_low"
+exit begin "movement_right"
+exit begin "stance_high"
+exit "movement_right"
+exit "stance_high"
+enter "movement_left"
+enter "stance_low"
+configuration
+active "#document"
+active "active"
+active "movement"
+active "movement_left"
+active "stance"
+active "stance_low"
+status running
+macrostep end

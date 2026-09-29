@@ -1,0 +1,12 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" datamodel="luau" initial="p">
+  <datamodel><data id="value" expr="0"/></datamodel>
+  <parallel id="p">
+    <state id="left" initial="left_wait">
+      <state id="left_wait"><transition event="tick" target="left_done"/></state>
+      <state id="left_done"><onentry><assign location="value" expr="missing()"/></onentry></state>
+    </state>
+    <state id="right" initial="right_wait">
+      <state id="right_wait"/>
+    </state>
+  </parallel>
+</scxml>

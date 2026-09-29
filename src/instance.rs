@@ -34,10 +34,25 @@ enum Trigger<'a, E> {
     External(&'a EventSet, &'a str, &'a E),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct SelectedTransition {
     source: StateId,
+    index: usize,
     transition: Transition,
+}
+
+#[derive(Clone, Copy)]
+enum SelectedStep {
+    Single(SelectedTransition),
+    Parallel,
+}
+
+#[derive(Debug, Default)]
+struct ParallelRuntime {
+    selected: Vec<SelectedTransition>,
+    exited: Vec<StateId>,
+    entries: Vec<Entry>,
+    completed: Vec<StateId>,
 }
 
 struct ActionContext<'a, E> {
@@ -150,7 +165,7 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         self.instance.status()
     }
 
-    /// Returns the active root-to-leaf authored state names.
+    /// Returns the active authored state names in canonical definition order.
     pub fn active_state_names(&self) -> impl Iterator<Item = &str> {
         self.instance.active_state_names()
     }
@@ -285,6 +300,7 @@ pub struct StateTreeInstance<D: StateTreeDomain> {
     definition: Handle<StateTreeDefinition>,
     linked: Option<Arc<LinkedDefinition<D>>>,
     active: Vec<StateId>,
+    parallel: Option<Box<ParallelRuntime>>,
     internal_events: VecDeque<EventId>,
     data: Vec<LuauValue>,
     status: InstanceStatus,
@@ -307,6 +323,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             definition,
             linked: None,
             active: Vec::new(),
+            parallel: None,
             internal_events: VecDeque::new(),
             data: Vec::new(),
             status: InstanceStatus::Pending,
@@ -338,7 +355,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.active.iter().copied()
     }
 
-    /// Returns the active root-to-leaf authored state names.
+    /// Returns the active authored state names in canonical definition order.
     pub fn active_state_names(&self) -> impl Iterator<Item = &str> {
         let compiled = self
             .linked
@@ -389,9 +406,18 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         });
         self.linked = Some(Arc::clone(&linked));
         self.active.clear();
-        self.active.reserve(compiled.max_depth);
+        self.active.reserve(compiled.max_active);
+        self.parallel = compiled.has_parallel.then(|| {
+            let mut runtime = Box::<ParallelRuntime>::default();
+            runtime.selected.reserve(compiled.max_active);
+            runtime.exited.reserve(compiled.max_active);
+            runtime.entries.reserve(compiled.max_active);
+            runtime.completed.reserve(compiled.max_active);
+            runtime
+        });
         self.internal_events.clear();
-        self.internal_events.reserve(compiled.max_depth);
+        self.internal_events
+            .reserve(compiled.max_depth.max(compiled.max_active));
         self.data.clear();
         self.status = InstanceStatus::Running;
         if let Err(fault) = self.initialize_datamodel(compiled, trace) {
@@ -461,17 +487,26 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return false;
         }
         let event_name = event.authored_name();
-        let selected = {
+        trace.record(StateTreeTraceRecord::MacrostepStarted {
+            trigger: StateTreeTraceTrigger::ExternalEvent(event_name),
+        });
+        let selected = if self.parallel.is_some() {
+            let Some(linked) = self.linked.as_ref().map(Arc::clone) else {
+                return false;
+            };
+            let Some(events) = linked.external_event(event.event_index()) else {
+                return false;
+            };
+            self.select_step(Trigger::External(events, event_name, event))
+        } else {
             let Some(linked) = self.linked.as_ref() else {
                 return false;
             };
             let Some(events) = linked.external_event(event.event_index()) else {
                 return false;
             };
-            trace.record(StateTreeTraceRecord::MacrostepStarted {
-                trigger: StateTreeTraceTrigger::ExternalEvent(event_name),
-            });
-            self.select_external_transition(events, event_name, event)
+            self.select_transition(Trigger::External(events, event_name, event))
+                .map(|selected| selected.map(SelectedStep::Single))
         };
         let transition = match selected {
             Ok(Some(transition)) => transition,
@@ -486,8 +521,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             }
         };
 
-        self.trace_transition_set(1, transition, trace);
-        if let Err(fault) = self.take_transition(
+        self.trace_selected_step(1, transition, trace);
+        if let Err(fault) = self.take_selected_step(
             transition,
             ActionContext {
                 event_name: Some(event_name),
@@ -531,7 +566,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         else {
             return false;
         };
-        let transition = match self.select_transition(Trigger::Internal(event)) {
+        let transition = match self.select_step(Trigger::Internal(event)) {
             Ok(Some(transition)) => transition,
             Ok(None) => return false,
             Err(fault) => {
@@ -544,8 +579,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .as_ref()
             .and_then(|linked| linked.compiled.event_name(event))
             .map(str::to_owned);
-        self.trace_transition_set(1, transition, &mut NoStateTreeTrace);
-        if let Err(fault) = self.take_transition(
+        self.trace_selected_step(1, transition, &mut NoStateTreeTrace);
+        if let Err(fault) = self.take_selected_step(
             transition,
             ActionContext {
                 event_name: name.as_deref(),
@@ -587,7 +622,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         let mut external_event = context.external_event;
         loop {
             let transition = match self
-                .select_transition(Trigger::Eventless(current_event.as_deref(), external_event))
+                .select_step(Trigger::Eventless(current_event.as_deref(), external_event))
             {
                 Ok(Some(transition)) => transition,
                 Ok(None) => {
@@ -605,7 +640,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                             event: event_name,
                         });
                     }
-                    match self.select_transition(Trigger::Internal(event)) {
+                    match self.select_step(Trigger::Internal(event)) {
                         Ok(Some(transition)) => transition,
                         Ok(None) => continue,
                         Err(fault) => {
@@ -624,8 +659,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit });
                 return;
             }
-            self.trace_transition_set(transitions_taken + 1, transition, trace);
-            if let Err(fault) = self.take_transition(
+            self.trace_selected_step(transitions_taken + 1, transition, trace);
+            if let Err(fault) = self.take_selected_step(
                 transition,
                 ActionContext {
                     event_name: current_event.as_deref(),
@@ -654,7 +689,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return Ok(None);
         };
         for state in self.active.iter().rev() {
-            for transition in &compiled.state(*state).transitions {
+            for (index, transition) in compiled.state(*state).transitions.iter().enumerate() {
                 let matches = match (transition.event, &trigger) {
                     (None, Trigger::Eventless(_, _)) => true,
                     (Some(candidate), Trigger::Internal(emitted)) => {
@@ -678,6 +713,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 }
                 return Ok(Some(SelectedTransition {
                     source: *state,
+                    index,
                     transition: *transition,
                 }));
             }
@@ -685,13 +721,242 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         Ok(None)
     }
 
-    fn select_external_transition(
+    fn select_step(
+        &mut self,
+        trigger: Trigger<'_, D::Event>,
+    ) -> Result<Option<SelectedStep>, RuntimeFault> {
+        if self.parallel.is_none() {
+            return self
+                .select_transition(trigger)
+                .map(|selected| selected.map(SelectedStep::Single));
+        }
+
+        let mut runtime = self.parallel.take().expect("parallel runtime exists");
+        let result = self.select_parallel_transition_set(&trigger, &mut runtime.selected);
+        let selected =
+            result.map(|()| (!runtime.selected.is_empty()).then_some(SelectedStep::Parallel));
+        self.parallel = Some(runtime);
+        selected
+    }
+
+    fn select_parallel_transition_set(
         &self,
-        events: &EventSet,
-        name: &str,
-        event: &D::Event,
-    ) -> Result<Option<SelectedTransition>, RuntimeFault> {
-        self.select_transition(Trigger::External(events, name, event))
+        trigger: &Trigger<'_, D::Event>,
+        selected: &mut Vec<SelectedTransition>,
+    ) -> Result<(), RuntimeFault> {
+        selected.clear();
+        let compiled = &self
+            .linked
+            .as_ref()
+            .expect("initialized instance has a definition")
+            .compiled;
+
+        for leaf in self.active.iter().copied().filter(|state| {
+            matches!(
+                compiled.state(*state).kind,
+                StateKind::Atomic | StateKind::Final
+            )
+        }) {
+            let mut cursor = Some(leaf);
+            let mut candidate = None;
+            while let Some(state) = cursor {
+                for (index, transition) in compiled.state(state).transitions.iter().enumerate() {
+                    let matches = match (transition.event, trigger) {
+                        (None, Trigger::Eventless(_, _)) => true,
+                        (Some(candidate), Trigger::Internal(emitted)) => {
+                            compiled.internal_event_matches(candidate, *emitted)
+                        }
+                        (Some(event), Trigger::External(events, _, _)) => events.contains(event),
+                        _ => false,
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    if let Some(condition) = transition.condition
+                        && !self.evaluate_condition(
+                            compiled,
+                            condition,
+                            trigger.event_name(compiled),
+                            trigger.external_event(),
+                        )?
+                    {
+                        continue;
+                    }
+                    candidate = Some(SelectedTransition {
+                        source: state,
+                        index,
+                        transition: *transition,
+                    });
+                    break;
+                }
+                if candidate.is_some() {
+                    break;
+                }
+                cursor = compiled.state(state).parent;
+            }
+
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if selected.iter().any(|existing| {
+                existing.source == candidate.source && existing.index == candidate.index
+            }) {
+                continue;
+            }
+
+            let mut accepted = true;
+            let mut index = 0;
+            while index < selected.len() {
+                if !transitions_conflict(compiled, selected[index], candidate) {
+                    index += 1;
+                    continue;
+                }
+                if is_descendant(compiled, candidate.source, selected[index].source) {
+                    selected.remove(index);
+                } else {
+                    accepted = false;
+                    break;
+                }
+            }
+            if accepted {
+                selected.push(candidate);
+            }
+        }
+        selected.sort_by_key(|candidate| compiled.state(candidate.source).document_order);
+        Ok(())
+    }
+
+    fn take_selected_step<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+        &mut self,
+        selected: SelectedStep,
+        context: ActionContext<'_, D::Event>,
+        effects: &mut S,
+        trace: &mut T,
+    ) -> Result<(), RuntimeFault> {
+        match selected {
+            SelectedStep::Single(selected) => {
+                self.take_transition(selected, context, effects, trace)
+            }
+            SelectedStep::Parallel => {
+                let mut runtime = self.parallel.take().expect("parallel runtime exists");
+                let result =
+                    self.take_parallel_transition_set(&mut runtime, context, effects, trace);
+                self.parallel = Some(runtime);
+                result
+            }
+        }
+    }
+
+    fn take_parallel_transition_set<
+        S: RuntimeEffectSink<D> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        runtime: &mut ParallelRuntime,
+        context: ActionContext<'_, D::Event>,
+        effects: &mut S,
+        trace: &mut T,
+    ) -> Result<(), RuntimeFault> {
+        let compiled = Arc::clone(
+            &self
+                .linked
+                .as_ref()
+                .expect("initialized instance has a definition")
+                .compiled,
+        );
+        runtime.exited.clear();
+        for selected in &runtime.selected {
+            if selected.transition.target.is_none() {
+                continue;
+            }
+            for state in &self.active {
+                if exits_domain(&compiled, *state, selected.transition.domain)
+                    && !runtime.exited.contains(state)
+                {
+                    runtime.exited.push(*state);
+                }
+            }
+        }
+        runtime.exited.sort_by(|left, right| {
+            compiled
+                .state(*right)
+                .depth
+                .cmp(&compiled.state(*left).depth)
+                .then_with(|| {
+                    compiled
+                        .state(*left)
+                        .document_order
+                        .cmp(&compiled.state(*right).document_order)
+                })
+        });
+
+        for state in &runtime.exited {
+            trace.record(StateTreeTraceRecord::StateExitStarted {
+                state: &compiled.state(*state).name,
+            });
+            self.execute_actions(
+                &compiled,
+                &compiled.state(*state).exit_actions,
+                context,
+                effects,
+                trace,
+            )?;
+        }
+        for state in &runtime.exited {
+            trace.record(StateTreeTraceRecord::StateExited {
+                state: &compiled.state(*state).name,
+            });
+        }
+        self.active.retain(|state| !runtime.exited.contains(state));
+        runtime
+            .completed
+            .retain(|state| !runtime.exited.contains(state));
+
+        for selected in &runtime.selected {
+            let start = selected.transition.action_start as usize;
+            let end = start + selected.transition.action_len as usize;
+            self.execute_actions(
+                &compiled,
+                &compiled.transition_actions[start..end],
+                context,
+                effects,
+                trace,
+            )?;
+        }
+
+        runtime.entries.clear();
+        for selected in &runtime.selected {
+            let start = selected.transition.entry_start as usize;
+            let end = start + selected.transition.entry_len as usize;
+            for entry in &compiled.transition_entries[start..end] {
+                if self.active.contains(&entry.state) {
+                    continue;
+                }
+                if let Some(existing) = runtime
+                    .entries
+                    .iter_mut()
+                    .find(|existing| existing.state == entry.state)
+                {
+                    existing.take_initial |= entry.take_initial;
+                } else {
+                    runtime.entries.push(*entry);
+                }
+            }
+        }
+        runtime
+            .entries
+            .sort_by_key(|entry| compiled.state(entry.state).document_order);
+        for index in 0..runtime.entries.len() {
+            let entry = runtime.entries[index];
+            if let Err(fault) = self.enter_state(&compiled, entry, context, effects, trace) {
+                self.active
+                    .sort_by_key(|state| compiled.state(*state).document_order);
+                return Err(fault);
+            }
+        }
+        self.active
+            .sort_by_key(|state| compiled.state(*state).document_order);
+        Ok(())
     }
 
     fn take_transition<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
@@ -787,6 +1052,39 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             });
         } else {
             trace.record(StateTreeTraceRecord::TransitionTargetless);
+        }
+    }
+
+    fn trace_selected_step<T: StateTreeTrace + ?Sized>(
+        &self,
+        microstep: usize,
+        selected: SelectedStep,
+        trace: &mut T,
+    ) {
+        match selected {
+            SelectedStep::Single(selected) => {
+                self.trace_transition_set(microstep, selected, trace);
+            }
+            SelectedStep::Parallel => {
+                let Some(compiled) = self.linked.as_ref().map(|linked| linked.compiled.as_ref())
+                else {
+                    return;
+                };
+                let runtime = self.parallel.as_ref().expect("parallel runtime exists");
+                trace.record(StateTreeTraceRecord::MicrostepStarted { index: microstep });
+                for selected in &runtime.selected {
+                    trace.record(StateTreeTraceRecord::TransitionSelected {
+                        source: &compiled.state(selected.source).name,
+                    });
+                    if let Some(target) = selected.transition.target {
+                        trace.record(StateTreeTraceRecord::TransitionTarget {
+                            state: &compiled.state(target).name,
+                        });
+                    } else {
+                        trace.record(StateTreeTraceRecord::TransitionTargetless);
+                    }
+                }
+            }
         }
     }
 
@@ -988,6 +1286,12 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     fn update_completion<T: StateTreeTrace + ?Sized>(&mut self, trace: &mut T) {
+        if self.parallel.is_some() {
+            let mut runtime = self.parallel.take().expect("parallel runtime exists");
+            self.update_parallel_completion(&mut runtime, trace);
+            self.parallel = Some(runtime);
+            return;
+        }
         let Some(linked) = self.linked.as_ref() else {
             return;
         };
@@ -1015,6 +1319,66 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
     }
 
+    fn update_parallel_completion<T: StateTreeTrace + ?Sized>(
+        &mut self,
+        runtime: &mut ParallelRuntime,
+        trace: &mut T,
+    ) {
+        let compiled = Arc::clone(
+            &self
+                .linked
+                .as_ref()
+                .expect("initialized instance has a definition")
+                .compiled,
+        );
+        if compiled.children(compiled.root).iter().any(|child| {
+            self.active.contains(child) && compiled.state(*child).kind == StateKind::Final
+        }) {
+            self.status = InstanceStatus::Complete;
+            return;
+        }
+
+        for depth in (1..compiled.max_depth as u32).rev() {
+            for state in
+                self.active.iter().copied().filter(|state| {
+                    compiled.state(*state).depth == depth && *state != compiled.root
+                })
+            {
+                if runtime.completed.contains(&state) {
+                    continue;
+                }
+                let complete = match compiled.state(state).kind {
+                    StateKind::Compound { .. } => compiled.children(state).iter().any(|child| {
+                        self.active.contains(child)
+                            && compiled.state(*child).kind == StateKind::Final
+                    }),
+                    StateKind::Parallel { .. } => {
+                        !compiled.children(state).is_empty()
+                            && compiled
+                                .children(state)
+                                .iter()
+                                .all(|child| runtime.completed.contains(child))
+                    }
+                    StateKind::Atomic | StateKind::Final => false,
+                };
+                if !complete {
+                    continue;
+                }
+                runtime.completed.push(state);
+                let completion = match compiled.state(state).kind {
+                    StateKind::Compound { completion, .. } | StateKind::Parallel { completion } => {
+                        completion
+                    }
+                    StateKind::Atomic | StateKind::Final => unreachable!(),
+                };
+                self.internal_events.push_back(completion);
+                if let Some(event) = compiled.event_name(completion) {
+                    trace.record(StateTreeTraceRecord::InternalEventRaised { event });
+                }
+            }
+        }
+    }
+
     fn finish_macrostep<T: StateTreeTrace + ?Sized>(
         &self,
         compiled: &CompiledDefinition,
@@ -1037,6 +1401,39 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return;
         };
         self.finish_macrostep(compiled, trace);
+    }
+}
+
+fn is_descendant(compiled: &CompiledDefinition, state: StateId, ancestor: StateId) -> bool {
+    let mut cursor = compiled.state(state).parent;
+    while let Some(current) = cursor {
+        if current == ancestor {
+            return true;
+        }
+        cursor = compiled.state(current).parent;
+    }
+    false
+}
+
+fn exits_domain(compiled: &CompiledDefinition, state: StateId, domain: Option<StateId>) -> bool {
+    domain.is_none_or(|domain| is_descendant(compiled, state, domain))
+}
+
+fn transitions_conflict(
+    compiled: &CompiledDefinition,
+    left: SelectedTransition,
+    right: SelectedTransition,
+) -> bool {
+    if left.transition.target.is_none() || right.transition.target.is_none() {
+        return false;
+    }
+    match (left.transition.domain, right.transition.domain) {
+        (None, _) | (_, None) => true,
+        (Some(left), Some(right)) => {
+            left == right
+                || is_descendant(compiled, left, right)
+                || is_descendant(compiled, right, left)
+        }
     }
 }
 
@@ -1132,6 +1529,36 @@ mod tests {
         assert_eq!(
             instance.active_state_names().collect::<Vec<_>>(),
             ["root", "parent", "leaf"]
+        );
+    }
+
+    #[test]
+    fn initializes_parallel_regions_in_hierarchy_order() {
+        let mut builder = StateTreeBuilder::new("parallel");
+        let root = builder.compound_root("root").unwrap();
+        let parallel = builder.parallel("parallel", root).unwrap();
+        let left = builder.compound("left", parallel).unwrap();
+        let right = builder.compound("right", parallel).unwrap();
+        // Builder insertion order need not already be depth-first.
+        let left_leaf = builder.atomic("left-leaf", left).unwrap();
+        let right_leaf = builder.atomic("right-leaf", right).unwrap();
+        builder.initial(root, parallel).unwrap();
+        builder.initial(left, left_leaf).unwrap();
+        builder.initial(right, right_leaf).unwrap();
+        let definition = builder.build().unwrap();
+
+        let instance = instance(&definition, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            [
+                "root",
+                "parallel",
+                "left",
+                "left-leaf",
+                "right",
+                "right-leaf"
+            ]
         );
     }
 

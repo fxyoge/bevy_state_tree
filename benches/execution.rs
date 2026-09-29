@@ -11,6 +11,7 @@ use divan::{Bencher, counter::ItemsCount};
 
 const TOGGLE: &str = include_str!("../tests/scxml/benchmark_toggle.scxml");
 const LUAU: &str = include_str!("../tests/scxml/benchmark_luau.scxml");
+const PARALLEL: &str = include_str!("../tests/scxml/benchmark_parallel.scxml");
 
 fn main() {
     divan::main();
@@ -84,4 +85,9 @@ fn process_toggle_population(bencher: Bencher<'_, '_>, instances: usize) {
 #[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 10)]
 fn process_luau_population(bencher: Bencher<'_, '_>, instances: usize) {
     process_population(bencher, instances, "benchmark_luau.scxml", LUAU);
+}
+
+#[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 10)]
+fn process_parallel_population(bencher: Bencher<'_, '_>, instances: usize) {
+    process_population(bencher, instances, "benchmark_parallel.scxml", PARALLEL);
 }

@@ -1,0 +1,12 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="p">
+  <parallel id="p">
+    <state id="left" initial="left_boot">
+      <state id="left_boot"><transition target="left_ready"/></state>
+      <state id="left_ready"/>
+    </state>
+    <state id="right" initial="right_boot">
+      <state id="right_boot"><transition target="right_ready"/></state>
+      <state id="right_ready"/>
+    </state>
+  </parallel>
+</scxml>

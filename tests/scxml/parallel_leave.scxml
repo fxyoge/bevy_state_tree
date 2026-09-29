@@ -1,0 +1,12 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="p">
+  <parallel id="p">
+    <state id="left" initial="left_active">
+      <state id="left_active"/>
+    </state>
+    <state id="right" initial="right_active">
+      <state id="right_active"/>
+    </state>
+    <transition event="advance" target="outside"/>
+  </parallel>
+  <state id="outside"/>
+</scxml>
