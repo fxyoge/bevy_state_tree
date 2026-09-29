@@ -1017,29 +1017,27 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 trace,
             );
         }
-        let exited: Vec<_> = self.active[transition.exit_depth as usize..]
-            .iter()
-            .rev()
-            .copied()
-            .collect();
-        for state in &exited {
+        let exit_depth = transition.exit_depth as usize;
+        for index in (exit_depth..self.active.len()).rev() {
+            let state = self.active[index];
             trace.record(StateTreeTraceRecord::StateExitStarted {
-                state: &compiled.state(*state).name,
+                state: &compiled.state(state).name,
             });
             self.execute_actions(
                 &compiled,
-                &compiled.state(*state).exit_actions,
+                &compiled.state(state).exit_actions,
                 context,
                 effects,
                 trace,
             )?;
         }
-        for state in exited {
+        for index in (exit_depth..self.active.len()).rev() {
+            let state = self.active[index];
             trace.record(StateTreeTraceRecord::StateExited {
                 state: &compiled.state(state).name,
             });
         }
-        self.active.truncate(transition.exit_depth as usize);
+        self.active.truncate(exit_depth);
 
         let action_start = transition.action_start as usize;
         let action_end = action_start + transition.action_len as usize;
