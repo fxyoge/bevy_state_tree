@@ -25,6 +25,7 @@ use crate::{
     definition::{CompiledDefinition, LinkedDefinition},
     effect::{BevyEffectSink, StateTreeEffectRegistry},
     instance::PendingStateTree,
+    scxml::ScxmlLoader,
 };
 
 /// Ordered phases installed into each state-tree domain schedule.
@@ -111,6 +112,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             {
                 app.init_asset::<StateTreeDefinition>();
             }
+            app.register_asset_loader(ScxmlLoader);
             app.insert_resource(StateTreeAssetsInstalled);
         }
 

@@ -29,6 +29,12 @@ instead of ignoring it. Compiled definitions contain dense identifiers and
 precomputed transition entry/exit plans; macrosteps do not traverse the SCXML
 tree or resolve authored names.
 
+`StateTreePlugin` registers an asset loader for `.scxml` files. Loading parses
+and compiles the source once into the same `StateTreeDefinition` asset type
+produced by `StateTreeBuilder`; no authored syntax is retained or interpreted at
+runtime. Definitions generated in code remain supported through
+`Assets<StateTreeDefinition>::add`.
+
 See [SCXML Support Policy](SCXML.md) for the Bevy-first compatibility scope and
 intentional differences from general-purpose SCXML processors.
 
@@ -92,6 +98,53 @@ at the point where they were written.
 Instances that initialize before event processing receive events queued during
 that schedule run. Instances still waiting for their definition asset receive
 no events, and queued entity events are discarded rather than replayed later.
+
+## Loading Definitions
+
+After installing `StateTreePlugin` for a domain, load an SCXML definition through
+Bevy's normal asset server and attach its handle to an entity:
+
+```rust,no_run
+# use bevy_asset::AssetServer;
+# use bevy_ecs::prelude::*;
+# use bevy_state_tree::prelude::*;
+# struct Simulation;
+# enum SimulationEvents {}
+# impl StateTreeEvents for SimulationEvents {
+#     const AUTHORED_NAMES: &'static [&'static str] = &[];
+#     fn event_index(&self) -> usize { match *self {} }
+# }
+# impl StateTreeDomain for Simulation { type Event = SimulationEvents; }
+fn spawn_controller(mut commands: Commands, assets: Res<AssetServer>) {
+    let definition = assets.load("state_trees/enemy.scxml");
+    commands.spawn(StateTreeInstance::<Simulation>::new(definition));
+}
+```
+
+Programmatically generated definitions use the same asset store:
+
+```rust,no_run
+# use bevy_asset::{Assets, Handle};
+# use bevy_state_tree::prelude::*;
+fn add_generated_definition(
+    definitions: &mut Assets<StateTreeDefinition>,
+) -> Result<Handle<StateTreeDefinition>, BuildError> {
+    let mut builder = StateTreeBuilder::new("generated");
+    let root = builder.compound_root("root")?;
+    let idle = builder.atomic("idle", root)?;
+    builder.initial(root, idle)?;
+    Ok(definitions.add(builder.build()?))
+}
+```
+
+Malformed XML and unsupported runtime semantics fail asset loading. Typed event
+descriptors and effects are domain-specific, so they are linked later when an
+instance initializes. A linking failure leaves the loaded definition intact and
+adds `StateTreeLinkFailure<D>` to the pending instance.
+
+Asset replacement is not currently applied to running instances. They retain
+the definition against which they initialized; new and pending instances use
+the replacement asset.
 
 Definitions are linked against each domain's typed event protocol and effect
 registry before initialization. An unmatched event descriptor or unregistered

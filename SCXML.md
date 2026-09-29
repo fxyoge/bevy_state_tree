@@ -9,6 +9,25 @@ useful diagnostics and future integrations do not require replacing the asset
 format. The compiler accepts only behavior with production runtime semantics.
 It rejects unsupported elements instead of silently ignoring them.
 
+## Asset Loading
+
+Installing `StateTreePlugin` registers `.scxml` as a Bevy asset source for
+`StateTreeDefinition`. Each UTF-8 source is parsed and compiled once during
+loading. Parser diagnostics retain the asset path, byte span, and line and
+column; compiler diagnostics retain the asset path and byte position.
+
+Asset loading is domain-independent. It validates authored SCXML and produces
+the same immutable runtime representation as `StateTreeBuilder::build`, but it
+does not resolve external events or typed effects. Those checks depend on a
+domain's `StateTreeEvents` protocol and effect registry and therefore occur when
+a `StateTreeInstance` initializes. A source can load successfully and still
+leave an instance pending with `StateTreeLinkFailure<D>` for a particular
+domain.
+
+Definitions constructed programmatically can be inserted directly into
+`Assets<StateTreeDefinition>`; they share the same initialization and linking
+path as file-loaded definitions.
+
 ## Events
 
 External events belong to a closed Rust protocol declared with

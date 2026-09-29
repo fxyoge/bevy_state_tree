@@ -7,7 +7,10 @@
 mod analysis;
 mod ast;
 mod compile;
+mod loader;
 mod parse;
+
+pub(crate) use loader::ScxmlLoader;
 
 pub use ast::{
     Assign, Attribute, Cancel, Capability, Content, ContentPart, Data, DataModel, DataModelChild,
