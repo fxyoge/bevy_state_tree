@@ -634,24 +634,23 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         effects: &mut S,
         trace: &mut T,
     ) {
-        let mut current_event = context.event_name.map(Box::<str>::from);
+        let compiled = self.linked.as_ref().map(|linked| Arc::clone(&linked.compiled));
+        let mut current_event = context.event_name;
         let mut external_event = context.external_event;
         loop {
             let transition = match self
-                .select_step(Trigger::Eventless(current_event.as_deref(), external_event))
+                .select_step(Trigger::Eventless(current_event, external_event))
             {
                 Ok(Some(transition)) => transition,
                 Ok(None) => {
                     let Some(event) = self.internal_events.pop_front() else {
                         return;
                     };
-                    current_event = self
-                        .linked
+                    current_event = compiled
                         .as_ref()
-                        .and_then(|linked| linked.compiled.event_name(event))
-                        .map(Box::from);
+                        .and_then(|compiled| compiled.event_name(event));
                     external_event = None;
-                    if let Some(event_name) = current_event.as_deref() {
+                    if let Some(event_name) = current_event {
                         trace.record(StateTreeTraceRecord::InternalEventConsumed {
                             event: event_name,
                         });
@@ -680,7 +679,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             if let Err(fault) = self.take_selected_step(
                 transition,
                 ActionContext {
-                    event_name: current_event.as_deref(),
+                    event_name: current_event,
                     external_event,
                     entity: context.entity,
                 },
