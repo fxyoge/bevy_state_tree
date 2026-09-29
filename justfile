@@ -12,12 +12,12 @@ _test-macros:
 _test-lib:
   cargo test
 
-bench:
-  cargo bench --bench execution
-  cargo bench --bench allocation
+bench: \
+  _bench-execution \
+  _bench-allocation
 
-bench-execution:
+_bench-execution:
   cargo bench --bench execution
 
-bench-allocation:
+_bench-allocation:
   cargo bench --bench allocation
