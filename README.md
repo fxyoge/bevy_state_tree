@@ -195,7 +195,7 @@ case-specific Rust assertions.
 ## Benchmarks
 
 Run `just bench` for both throughput and allocation profiles, or use
-`just bench-execution` and `just bench-allocation` separately. Throughput cases
+`just _bench-execution` and `just _bench-allocation` separately. Throughput cases
 cover broadcast processing across as many as one million independent trees,
 sparse entity events in a population of 100,000, initialization, deep re-entry,
 transition scanning, typed effects, and wide parallel configurations. Parsing,
