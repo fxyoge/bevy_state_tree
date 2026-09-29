@@ -1,0 +1,8 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml">
+  <state id="left">
+    <transition event="tick" target="right"/>
+  </state>
+  <state id="right">
+    <transition event="tick" target="left"/>
+  </state>
+</scxml>

@@ -1,3 +1,5 @@
+benchmark_luau
+benchmark_toggle
 datamodel_actions
 external_transition
 faulting_exit

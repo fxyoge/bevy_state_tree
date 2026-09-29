@@ -90,8 +90,9 @@ case-specific Rust assertions.
 
 ## Benchmarks
 
-Run `just bench` for initialization, hierarchy depth, eventless stabilization,
-transition fanout, ignored and handled external events, Luau execution, and
-opt-in tracing. Divan prepares each mutable execution outside the timed region
-and defers teardown until after timing; initialization benchmarks intentionally
-include linking and runtime storage setup.
+Run `just bench` to process broadcast events through Bevy's ECS and compute task
+pool across as many as one million independent trees. The benchmark definitions
+are the `benchmark_*.scxml` cases in `tests/scxml`, where their behavior is also
+covered by the semantic trace corpus. Parsing, compilation, entity spawning,
+instance initialization, and event queueing happen outside the timed region;
+results report aggregate instance throughput for the scheduled AI processing.

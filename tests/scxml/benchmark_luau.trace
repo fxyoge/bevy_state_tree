@@ -1,0 +1,36 @@
+state-tree-trace 1
+macrostep initialize
+assign "count" = 0
+enter "#document"
+enter "left"
+configuration
+active "#document"
+active "left"
+status running
+macrostep end
+macrostep external "tick"
+microstep 1
+transition "left"
+target "right"
+exit begin "left"
+exit "left"
+assign "count" = 1
+enter "right"
+configuration
+active "#document"
+active "right"
+status running
+macrostep end
+macrostep external "tick"
+microstep 1
+transition "right"
+target "left"
+exit begin "right"
+exit "right"
+assign "count" = 2
+enter "left"
+configuration
+active "#document"
+active "left"
+status running
+macrostep end
