@@ -76,6 +76,8 @@ pub enum Capability {
     PayloadContent,
     /// A foreign-namespaced extension is present.
     ForeignExtension,
+    /// A Bevy state-tree typed effect is present.
+    TypedEffect,
 }
 
 /// The document element (`scxml`).

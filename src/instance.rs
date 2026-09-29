@@ -9,11 +9,17 @@ use std::{
 };
 
 use bevy_asset::{AssetId, Handle};
-use bevy_ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld};
+use bevy_ecs::{
+    component::Component, entity::Entity, lifecycle::HookContext, world::DeferredWorld,
+};
 
 use crate::definition::{
     Action, CompiledDefinition, Entry, EventId, EventSet, ExpressionId, LinkedDefinition, StateId,
     StateKind, Transition,
+};
+use crate::effect::{
+    HeadlessEffectSink, RejectEffects, RuntimeEffectSink, StateTreeEffectArgs,
+    StateTreeEffectContext, StateTreeEffectSink,
 };
 use crate::{
     LuauValue, NoStateTreeTrace, StateTreeDefinition, StateTreeDomain, StateTreeEvents,
@@ -22,10 +28,10 @@ use crate::{
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-enum Trigger<'a> {
-    Eventless(Option<&'a str>),
+enum Trigger<'a, E> {
+    Eventless(Option<&'a str>, Option<&'a E>),
     Internal(EventId),
-    External(&'a EventSet, &'a str),
+    External(&'a EventSet, &'a str, &'a E),
 }
 
 #[derive(Clone, Copy)]
@@ -34,12 +40,34 @@ struct SelectedTransition {
     transition: Transition,
 }
 
-impl<'a> Trigger<'a> {
+struct ActionContext<'a, E> {
+    event_name: Option<&'a str>,
+    external_event: Option<&'a E>,
+    entity: Option<Entity>,
+}
+
+impl<E> Clone for ActionContext<'_, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Copy for ActionContext<'_, E> {}
+
+impl<'a, E> Trigger<'a, E> {
     fn event_name(&self, compiled: &'a CompiledDefinition) -> Option<&'a str> {
         match self {
-            Self::Eventless(name) => *name,
+            Self::Eventless(name, _) => *name,
             Self::Internal(event) => compiled.event_name(*event),
-            Self::External(_, name) => Some(name),
+            Self::External(_, name, _) => Some(name),
+        }
+    }
+
+    fn external_event(&self) -> Option<&'a E> {
+        match self {
+            Self::Eventless(_, event) => *event,
+            Self::External(_, _, event) => Some(*event),
+            Self::Internal(_) => None,
         }
     }
 }
@@ -65,15 +93,55 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         Self::new_traced(definition, microstep_limit, &mut NoStateTreeTrace)
     }
 
+    /// Links and initializes a definition while delivering effects to `sink`.
+    pub fn new_with_sink<S: StateTreeEffectSink<E> + ?Sized>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        sink: &mut S,
+    ) -> Self {
+        Self::new_traced_with_sink(definition, microstep_limit, sink, &mut NoStateTreeTrace)
+    }
+
     /// Links and initializes a definition while writing its semantic trace.
     pub fn new_traced<T: StateTreeTrace + ?Sized>(
         definition: &StateTreeDefinition,
         microstep_limit: NonZeroUsize,
         trace: &mut T,
     ) -> Self {
-        let linked = Arc::new(LinkedDefinition::new::<E>(Arc::clone(&definition.compiled)));
+        let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
+            Arc::clone(&definition.compiled),
+            None,
+        ));
         let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize_traced(linked, microstep_limit.get(), trace);
+        instance.initialize_traced(
+            linked,
+            microstep_limit.get(),
+            None,
+            &mut RejectEffects,
+            trace,
+        );
+        Self { instance }
+    }
+
+    /// Links and initializes a definition while delivering effects and tracing execution.
+    pub fn new_traced_with_sink<S: StateTreeEffectSink<E> + ?Sized, T: StateTreeTrace + ?Sized>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        sink: &mut S,
+        trace: &mut T,
+    ) -> Self {
+        let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
+            Arc::clone(&definition.compiled),
+            None,
+        ));
+        let mut instance = StateTreeInstance::new(Handle::default());
+        instance.initialize_traced(
+            linked,
+            microstep_limit.get(),
+            None,
+            &mut HeadlessEffectSink { sink },
+            trace,
+        );
         Self { instance }
     }
 
@@ -97,6 +165,22 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         self.process_event_traced(event, microstep_limit, &mut NoStateTreeTrace)
     }
 
+    /// Processes one external event while delivering effects to `sink`.
+    pub fn process_event_with_sink<S: StateTreeEffectSink<E> + ?Sized>(
+        &mut self,
+        event: &E,
+        microstep_limit: NonZeroUsize,
+        sink: &mut S,
+    ) -> bool {
+        self.instance.process_event_traced(
+            event,
+            microstep_limit.get(),
+            None,
+            &mut HeadlessEffectSink { sink },
+            &mut NoStateTreeTrace,
+        )
+    }
+
     /// Processes one external event while writing its complete semantic trace.
     pub fn process_event_traced<T: StateTreeTrace + ?Sized>(
         &mut self,
@@ -104,8 +188,33 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         microstep_limit: NonZeroUsize,
         trace: &mut T,
     ) -> bool {
-        self.instance
-            .process_event_traced(event, microstep_limit.get(), trace)
+        self.instance.process_event_traced(
+            event,
+            microstep_limit.get(),
+            None,
+            &mut RejectEffects,
+            trace,
+        )
+    }
+
+    /// Processes one external event while delivering effects and tracing execution.
+    pub fn process_event_traced_with_sink<
+        S: StateTreeEffectSink<E> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        event: &E,
+        microstep_limit: NonZeroUsize,
+        sink: &mut S,
+        trace: &mut T,
+    ) -> bool {
+        self.instance.process_event_traced(
+            event,
+            microstep_limit.get(),
+            None,
+            &mut HeadlessEffectSink { sink },
+            trace,
+        )
     }
 }
 
@@ -139,6 +248,15 @@ pub enum RuntimeFault {
         span_start: usize,
         message: Box<str>,
     },
+    /// A typed effect could not be constructed or published.
+    Effect {
+        effect: Box<str>,
+        argument: Option<Box<str>>,
+        span_start: usize,
+        message: Box<str>,
+    },
+    /// A typed external event could not be projected into Luau data.
+    EventDataProjection { event: Box<str>, message: Box<str> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +264,7 @@ pub enum DatamodelOperation {
     Initialize,
     Condition,
     Assign,
+    EffectArgument,
 }
 
 /// Mutable statechart state attached to one Bevy entity.
@@ -164,7 +283,7 @@ pub enum DatamodelOperation {
 pub struct StateTreeInstance<D: StateTreeDomain> {
     runtime_id: u64,
     definition: Handle<StateTreeDefinition>,
-    linked: Option<Arc<LinkedDefinition>>,
+    linked: Option<Arc<LinkedDefinition<D>>>,
     active: Vec<StateId>,
     internal_events: VecDeque<EventId>,
     data: Vec<LuauValue>,
@@ -240,14 +359,28 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .and_then(|index| self.data.get(index))
     }
 
-    pub(crate) fn initialize(&mut self, linked: Arc<LinkedDefinition>, microstep_limit: usize) {
-        self.initialize_traced(linked, microstep_limit, &mut NoStateTreeTrace);
+    pub(crate) fn initialize<S: RuntimeEffectSink<D> + ?Sized>(
+        &mut self,
+        linked: Arc<LinkedDefinition<D>>,
+        microstep_limit: usize,
+        entity: Option<Entity>,
+        effects: &mut S,
+    ) {
+        self.initialize_traced(
+            linked,
+            microstep_limit,
+            entity,
+            effects,
+            &mut NoStateTreeTrace,
+        );
     }
 
-    fn initialize_traced<T: StateTreeTrace + ?Sized>(
+    fn initialize_traced<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
-        linked: Arc<LinkedDefinition>,
+        linked: Arc<LinkedDefinition<D>>,
         microstep_limit: usize,
+        entity: Option<Entity>,
+        effects: &mut S,
         trace: &mut T,
     ) {
         let compiled = &linked.compiled;
@@ -267,7 +400,17 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return;
         }
         for entry in &compiled.initial_entries {
-            if let Err(fault) = self.enter_state(compiled, *entry, None, trace) {
+            if let Err(fault) = self.enter_state(
+                compiled,
+                *entry,
+                ActionContext {
+                    event_name: None,
+                    external_event: None,
+                    entity,
+                },
+                effects,
+                trace,
+            ) {
                 self.status = InstanceStatus::Faulted(fault);
                 self.finish_macrostep(compiled, trace);
                 return;
@@ -275,19 +418,43 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
         self.update_completion(trace);
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 0, None, trace);
+            self.stabilize(
+                microstep_limit,
+                0,
+                ActionContext {
+                    event_name: None,
+                    external_event: None,
+                    entity,
+                },
+                effects,
+                trace,
+            );
         }
         self.finish_macrostep(compiled, trace);
     }
 
-    pub(crate) fn process_event(&mut self, event: &D::Event, microstep_limit: usize) -> bool {
-        self.process_event_traced(event, microstep_limit, &mut NoStateTreeTrace)
-    }
-
-    fn process_event_traced<T: StateTreeTrace + ?Sized>(
+    pub(crate) fn process_event<S: RuntimeEffectSink<D> + ?Sized>(
         &mut self,
         event: &D::Event,
         microstep_limit: usize,
+        entity: Option<Entity>,
+        effects: &mut S,
+    ) -> bool {
+        self.process_event_traced(
+            event,
+            microstep_limit,
+            entity,
+            effects,
+            &mut NoStateTreeTrace,
+        )
+    }
+
+    fn process_event_traced<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+        &mut self,
+        event: &D::Event,
+        microstep_limit: usize,
+        entity: Option<Entity>,
+        effects: &mut S,
         trace: &mut T,
     ) -> bool {
         if self.status != InstanceStatus::Running {
@@ -304,7 +471,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             trace.record(StateTreeTraceRecord::MacrostepStarted {
                 trigger: StateTreeTraceTrigger::ExternalEvent(event_name),
             });
-            self.select_external_transition(events, event_name)
+            self.select_external_transition(events, event_name, event)
         };
         let transition = match selected {
             Ok(Some(transition)) => transition,
@@ -320,14 +487,33 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         };
 
         self.trace_transition_set(1, transition, trace);
-        if let Err(fault) = self.take_transition(transition, Some(event_name), trace) {
+        if let Err(fault) = self.take_transition(
+            transition,
+            ActionContext {
+                event_name: Some(event_name),
+                external_event: Some(event),
+                entity,
+            },
+            effects,
+            trace,
+        ) {
             self.status = InstanceStatus::Faulted(fault);
             self.finish_current_macrostep(trace);
             return true;
         }
         self.update_completion(trace);
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 1, Some(event_name), trace);
+            self.stabilize(
+                microstep_limit,
+                1,
+                ActionContext {
+                    event_name: Some(event_name),
+                    external_event: Some(event),
+                    entity,
+                },
+                effects,
+                trace,
+            );
         }
         self.finish_current_macrostep(trace);
         true
@@ -359,65 +545,96 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .and_then(|linked| linked.compiled.event_name(event))
             .map(str::to_owned);
         self.trace_transition_set(1, transition, &mut NoStateTreeTrace);
-        if let Err(fault) = self.take_transition(transition, name.as_deref(), &mut NoStateTreeTrace)
-        {
+        if let Err(fault) = self.take_transition(
+            transition,
+            ActionContext {
+                event_name: name.as_deref(),
+                external_event: None,
+                entity: None,
+            },
+            &mut RejectEffects,
+            &mut NoStateTreeTrace,
+        ) {
             self.status = InstanceStatus::Faulted(fault);
             return true;
         }
         self.update_completion(&mut NoStateTreeTrace);
         if self.status == InstanceStatus::Running {
-            self.stabilize(microstep_limit, 1, name.as_deref(), &mut NoStateTreeTrace);
+            self.stabilize(
+                microstep_limit,
+                1,
+                ActionContext {
+                    event_name: name.as_deref(),
+                    external_event: None,
+                    entity: None,
+                },
+                &mut RejectEffects,
+                &mut NoStateTreeTrace,
+            );
         }
         true
     }
 
-    fn stabilize<T: StateTreeTrace + ?Sized>(
+    fn stabilize<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         limit: usize,
         mut transitions_taken: usize,
-        current_event: Option<&str>,
+        context: ActionContext<'_, D::Event>,
+        effects: &mut S,
         trace: &mut T,
     ) {
-        let mut current_event = current_event.map(Box::<str>::from);
+        let mut current_event = context.event_name.map(Box::<str>::from);
+        let mut external_event = context.external_event;
         loop {
-            let transition =
-                match self.select_transition(Trigger::Eventless(current_event.as_deref())) {
-                    Ok(Some(transition)) => transition,
-                    Ok(None) => {
-                        let Some(event) = self.internal_events.pop_front() else {
-                            return;
-                        };
-                        current_event = self
-                            .linked
-                            .as_ref()
-                            .and_then(|linked| linked.compiled.event_name(event))
-                            .map(Box::from);
-                        if let Some(event_name) = current_event.as_deref() {
-                            trace.record(StateTreeTraceRecord::InternalEventConsumed {
-                                event: event_name,
-                            });
-                        }
-                        match self.select_transition(Trigger::Internal(event)) {
-                            Ok(Some(transition)) => transition,
-                            Ok(None) => continue,
-                            Err(fault) => {
-                                self.status = InstanceStatus::Faulted(fault);
-                                return;
-                            }
-                        }
-                    }
-                    Err(fault) => {
-                        self.status = InstanceStatus::Faulted(fault);
+            let transition = match self
+                .select_transition(Trigger::Eventless(current_event.as_deref(), external_event))
+            {
+                Ok(Some(transition)) => transition,
+                Ok(None) => {
+                    let Some(event) = self.internal_events.pop_front() else {
                         return;
+                    };
+                    current_event = self
+                        .linked
+                        .as_ref()
+                        .and_then(|linked| linked.compiled.event_name(event))
+                        .map(Box::from);
+                    external_event = None;
+                    if let Some(event_name) = current_event.as_deref() {
+                        trace.record(StateTreeTraceRecord::InternalEventConsumed {
+                            event: event_name,
+                        });
                     }
-                };
+                    match self.select_transition(Trigger::Internal(event)) {
+                        Ok(Some(transition)) => transition,
+                        Ok(None) => continue,
+                        Err(fault) => {
+                            self.status = InstanceStatus::Faulted(fault);
+                            return;
+                        }
+                    }
+                }
+                Err(fault) => {
+                    self.status = InstanceStatus::Faulted(fault);
+                    return;
+                }
+            };
             if transitions_taken == limit {
                 self.status =
                     InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit });
                 return;
             }
             self.trace_transition_set(transitions_taken + 1, transition, trace);
-            if let Err(fault) = self.take_transition(transition, current_event.as_deref(), trace) {
+            if let Err(fault) = self.take_transition(
+                transition,
+                ActionContext {
+                    event_name: current_event.as_deref(),
+                    external_event,
+                    entity: context.entity,
+                },
+                effects,
+                trace,
+            ) {
                 self.status = InstanceStatus::Faulted(fault);
                 return;
             }
@@ -431,7 +648,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
     fn select_transition(
         &self,
-        trigger: Trigger<'_>,
+        trigger: Trigger<'_, D::Event>,
     ) -> Result<Option<SelectedTransition>, RuntimeFault> {
         let Some(compiled) = self.linked.as_ref().map(|linked| &linked.compiled) else {
             return Ok(None);
@@ -439,11 +656,11 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         for state in self.active.iter().rev() {
             for transition in &compiled.state(*state).transitions {
                 let matches = match (transition.event, &trigger) {
-                    (None, Trigger::Eventless(_)) => true,
+                    (None, Trigger::Eventless(_, _)) => true,
                     (Some(candidate), Trigger::Internal(emitted)) => {
                         compiled.internal_event_matches(candidate, *emitted)
                     }
-                    (Some(event), Trigger::External(events, _)) => events.contains(event),
+                    (Some(event), Trigger::External(events, _, _)) => events.contains(event),
                     _ => false,
                 };
                 if !matches {
@@ -454,6 +671,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                         compiled,
                         condition,
                         trigger.event_name(compiled),
+                        trigger.external_event(),
                     )?
                 {
                     continue;
@@ -471,14 +689,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &self,
         events: &EventSet,
         name: &str,
+        event: &D::Event,
     ) -> Result<Option<SelectedTransition>, RuntimeFault> {
-        self.select_transition(Trigger::External(events, name))
+        self.select_transition(Trigger::External(events, name, event))
     }
 
-    fn take_transition<T: StateTreeTrace + ?Sized>(
+    fn take_transition<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         selected: SelectedTransition,
-        event_name: Option<&str>,
+        context: ActionContext<'_, D::Event>,
+        effects: &mut S,
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         let Some(compiled) = self
@@ -495,7 +715,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return self.execute_actions(
                 &compiled,
                 &compiled.transition_actions[action_start..action_end],
-                event_name,
+                context,
+                effects,
                 trace,
             );
         }
@@ -511,7 +732,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             self.execute_actions(
                 &compiled,
                 &compiled.state(*state).exit_actions,
-                event_name,
+                context,
+                effects,
                 trace,
             )?;
         }
@@ -527,14 +749,15 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.execute_actions(
             &compiled,
             &compiled.transition_actions[action_start..action_end],
-            event_name,
+            context,
+            effects,
             trace,
         )?;
 
         let start = transition.entry_start as usize;
         let end = start + transition.entry_len as usize;
         for entry in &compiled.transition_entries[start..end] {
-            self.enter_state(&compiled, *entry, event_name, trace)?;
+            self.enter_state(&compiled, *entry, context, effects, trace)?;
         }
         debug_assert!(
             self.active
@@ -567,19 +790,20 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
     }
 
-    fn enter_state<T: StateTreeTrace + ?Sized>(
+    fn enter_state<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         compiled: &CompiledDefinition,
         entry: Entry,
-        event_name: Option<&str>,
+        context: ActionContext<'_, D::Event>,
+        effects: &mut S,
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         self.active.push(entry.state);
         let state = compiled.state(entry.state);
         trace.record(StateTreeTraceRecord::StateEntered { state: &state.name });
-        self.execute_actions(compiled, &state.entry_actions, event_name, trace)?;
+        self.execute_actions(compiled, &state.entry_actions, context, effects, trace)?;
         if entry.take_initial {
-            self.execute_actions(compiled, &state.initial_actions, event_name, trace)?;
+            self.execute_actions(compiled, &state.initial_actions, context, effects, trace)?;
         }
         Ok(())
     }
@@ -601,6 +825,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 compiled,
                 *initializer,
                 None,
+                None,
                 DatamodelOperation::Initialize,
             )?;
             trace.record(StateTreeTraceRecord::DataAssigned {
@@ -616,11 +841,13 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         compiled: &CompiledDefinition,
         expression: ExpressionId,
         event_name: Option<&str>,
+        external_event: Option<&D::Event>,
     ) -> Result<bool, RuntimeFault> {
         match self.evaluate_expression(
             compiled,
             expression,
             event_name,
+            external_event,
             DatamodelOperation::Condition,
         )? {
             LuauValue::Boolean(value) => Ok(value),
@@ -633,6 +860,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         compiled: &CompiledDefinition,
         expression: ExpressionId,
         event_name: Option<&str>,
+        external_event: Option<&D::Event>,
         operation: DatamodelOperation,
     ) -> Result<LuauValue, RuntimeFault> {
         let datamodel = compiled
@@ -640,20 +868,38 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .as_ref()
             .expect("compiled Luau expressions require a datamodel");
         let expression = &datamodel.expressions[expression.index()];
-        luau::evaluate(expression, &datamodel.names, &self.data, event_name).map_err(|error| {
-            RuntimeFault::Datamodel {
-                operation,
-                span_start: expression.span_start,
-                message: error.to_string().into(),
-            }
+        let event_data = if expression.reads_event_data {
+            external_event
+                .map(StateTreeEvents::event_data)
+                .transpose()
+                .map_err(|error| RuntimeFault::EventDataProjection {
+                    event: event_name.unwrap_or_default().into(),
+                    message: error.to_string().into(),
+                })?
+                .flatten()
+        } else {
+            None
+        };
+        luau::evaluate(
+            expression,
+            &datamodel.names,
+            &self.data,
+            event_name,
+            event_data.as_ref(),
+        )
+        .map_err(|error| RuntimeFault::Datamodel {
+            operation,
+            span_start: expression.span_start,
+            message: error.to_string().into(),
         })
     }
 
-    fn execute_actions<T: StateTreeTrace + ?Sized>(
+    fn execute_actions<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         compiled: &CompiledDefinition,
         actions: &[Action],
-        event_name: Option<&str>,
+        context: ActionContext<'_, D::Event>,
+        effects: &mut S,
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         for action in actions {
@@ -668,7 +914,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     let value = self.evaluate_expression(
                         compiled,
                         expression,
-                        event_name,
+                        context.event_name,
+                        context.external_event,
                         DatamodelOperation::Assign,
                     )?;
                     self.data[data.index()] = value;
@@ -680,6 +927,60 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                         data: &datamodel.names[data.index()],
                         value: &self.data[data.index()],
                     });
+                }
+                Action::Effect {
+                    effect,
+                    argument_start,
+                    argument_len,
+                    span_start,
+                } => {
+                    let start = argument_start as usize;
+                    let end = start + argument_len as usize;
+                    let mut values = Vec::with_capacity(argument_len as usize);
+                    for argument in &compiled.effect_arguments[start..end] {
+                        let value = self.evaluate_expression(
+                            compiled,
+                            argument.expression,
+                            context.event_name,
+                            context.external_event,
+                            DatamodelOperation::EffectArgument,
+                        )?;
+                        values.push((argument.name.clone(), value));
+                    }
+                    let (data_names, data) = compiled
+                        .datamodel
+                        .as_ref()
+                        .map_or((&[][..], &[][..]), |datamodel| {
+                            (datamodel.names.as_ref(), self.data.as_slice())
+                        });
+                    let handler = self
+                        .linked
+                        .as_ref()
+                        .and_then(|linked| linked.effect(effect))
+                        .cloned();
+                    let name = compiled.effect_name(effect);
+                    let context = StateTreeEffectContext {
+                        entity: context.entity,
+                        event_name: context.event_name,
+                        external_event: context.external_event,
+                        data_names,
+                        data,
+                    };
+                    if let Err(error) = effects.emit(
+                        name,
+                        handler.as_ref(),
+                        context,
+                        StateTreeEffectArgs::new(values),
+                        span_start as usize,
+                    ) {
+                        return Err(RuntimeFault::Effect {
+                            effect: name.into(),
+                            argument: error.argument_name().map(Into::into),
+                            span_start: span_start as usize,
+                            message: error.message().into(),
+                        });
+                    }
+                    trace.record(StateTreeTraceRecord::EffectEmitted { effect: name });
                 }
             }
         }
@@ -774,10 +1075,13 @@ mod tests {
     fn instance(definition: &StateTreeDefinition, limit: usize) -> StateTreeInstance<TestDomain> {
         let mut instance = StateTreeInstance::new(Handle::default());
         instance.initialize(
-            Arc::new(LinkedDefinition::new::<TestEvents>(Arc::clone(
-                &definition.compiled,
-            ))),
+            Arc::new(LinkedDefinition::<TestDomain>::new(
+                Arc::clone(&definition.compiled),
+                None,
+            )),
             limit,
+            None,
+            &mut RejectEffects,
         );
         instance
     }

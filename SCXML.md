@@ -17,6 +17,13 @@ that protocol when a definition is linked to a state-tree domain. Typed Rust
 payloads remain intact through queueing and execution; the runtime does not
 dispatch arbitrary string events.
 
+An event variant may opt into Luau payload access with
+`#[state_tree(name = "...", data = projector)]`. The projector accepts a shared
+reference to the concrete payload and returns
+`Result<LuauValue, StateTreeEventDataError>`. It runs lazily only when an
+executed expression reads `_event.data`. Projection errors fault the affected
+instance.
+
 `<raise>` is supported because it creates a payload-free event on the
 statechart's private internal queue. Its authored name is compiled to a dense
 event identifier and does not escape as a Bevy event.
@@ -53,9 +60,41 @@ fresh authored environment for each evaluation; scripts cannot access Bevy's
 `World`.
 
 `_event.name` exposes the currently processed typed event's authored name.
-Other SCXML system variables are reserved but not yet implemented. Datamodel
-errors fault the instance rather than raising SCXML `error.execution` events.
-ECMAScript is not a planned built-in datamodel.
+`_event.data` exposes the opt-in portable projection of the current external
+event. It is absent for internal events and unprojected variants. Other SCXML
+system variables are reserved but not yet implemented. Datamodel errors fault
+the instance rather than raising SCXML `error.execution` events. ECMAScript is
+not a planned built-in datamodel.
+
+## Typed Effects
+
+The Bevy extension namespace `urn:bevy-state-tree` provides executable typed
+effects:
+
+```xml
+<bst:effect name="deal_damage">
+  <bst:arg name="amount" expr="base_damage * 2"/>
+</bst:effect>
+```
+
+`<bst:effect>` requires exactly one non-empty `name` attribute and contains only
+zero or more `<bst:arg name="..." expr="..."/>` children. Argument names must be
+unique within the effect. Arguments require `datamodel="luau"`; an effect with
+no arguments does not.
+
+Applications register an authored effect name with a Rust constructor. The
+constructor receives the entity, current external event, datamodel view, and
+evaluated named arguments, and returns a concrete Bevy `Message`. The runtime
+publishes that message through deferred commands. Systems ordered in
+`StateTreeSet::HandleEffects` observe messages after state-tree processing.
+
+Effects are constructed in SCXML action order. Publication across independently
+processed instances is unordered. A constructor, argument conversion, or
+unregistered-effect error faults the affected instance; actions already run in
+that macrostep are not rolled back. Headless execution can provide a
+`StateTreeEffectSink`; without one, encountering an effect faults the execution.
+
+SCXML `<send>` remains unsupported and is not an alias for typed effects.
 
 ## Semantic Traces
 

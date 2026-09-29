@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use super::{
-    Attribute, Content, ContentPart, DataModelChild, Document, ExecutableContent, Final,
-    FinalChild, Initial, OnEntry, OnExit, RootChild, Span, State, StateChild, Transition,
-    TransitionType,
+    Attribute, Content, ContentPart, DataModelChild, Document, ExecutableContent, Extension,
+    ExtensionContent, Final, FinalChild, Initial, OnEntry, OnExit, RootChild, Span, State,
+    StateChild, Transition, TransitionType,
 };
 use crate::{
     BuildError, StateId, StateTreeBuilder, StateTreeDefinition,
@@ -45,6 +45,12 @@ pub enum CompileError {
     },
     #[error("{source_name}@{span_start}: invalid Luau datamodel: {message}")]
     InvalidDataModel {
+        source_name: String,
+        span_start: usize,
+        message: String,
+    },
+    #[error("{source_name}@{span_start}: invalid typed effect: {message}")]
+    InvalidEffect {
         source_name: String,
         span_start: usize,
         message: String,
@@ -548,9 +554,90 @@ impl<'a> Compiler<'a> {
                 ExecutableContent::Assign(assign) => {
                     self.unsupported(assign.span, "non-expression Luau assignment")
                 }
+                ExecutableContent::Extension(extension)
+                    if extension.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
+                        && extension.local_name == "effect" =>
+                {
+                    self.effect(extension)
+                }
                 _ => self.unsupported(span, "executable content other than raise"),
             })
             .collect()
+    }
+
+    fn effect(&mut self, extension: &Extension) -> Result<DraftAction, CompileError> {
+        let name = extension_attribute(extension, "name")
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| self.effect_error(extension.span, "effect requires a non-empty name"))?;
+        if extension
+            .attributes
+            .iter()
+            .any(|attribute| attribute.namespace.is_some() || attribute.local_name != "name")
+        {
+            return Err(self.effect_error(extension.span, "effect has unsupported attributes"));
+        }
+
+        let mut arguments = Vec::new();
+        let mut argument_names = HashSet::new();
+        for content in &extension.content {
+            let ExtensionContent::Element(argument) = content else {
+                let ExtensionContent::Text(text) = content else {
+                    unreachable!()
+                };
+                if !text.trim().is_empty() {
+                    return Err(self.effect_error(extension.span, "effect contains text"));
+                }
+                continue;
+            };
+            if argument.namespace.as_deref() != Some(super::BEVY_STATE_TREE_NAMESPACE)
+                || argument.local_name != "arg"
+            {
+                return Err(
+                    self.effect_error(argument.span, "effect contains an unsupported child")
+                );
+            }
+            if argument.content.iter().any(|content| match content {
+                ExtensionContent::Text(text) => !text.trim().is_empty(),
+                ExtensionContent::Element(_) => true,
+            }) {
+                return Err(self.effect_error(argument.span, "effect argument cannot have content"));
+            }
+            if argument.attributes.iter().any(|attribute| {
+                attribute.namespace.is_some()
+                    || !matches!(attribute.local_name.as_str(), "name" | "expr")
+            }) {
+                return Err(
+                    self.effect_error(argument.span, "effect argument has unsupported attributes")
+                );
+            }
+            let argument_name = extension_attribute(argument, "name")
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    self.effect_error(argument.span, "effect argument requires a non-empty name")
+                })?;
+            if !argument_names.insert(argument_name) {
+                return Err(self.effect_error(argument.span, "effect argument name is duplicated"));
+            }
+            let expression = extension_attribute(argument, "expr")
+                .filter(|expression| !expression.trim().is_empty())
+                .ok_or_else(|| {
+                    self.effect_error(argument.span, "effect argument requires an expression")
+                })?;
+            if self.document.root.datamodel.as_deref() != Some("luau") {
+                return Err(
+                    self.effect_error(argument.span, "effect arguments require datamodel=\"luau\"")
+                );
+            }
+            let expression = self.compile_luau(expression, false, argument.span)?;
+            let expression = self.builder.luau_expression(expression)?;
+            arguments.push((Box::from(argument_name), expression));
+        }
+
+        Ok(DraftAction::Effect {
+            name: Box::from(name),
+            arguments,
+            span_start: extension.span.start,
+        })
     }
 
     fn compile_luau(
@@ -616,6 +703,22 @@ impl<'a> Compiler<'a> {
             message: message.into(),
         })
     }
+
+    fn effect_error(&self, span: Span, message: impl Into<String>) -> CompileError {
+        CompileError::InvalidEffect {
+            source_name: self.document.source_name.clone(),
+            span_start: span.start,
+            message: message.into(),
+        }
+    }
+}
+
+fn extension_attribute<'a>(extension: &'a Extension, name: &str) -> Option<&'a str> {
+    extension
+        .attributes
+        .iter()
+        .find(|attribute| attribute.namespace.is_none() && attribute.local_name == name)
+        .map(|attribute| attribute.value.as_str())
 }
 
 fn is_luau_identifier(value: &str) -> bool {
@@ -708,8 +811,8 @@ mod tests {
     use super::*;
     use crate::scxml;
     use crate::{
-        DatamodelOperation, InstanceStatus, LuauValue, RuntimeFault, StateTreeEvents,
-        StateTreeExecution,
+        DatamodelOperation, InstanceStatus, LuauValue, RuntimeFault, StateTreeEffectError,
+        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEvents, StateTreeExecution,
     };
 
     const NS: &str = super::super::SCXML_NAMESPACE;
@@ -811,6 +914,147 @@ mod tests {
         let document = scxml::parse("raises.scxml", source).unwrap();
         let definition = compile(&document).unwrap();
         StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(32).unwrap())
+    }
+
+    #[derive(Default)]
+    struct RecordingEffects(Vec<(String, i64)>);
+
+    impl StateTreeEffectSink<NoEvents> for RecordingEffects {
+        fn emit(
+            &mut self,
+            mut request: StateTreeEffectRequest<'_, NoEvents>,
+        ) -> Result<(), StateTreeEffectError> {
+            let value = request.arguments().take::<i64>("value")?;
+            self.0.push((request.name().to_owned(), value));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn compiles_and_emits_typed_effect_arguments() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+                <state id="source">
+                    <onentry><bst:effect name="record"><bst:arg name="value" expr="2 + 3"/></bst:effect></onentry>
+                </state>
+            </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let document = scxml::parse("effect.scxml", &source).unwrap();
+        let definition = compile(&document).unwrap();
+        let mut effects = RecordingEffects::default();
+
+        let execution = StateTreeExecution::<NoEvents>::new_with_sink(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+            &mut effects,
+        );
+
+        assert_eq!(execution.status(), &InstanceStatus::Running);
+        assert_eq!(effects.0, [("record".to_owned(), 5)]);
+    }
+
+    struct PayloadEvent {
+        amount: i64,
+    }
+
+    impl StateTreeEvents for PayloadEvent {
+        const AUTHORED_NAMES: &'static [&'static str] = &["payload"];
+
+        fn event_index(&self) -> usize {
+            0
+        }
+
+        fn event_data(&self) -> Result<Option<LuauValue>, crate::StateTreeEventDataError> {
+            Ok(Some(LuauValue::Record(
+                [(Box::from("amount"), LuauValue::Integer(self.amount))].into(),
+            )))
+        }
+    }
+
+    #[test]
+    fn luau_conditions_can_read_projected_external_event_data() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" datamodel="luau">
+                <state id="source">
+                    <transition event="payload" cond="_event.data.amount == 7" target="pass"/>
+                    <transition event="payload" target="fail"/>
+                </state>
+                <final id="pass"/><final id="fail"/>
+            </scxml>"#,
+        );
+        let document = scxml::parse("payload.scxml", &source).unwrap();
+        let definition = compile(&document).unwrap();
+        let mut execution =
+            StateTreeExecution::<PayloadEvent>::new(&definition, NonZeroUsize::new(8).unwrap());
+
+        assert!(
+            execution.process_event(&PayloadEvent { amount: 7 }, NonZeroUsize::new(8).unwrap(),)
+        );
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
+    }
+
+    enum FailedProjectionEvent {
+        Trigger,
+    }
+
+    impl StateTreeEvents for FailedProjectionEvent {
+        const AUTHORED_NAMES: &'static [&'static str] = &["trigger"];
+
+        fn event_index(&self) -> usize {
+            0
+        }
+
+        fn event_data(&self) -> Result<Option<LuauValue>, crate::StateTreeEventDataError> {
+            Err(crate::StateTreeEventDataError::new("projection failed"))
+        }
+    }
+
+    #[test]
+    fn event_data_projection_errors_fault_the_instance() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" datamodel="luau">
+                <state id="source"><transition event="trigger" cond="_event.data ~= nil" target="pass"/></state>
+                <final id="pass"/>
+            </scxml>"#,
+        );
+        let document = scxml::parse("projection.scxml", &source).unwrap();
+        let definition = compile(&document).unwrap();
+        let mut execution = StateTreeExecution::<FailedProjectionEvent>::new(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+        );
+
+        assert!(execution.process_event(
+            &FailedProjectionEvent::Trigger,
+            NonZeroUsize::new(8).unwrap(),
+        ));
+        assert!(matches!(
+            execution.status(),
+            InstanceStatus::Faulted(RuntimeFault::EventDataProjection { .. })
+        ));
+    }
+
+    #[test]
+    fn reading_only_event_name_does_not_project_payload_data() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" datamodel="luau">
+                <state id="source"><transition event="trigger" cond="_event.name == 'trigger'" target="pass"/></state>
+                <final id="pass"/>
+            </scxml>"#,
+        );
+        let document = scxml::parse("event-name.scxml", &source).unwrap();
+        let definition = compile(&document).unwrap();
+        let mut execution = StateTreeExecution::<FailedProjectionEvent>::new(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+        );
+
+        assert!(execution.process_event(
+            &FailedProjectionEvent::Trigger,
+            NonZeroUsize::new(8).unwrap(),
+        ));
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
     }
 
     #[test]

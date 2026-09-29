@@ -1,4 +1,22 @@
 use bevy_ecs::event::{EntityEvent, Event};
+use thiserror::Error;
+
+use crate::LuauValue;
+
+/// An error while projecting a typed external event for Luau `_event.data`.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("{message}")]
+pub struct StateTreeEventDataError {
+    message: Box<str>,
+}
+
+impl StateTreeEventDataError {
+    pub fn new(message: impl Into<Box<str>>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
 
 /// Identifies one independent state-tree runtime and its external event protocol.
 pub trait StateTreeDomain: Send + Sync + 'static {
@@ -12,7 +30,8 @@ pub trait StateTreeDomain: Send + Sync + 'static {
 /// [`StateTreeEvents`](macro@crate::StateTreeEvents).
 /// Each enum variant contains one concrete payload and carries a
 /// `#[state_tree(name = "...")]` attribute. Add `broadcast` to variants written
-/// through [`BroadcastStateTreeEventWriter`](crate::BroadcastStateTreeEventWriter):
+/// through [`BroadcastStateTreeEventWriter`](crate::BroadcastStateTreeEventWriter),
+/// and `data = projector` to expose an opt-in portable Luau payload:
 ///
 /// ```
 /// # use bevy_ecs::prelude::*;
@@ -47,6 +66,11 @@ pub trait StateTreeEvents: Send + Sync + 'static {
     /// Returns the SCXML event name represented by this value.
     fn authored_name(&self) -> &'static str {
         Self::AUTHORED_NAMES[self.event_index()]
+    }
+
+    /// Projects this event's typed payload for Luau `_event.data` access.
+    fn event_data(&self) -> Result<Option<LuauValue>, StateTreeEventDataError> {
+        Ok(None)
     }
 }
 

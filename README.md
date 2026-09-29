@@ -11,6 +11,8 @@ The crate currently provides the runtime foundation:
 - Luau data expressions and transition guards;
 - ordered SCXML `raise` and Luau `assign` actions on entry, exit, initial, and
   regular transitions;
+- typed effects that construct and publish concrete Bevy messages;
+- opt-in typed event payload projection through Luau `_event.data`;
 - bounded iterative macrostep stabilization;
 - ordered per-instance entity and broadcast event queues;
 - parallel event processing across independent instances.
@@ -39,6 +41,10 @@ the original Rust payload intact through queueing and execution, while the
 derive generates event-name matching and writer conversions. Variants are
 entity-targeted by default; mark domain-wide events with `broadcast`.
 
+Payloads can opt into Luau projection with `data = projector`. The projector is
+called only when an executed expression reads `_event.data`; its portable value
+is not used for Rust event routing or retained by the instance.
+
 ```rust,no_run
 use bevy_app::{App, FixedUpdate};
 use bevy_asset::AssetPlugin;
@@ -52,10 +58,16 @@ struct Wake {
     entity: Entity,
 }
 
+fn wake_data(_: &Wake) -> Result<LuauValue, StateTreeEventDataError> {
+    Ok(LuauValue::Record(
+        [(Box::from("urgent"), LuauValue::Boolean(true))].into(),
+    ))
+}
+
 #[derive(StateTreeEvents)]
 #[state_tree(domain = Simulation)]
 enum SimulationEvents {
-    #[state_tree(name = "wake")]
+    #[state_tree(name = "wake", data = wake_data)]
     Wake(Wake),
 }
 
@@ -79,6 +91,31 @@ at the point where they were written.
 Instances that initialize before event processing receive events queued during
 that schedule run. Instances still waiting for their definition asset receive
 no events, and queued entity events are discarded rather than replayed later.
+
+## Typed Effects
+
+Bevy-specific executable content uses the `urn:bevy-state-tree` namespace:
+
+```xml
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree" datamodel="luau">
+  <state id="active">
+    <onentry>
+      <bst:effect name="play_sound">
+        <bst:arg name="volume" expr="0.75"/>
+      </bst:effect>
+    </onentry>
+  </state>
+</scxml>
+```
+
+Register each authored name with `StateTreeAppExt::register_state_tree_effect`.
+The constructor consumes named `StateTreeEffectArgs` and returns one concrete
+Bevy `Message`. Messages are available to systems in `StateTreeSet::HandleEffects`.
+Construction follows statechart action order, but message delivery order between
+parallel instances is unspecified. Constructor, argument, and payload projection
+errors fault only the affected instance. Headless callers use
+`StateTreeExecution::{new,process_event}_with_sink` to receive portable requests.
 
 ## Semantic Tests
 

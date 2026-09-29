@@ -48,13 +48,14 @@ fn expand_state_tree_events_with_runtime(
     let mut payloads = HashSet::new();
     let mut name_arms = Vec::new();
     let mut index_arms = Vec::new();
+    let mut data_arms = Vec::new();
     let mut authored_names = Vec::new();
     let mut payload_impls = Vec::new();
     let mut conversion_impls = Vec::new();
     let mut route_impls = Vec::new();
 
     for (index, variant) in data.variants.iter().enumerate() {
-        let (authored_name, broadcast) = parse_variant(&variant.attrs, variant.span())?;
+        let (authored_name, broadcast, data) = parse_variant(&variant.attrs, variant.span())?;
         let Fields::Unnamed(fields) = &variant.fields else {
             return Err(Error::new(
                 variant.fields.span(),
@@ -82,6 +83,15 @@ fn expand_state_tree_events_with_runtime(
         });
         index_arms.push(quote! {
             Self::#variant_name(_) => #index
+        });
+        data_arms.push(if let Some(projector) = data {
+            quote! {
+                Self::#variant_name(payload) => #projector(payload).map(::core::option::Option::Some)
+            }
+        } else {
+            quote! {
+                Self::#variant_name(_) => ::core::result::Result::Ok(::core::option::Option::None)
+            }
         });
         authored_names.push(authored_name.clone());
         payload_impls.push(quote! {
@@ -131,6 +141,17 @@ fn expand_state_tree_events_with_runtime(
             fn authored_name(&self) -> &'static str {
                 match self {
                     #(#name_arms),*
+                }
+            }
+
+            fn event_data(
+                &self,
+            ) -> ::core::result::Result<
+                ::core::option::Option<#runtime::LuauValue>,
+                #runtime::StateTreeEventDataError,
+            > {
+                match self {
+                    #(#data_arms),*
                 }
             }
         }
@@ -185,9 +206,10 @@ fn parse_domain(attributes: &[Attribute]) -> syn::Result<Path> {
 fn parse_variant(
     attributes: &[Attribute],
     variant_span: proc_macro2::Span,
-) -> syn::Result<(LitStr, bool)> {
+) -> syn::Result<(LitStr, bool, Option<Path>)> {
     let mut name = None;
     let mut broadcast = false;
+    let mut data = None;
     let mut found = false;
 
     for attribute in attributes
@@ -214,8 +236,14 @@ fn parse_variant(
                 }
                 broadcast = true;
                 Ok(())
+            } else if meta.path.is_ident("data") {
+                if data.is_some() {
+                    return Err(meta.error("`data` was specified more than once"));
+                }
+                data = Some(meta.value()?.parse()?);
+                Ok(())
             } else {
-                Err(meta.error("expected `name = \"...\"` or `broadcast`"))
+                Err(meta.error("expected `name = \"...\"`, `broadcast`, or `data = path`"))
             }
         })?;
     }
@@ -232,7 +260,7 @@ fn parse_variant(
             "state-tree event name cannot be empty",
         ));
     }
-    Ok((name, broadcast))
+    Ok((name, broadcast, data))
 }
 
 #[cfg(test)]

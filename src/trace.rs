@@ -49,6 +49,7 @@ pub enum StateTreeTraceRecord<'a> {
     InternalEventRaised { event: &'a str },
     InternalEventConsumed { event: &'a str },
     DataAssigned { data: &'a str, value: &'a LuauValue },
+    EffectEmitted { effect: &'a str },
     ConfigurationStarted,
     ActiveState { state: &'a str },
     Status { status: &'a InstanceStatus },
@@ -134,6 +135,9 @@ impl StateTreeTrace for StateTreeEventLog {
                 write_luau_value(&mut self.output, value);
                 self.output.push('\n');
             }
+            StateTreeTraceRecord::EffectEmitted { effect } => {
+                writeln!(self.output, "effect {effect:?}").unwrap();
+            }
             StateTreeTraceRecord::ConfigurationStarted => {
                 self.output.push_str("configuration\n");
             }
@@ -166,6 +170,12 @@ fn write_fault(output: &mut String, fault: &RuntimeFault) {
             message: _,
         } => {
             write!(output, "datamodel {operation:?}").unwrap();
+        }
+        RuntimeFault::Effect { effect, .. } => {
+            write!(output, "effect {effect:?}").unwrap();
+        }
+        RuntimeFault::EventDataProjection { event, .. } => {
+            write!(output, "event-data {event:?}").unwrap();
         }
     }
 }

@@ -19,3 +19,6 @@ pub use ast::{
 };
 pub use compile::{CompileError, compile};
 pub use parse::{SCXML_NAMESPACE, parse};
+
+/// Namespace URI for Bevy-specific executable content.
+pub const BEVY_STATE_TREE_NAMESPACE: &str = "urn:bevy-state-tree";

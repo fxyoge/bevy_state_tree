@@ -10,7 +10,8 @@ use bevy_asset::Asset;
 use bevy_reflect::TypePath;
 use thiserror::Error;
 
-use crate::{StateTreeEvents, luau::CompiledLuauExpression};
+use crate::effect::{RegisteredEffect, StateTreeEffectRegistry};
+use crate::{StateTreeDomain, StateTreeEvents, luau::CompiledLuauExpression};
 
 /// A compact state identifier local to one [`StateTreeDefinition`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -54,6 +55,15 @@ impl ExpressionId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct EffectId(u32);
+
+impl EffectId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
     Raise(EventId),
@@ -61,6 +71,18 @@ pub(crate) enum Action {
         data: DataId,
         expression: ExpressionId,
     },
+    Effect {
+        effect: EffectId,
+        argument_start: u32,
+        argument_len: u32,
+        span_start: u32,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EffectArgument {
+    pub name: Box<str>,
+    pub expression: ExpressionId,
 }
 
 #[derive(Clone, Debug)]
@@ -150,10 +172,12 @@ pub(crate) struct CompiledDefinition {
     pub states: Box<[StateNode]>,
     pub transition_entries: Box<[Entry]>,
     pub transition_actions: Box<[Action]>,
+    pub effect_arguments: Box<[EffectArgument]>,
     pub initial_entries: Box<[Entry]>,
     pub max_depth: usize,
     pub datamodel: Option<CompiledLuauDataModel>,
     events: Box<[EventPattern]>,
+    effects: Box<[Box<str>]>,
 }
 
 impl CompiledDefinition {
@@ -186,28 +210,57 @@ impl CompiledDefinition {
             EventPattern::Descriptor(_) => None,
         }
     }
+
+    pub fn effect_name(&self, effect: EffectId) -> &str {
+        &self.effects[effect.index()]
+    }
+
+    pub fn effect_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.effects.iter().map(Box::as_ref)
+    }
 }
 
-#[derive(Debug)]
-pub(crate) struct LinkedDefinition {
+pub(crate) struct LinkedDefinition<D: StateTreeDomain> {
     pub compiled: Arc<CompiledDefinition>,
     external_events: Box<[EventSet]>,
+    effects: Box<[Option<Arc<dyn RegisteredEffect<D>>>]>,
 }
 
-impl LinkedDefinition {
-    pub fn new<E: StateTreeEvents>(compiled: Arc<CompiledDefinition>) -> Self {
-        let external_events = E::AUTHORED_NAMES
+impl<D: StateTreeDomain> std::fmt::Debug for LinkedDefinition<D> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LinkedDefinition")
+            .field("compiled", &self.compiled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<D: StateTreeDomain> LinkedDefinition<D> {
+    pub fn new(
+        compiled: Arc<CompiledDefinition>,
+        effects: Option<&StateTreeEffectRegistry<D>>,
+    ) -> Self {
+        let external_events = D::Event::AUTHORED_NAMES
             .iter()
             .map(|name| EventSet::for_name(&compiled.events, name))
+            .collect();
+        let linked_effects = compiled
+            .effect_names()
+            .map(|name| effects.and_then(|effects| effects.get(name)))
             .collect();
         Self {
             compiled,
             external_events,
+            effects: linked_effects,
         }
     }
 
     pub fn external_event(&self, index: usize) -> Option<&EventSet> {
         self.external_events.get(index)
+    }
+
+    pub fn effect(&self, effect: EffectId) -> Option<&Arc<dyn RegisteredEffect<D>>> {
+        self.effects.get(effect.index()).and_then(Option::as_ref)
     }
 }
 
@@ -289,6 +342,11 @@ pub(crate) enum DraftAction {
     Assign {
         data: DataId,
         expression: ExpressionId,
+    },
+    Effect {
+        name: Box<str>,
+        arguments: Vec<(Box<str>, ExpressionId)>,
+        span_start: usize,
     },
 }
 
@@ -562,6 +620,9 @@ impl StateTreeBuilder {
         let mut states = Vec::with_capacity(self.states.len());
         let mut transition_entries = Vec::new();
         let mut transition_actions = Vec::new();
+        let mut effects = Vec::<Box<str>>::new();
+        let mut effect_ids = HashMap::<Box<str>, EffectId>::new();
+        let mut effect_arguments = Vec::new();
 
         for (index, draft) in self.states.iter().enumerate() {
             let state_id = StateId {
@@ -627,6 +688,9 @@ impl StateTreeBuilder {
                         &transition.actions,
                         &mut events,
                         &mut event_ids,
+                        &mut effects,
+                        &mut effect_ids,
+                        &mut effect_arguments,
                         &mut transition_actions,
                     )?,
                 });
@@ -637,12 +701,29 @@ impl StateTreeBuilder {
                 parent: draft.parent,
                 depth: depths[index],
                 kind,
-                entry_actions: compile_actions(&draft.entry_actions, &mut events, &mut event_ids)?,
-                exit_actions: compile_actions(&draft.exit_actions, &mut events, &mut event_ids)?,
+                entry_actions: compile_actions(
+                    &draft.entry_actions,
+                    &mut events,
+                    &mut event_ids,
+                    &mut effects,
+                    &mut effect_ids,
+                    &mut effect_arguments,
+                )?,
+                exit_actions: compile_actions(
+                    &draft.exit_actions,
+                    &mut events,
+                    &mut event_ids,
+                    &mut effects,
+                    &mut effect_ids,
+                    &mut effect_arguments,
+                )?,
                 initial_actions: compile_actions(
                     &draft.initial_actions,
                     &mut events,
                     &mut event_ids,
+                    &mut effects,
+                    &mut effect_ids,
+                    &mut effect_arguments,
                 )?,
                 transitions: transitions.into_boxed_slice(),
             });
@@ -669,10 +750,12 @@ impl StateTreeBuilder {
                 states: states.into_boxed_slice(),
                 transition_entries: transition_entries.into_boxed_slice(),
                 transition_actions: transition_actions.into_boxed_slice(),
+                effect_arguments: effect_arguments.into_boxed_slice(),
                 initial_entries: initial_entries.into_boxed_slice(),
                 max_depth,
                 datamodel,
                 events: events.into_boxed_slice(),
+                effects: effects.into_boxed_slice(),
             }),
         })
     }
@@ -782,10 +865,22 @@ fn compile_actions(
     actions: &[DraftAction],
     events: &mut Vec<EventPattern>,
     event_ids: &mut HashMap<EventPattern, EventId>,
+    effects: &mut Vec<Box<str>>,
+    effect_ids: &mut HashMap<Box<str>, EffectId>,
+    effect_arguments: &mut Vec<EffectArgument>,
 ) -> Result<Box<[Action]>, BuildError> {
     actions
         .iter()
-        .map(|action| compile_action(action, events, event_ids))
+        .map(|action| {
+            compile_action(
+                action,
+                events,
+                event_ids,
+                effects,
+                effect_ids,
+                effect_arguments,
+            )
+        })
         .collect()
 }
 
@@ -793,11 +888,21 @@ fn append_actions(
     actions: &[DraftAction],
     events: &mut Vec<EventPattern>,
     event_ids: &mut HashMap<EventPattern, EventId>,
+    effects: &mut Vec<Box<str>>,
+    effect_ids: &mut HashMap<Box<str>, EffectId>,
+    effect_arguments: &mut Vec<EffectArgument>,
     compiled: &mut Vec<Action>,
 ) -> Result<u32, BuildError> {
     let start = compiled.len();
     for action in actions {
-        compiled.push(compile_action(action, events, event_ids)?);
+        compiled.push(compile_action(
+            action,
+            events,
+            event_ids,
+            effects,
+            effect_ids,
+            effect_arguments,
+        )?);
     }
     u32::try_from(compiled.len() - start).map_err(|_| BuildError::TooManyActions)
 }
@@ -806,6 +911,9 @@ fn compile_action(
     action: &DraftAction,
     events: &mut Vec<EventPattern>,
     event_ids: &mut HashMap<EventPattern, EventId>,
+    effects: &mut Vec<Box<str>>,
+    effect_ids: &mut HashMap<Box<str>, EffectId>,
+    effect_arguments: &mut Vec<EffectArgument>,
 ) -> Result<Action, BuildError> {
     match action {
         DraftAction::Raise(event) => {
@@ -815,6 +923,34 @@ fn compile_action(
             data: *data,
             expression: *expression,
         }),
+        DraftAction::Effect {
+            name,
+            arguments,
+            span_start,
+        } => {
+            let effect = if let Some(effect) = effect_ids.get(name) {
+                *effect
+            } else {
+                let effect =
+                    EffectId(u32::try_from(effects.len()).map_err(|_| BuildError::TooManyEffects)?);
+                effects.push(name.clone());
+                effect_ids.insert(name.clone(), effect);
+                effect
+            };
+            let argument_start = u32::try_from(effect_arguments.len())
+                .map_err(|_| BuildError::TooManyEffectArguments)?;
+            effect_arguments.extend(arguments.iter().map(|(name, expression)| EffectArgument {
+                name: name.clone(),
+                expression: *expression,
+            }));
+            Ok(Action::Effect {
+                effect,
+                argument_start,
+                argument_len: u32::try_from(arguments.len())
+                    .map_err(|_| BuildError::TooManyEffectArguments)?,
+                span_start: u32::try_from(*span_start).unwrap_or(u32::MAX),
+            })
+        }
     }
 }
 
@@ -952,6 +1088,10 @@ pub enum BuildError {
     TooManyDataItems,
     #[error("a definition cannot contain more than u32::MAX expressions")]
     TooManyExpressions,
+    #[error("a definition cannot contain more than u32::MAX effects")]
+    TooManyEffects,
+    #[error("a definition cannot contain more than u32::MAX effect arguments")]
+    TooManyEffectArguments,
 }
 
 #[cfg(test)]

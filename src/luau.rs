@@ -25,6 +25,7 @@ pub enum LuauValue {
 pub(crate) struct CompiledLuauExpression {
     pub bytecode: Box<[u8]>,
     pub span_start: usize,
+    pub reads_event_data: bool,
 }
 
 pub(crate) fn compile_expression(
@@ -41,6 +42,7 @@ pub(crate) fn compile_expression(
     Ok(CompiledLuauExpression {
         bytecode: bytecode.into_boxed_slice(),
         span_start,
+        reads_event_data: expression.contains("_event.data"),
     })
 }
 
@@ -53,8 +55,9 @@ pub(crate) fn evaluate(
     names: &[Box<str>],
     values: &[LuauValue],
     event_name: Option<&str>,
+    event_data: Option<&LuauValue>,
 ) -> Result<LuauValue, Error> {
-    WORKER.with_borrow(|worker| worker.evaluate(expression, names, values, event_name))
+    WORKER.with_borrow(|worker| worker.evaluate(expression, names, values, event_name, event_data))
 }
 
 struct LuauWorker {
@@ -88,6 +91,7 @@ impl LuauWorker {
         names: &[Box<str>],
         values: &[LuauValue],
         event_name: Option<&str>,
+        event_data: Option<&LuauValue>,
     ) -> Result<LuauValue, Error> {
         self.interrupts.set(0);
         let environment = self.lua.create_table()?;
@@ -114,6 +118,9 @@ impl LuauWorker {
         if let Some(name) = event_name {
             let event = self.lua.create_table()?;
             event.set("name", name)?;
+            if let Some(data) = event_data {
+                event.set("data", to_lua(&self.lua, data)?)?;
+            }
             event.set_readonly(true);
             environment.set("_event", event)?;
         }
@@ -247,7 +254,7 @@ mod tests {
         let expression =
             compile_expression("{ values = { 1, 2, 3 }, enabled = true }", false, 0).unwrap();
 
-        let value = evaluate(&expression, &[], &[], None).unwrap();
+        let value = evaluate(&expression, &[], &[], None, None).unwrap();
 
         assert_eq!(
             value,
@@ -276,10 +283,13 @@ mod tests {
         let inspect = compile_expression("accidental_global", false, 0).unwrap();
 
         assert_eq!(
-            evaluate(&mutate, &[], &[], None).unwrap(),
+            evaluate(&mutate, &[], &[], None, None).unwrap(),
             LuauValue::Integer(42)
         );
-        assert_eq!(evaluate(&inspect, &[], &[], None).unwrap(), LuauValue::Nil);
+        assert_eq!(
+            evaluate(&inspect, &[], &[], None, None).unwrap(),
+            LuauValue::Nil
+        );
     }
 
     #[test]
@@ -287,7 +297,14 @@ mod tests {
         let expression = compile_expression("math", false, 0).unwrap();
 
         assert_eq!(
-            evaluate(&expression, &[Box::from("math")], &[LuauValue::Nil], None).unwrap(),
+            evaluate(
+                &expression,
+                &[Box::from("math")],
+                &[LuauValue::Nil],
+                None,
+                None,
+            )
+            .unwrap(),
             LuauValue::Nil
         );
     }
@@ -298,7 +315,7 @@ mod tests {
             compile_expression("(function() while true do end return true end)()", false, 0)
                 .unwrap();
 
-        let error = evaluate(&expression, &[], &[], None).unwrap_err();
+        let error = evaluate(&expression, &[], &[], None, None).unwrap_err();
 
         assert!(error.to_string().contains("Luau execution limit exceeded"));
     }
@@ -312,7 +329,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = evaluate(&expression, &[], &[], None).unwrap_err();
+        let error = evaluate(&expression, &[], &[], None, None).unwrap_err();
 
         assert!(
             error

@@ -27,6 +27,7 @@
 extern crate self as bevy_state_tree;
 
 mod definition;
+mod effect;
 mod event;
 mod instance;
 mod luau;
@@ -37,9 +38,13 @@ pub mod scxml;
 
 pub use bevy_state_tree_macros::StateTreeEvents;
 pub use definition::{BuildError, StateId, StateTreeBuilder, StateTreeDefinition};
+pub use effect::{
+    FromStateTreeValue, StateTreeAppExt, StateTreeEffectArgs, StateTreeEffectContext,
+    StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
+};
 pub use event::{
-    BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEventPayload,
-    StateTreeEvents,
+    BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEventDataError,
+    StateTreeEventPayload, StateTreeEvents,
 };
 pub use instance::{
     DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeExecution, StateTreeInstance,
@@ -58,8 +63,10 @@ pub use trace::{
 pub mod prelude {
     pub use crate::{
         BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, DatamodelOperation,
-        EntityStateTreeEvent, EntityStateTreeEventWriter, InstanceStatus, LuauValue, RuntimeFault,
-        StateId, StateTreeBuilder, StateTreeDefinition, StateTreeDomain, StateTreeEventLog,
+        EntityStateTreeEvent, EntityStateTreeEventWriter, FromStateTreeValue, InstanceStatus,
+        LuauValue, RuntimeFault, StateId, StateTreeAppExt, StateTreeBuilder, StateTreeDefinition,
+        StateTreeDomain, StateTreeEffectArgs, StateTreeEffectContext, StateTreeEffectError,
+        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEventDataError, StateTreeEventLog,
         StateTreeEventPayload, StateTreeEvents, StateTreeExecution, StateTreeInstance,
         StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTrace, StateTreeTraceRecord,
         StateTreeTraceTrigger,

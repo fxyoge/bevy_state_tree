@@ -333,7 +333,14 @@ impl<'a> CapabilityAnalyzer<'a> {
     }
 
     fn visit_extension(&mut self, extension: &Extension) {
-        self.add(Capability::ForeignExtension);
+        if extension.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
+            && extension.local_name == "effect"
+        {
+            self.add(Capability::TypedEffect);
+            return;
+        } else {
+            self.add(Capability::ForeignExtension);
+        }
         for child in &extension.content {
             if let ExtensionContent::Element(child) = child {
                 self.visit_extension(child);

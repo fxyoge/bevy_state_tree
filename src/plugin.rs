@@ -13,9 +13,9 @@ use bevy_asset::{AssetApp, AssetServer, Assets};
 use bevy_ecs::{
     change_detection::DetectChangesMut,
     entity::EntityHashSet,
-    prelude::{Commands, Component, Entity, Mut, Query, Res, ResMut, Resource, With},
+    prelude::{Component, Entity, Mut, Query, Res, ResMut, Resource, With},
     schedule::{InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemSet},
-    system::SystemParam,
+    system::{ParallelCommands, SystemParam},
 };
 use bevy_tasks::ComputeTaskPool;
 
@@ -23,6 +23,7 @@ use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
     StateTreeDomain, StateTreeInstance,
     definition::{CompiledDefinition, LinkedDefinition},
+    effect::{BevyEffectSink, StateTreeEffectRegistry},
     instance::PendingStateTree,
 };
 
@@ -35,6 +36,8 @@ pub enum StateTreeSet {
     Initialize,
     /// Delivers queued events and runs macrosteps to stability.
     ProcessEvents,
+    /// Consumes typed effect messages emitted by state-tree actions.
+    HandleEffects,
 }
 
 /// Runtime limits for one state-tree domain.
@@ -113,6 +116,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
 
         app.init_resource::<StateTreeEventIngress<D>>()
             .init_resource::<LinkedStateTreeDefinitions<D>>()
+            .init_resource::<StateTreeEffectRegistry<D>>()
             .init_resource::<StateTreeSettings<D>>()
             .configure_sets(
                 self.schedule,
@@ -120,6 +124,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
                     StateTreeSet::QueueEvents,
                     StateTreeSet::Initialize,
                     StateTreeSet::ProcessEvents,
+                    StateTreeSet::HandleEffects,
                 )
                     .chain(),
             )
@@ -138,7 +143,7 @@ struct StateTreeAssetsInstalled;
 
 #[derive(Resource)]
 struct LinkedStateTreeDefinitions<D: StateTreeDomain> {
-    definitions: HashMap<u64, Weak<LinkedDefinition>>,
+    definitions: HashMap<u64, Weak<LinkedDefinition<D>>>,
     marker: PhantomData<fn() -> D>,
 }
 
@@ -152,7 +157,11 @@ impl<D: StateTreeDomain> Default for LinkedStateTreeDefinitions<D> {
 }
 
 impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
-    fn get_or_insert(&mut self, compiled: Arc<CompiledDefinition>) -> Arc<LinkedDefinition> {
+    fn get_or_insert(
+        &mut self,
+        compiled: Arc<CompiledDefinition>,
+        effects: &StateTreeEffectRegistry<D>,
+    ) -> Arc<LinkedDefinition<D>> {
         if let Some(linked) = self
             .definitions
             .get(&compiled.identity)
@@ -161,7 +170,7 @@ impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
             return linked;
         }
         let identity = compiled.identity;
-        let linked = Arc::new(LinkedDefinition::new::<D::Event>(compiled));
+        let linked = Arc::new(LinkedDefinition::new(compiled, Some(effects)));
         self.definitions.insert(identity, Arc::downgrade(&linked));
         linked
     }
@@ -327,9 +336,10 @@ where
 }
 
 fn initialize_pending<D: StateTreeDomain>(
-    mut commands: Commands,
+    commands: ParallelCommands,
     definitions: Res<Assets<StateTreeDefinition>>,
     mut linked_definitions: ResMut<LinkedStateTreeDefinitions<D>>,
+    effects: Res<StateTreeEffectRegistry<D>>,
     settings: Res<StateTreeSettings<D>>,
     mut instances: Query<(Entity, &mut StateTreeInstance<D>), With<PendingStateTree<D>>>,
 ) {
@@ -338,10 +348,16 @@ fn initialize_pending<D: StateTreeDomain>(
             continue;
         };
         instance.initialize(
-            linked_definitions.get_or_insert(definition.compiled.clone()),
+            linked_definitions.get_or_insert(definition.compiled.clone(), &effects),
             settings.max_microsteps.get(),
+            Some(entity),
+            &mut BevyEffectSink {
+                commands: &commands,
+            },
         );
-        commands.entity(entity).remove::<PendingStateTree<D>>();
+        commands.command_scope(|mut commands| {
+            commands.entity(entity).remove::<PendingStateTree<D>>();
+        });
     }
 }
 
@@ -349,12 +365,14 @@ type StateTrees<'w, 's, D> = Query<
     'w,
     's,
     (
+        Entity,
         &'static mut StateTreeInstance<D>,
         &'static StateTreeEventInbox<D>,
     ),
 >;
 
 fn process_events<D: StateTreeDomain>(
+    commands: ParallelCommands,
     mut ingress: ResMut<StateTreeEventIngress<D>>,
     settings: Res<StateTreeSettings<D>>,
     mut instances: StateTrees<'_, '_, D>,
@@ -374,39 +392,50 @@ fn process_events<D: StateTreeDomain>(
     }
     let microstep_limit = settings.max_microsteps.get();
 
-    let process_instance =
-        |(mut instance, inbox): (Mut<'_, StateTreeInstance<D>>, &StateTreeEventInbox<D>)| {
-            let mut entity_events = inbox
-                .events
-                .lock()
-                .expect("state-tree event inbox poisoned");
-            if instance.status() == &InstanceStatus::Pending {
-                entity_events.clear();
-                return;
-            }
+    let process_instance = |(entity, mut instance, inbox): (
+        Entity,
+        Mut<'_, StateTreeInstance<D>>,
+        &StateTreeEventInbox<D>,
+    )| {
+        let mut entity_events = inbox
+            .events
+            .lock()
+            .expect("state-tree event inbox poisoned");
+        if instance.status() == &InstanceStatus::Pending {
+            entity_events.clear();
+            return;
+        }
 
-            let mut broadcast_cursor = 0;
+        let mut broadcast_cursor = 0;
 
-            for event in entity_events.drain(..) {
-                if event.instance != instance.runtime_id() || event.batch != batch {
-                    continue;
-                }
-                debug_assert!(event.broadcasts_before <= broadcasts.len());
-                while broadcast_cursor < event.broadcasts_before {
-                    process_external_event(
-                        &mut instance,
-                        &broadcasts[broadcast_cursor],
-                        microstep_limit,
-                    );
-                    broadcast_cursor += 1;
-                }
-                process_external_event(&mut instance, &event.event, microstep_limit);
+        for event in entity_events.drain(..) {
+            if event.instance != instance.runtime_id() || event.batch != batch {
+                continue;
             }
+            debug_assert!(event.broadcasts_before <= broadcasts.len());
+            while broadcast_cursor < event.broadcasts_before {
+                process_external_event(
+                    &mut instance,
+                    &broadcasts[broadcast_cursor],
+                    microstep_limit,
+                    entity,
+                    &commands,
+                );
+                broadcast_cursor += 1;
+            }
+            process_external_event(
+                &mut instance,
+                &event.event,
+                microstep_limit,
+                entity,
+                &commands,
+            );
+        }
 
-            for event in &broadcasts[broadcast_cursor..] {
-                process_external_event(&mut instance, event, microstep_limit);
-            }
-        };
+        for event in &broadcasts[broadcast_cursor..] {
+            process_external_event(&mut instance, event, microstep_limit, entity, &commands);
+        }
+    };
 
     let parallel = ComputeTaskPool::try_get().is_some();
     if broadcasts.is_empty() && parallel {
@@ -435,10 +464,15 @@ fn process_external_event<D: StateTreeDomain>(
     instance: &mut Mut<'_, StateTreeInstance<D>>,
     event: &D::Event,
     microstep_limit: usize,
+    entity: Entity,
+    commands: &ParallelCommands<'_, '_>,
 ) {
-    let changed = instance
-        .bypass_change_detection()
-        .process_event(event, microstep_limit);
+    let changed = instance.bypass_change_detection().process_event(
+        event,
+        microstep_limit,
+        Some(entity),
+        &mut BevyEffectSink { commands },
+    );
     if changed {
         instance.set_changed();
     }
@@ -450,13 +484,17 @@ mod tests {
     use bevy_asset::{AssetPlugin, Assets};
     use bevy_ecs::{
         event::{EntityEvent, Event},
+        message::{Message, MessageReader},
         prelude::{Changed, Entity},
         schedule::ScheduleBuildSettings,
         system::{In, RunSystemOnce},
     };
 
     use super::*;
-    use crate::{InstanceStatus, StateTreeBuilder, StateTreeEventPayload};
+    use crate::{
+        InstanceStatus, StateTreeAppExt, StateTreeBuilder, StateTreeEffectError,
+        StateTreeEventPayload, StateTreeEvents, scxml,
+    };
 
     struct Simulation;
 
@@ -479,10 +517,22 @@ mod tests {
     #[derive(Event)]
     struct AdvanceAll;
 
+    fn project_advance(
+        event: &Advance,
+    ) -> Result<crate::LuauValue, crate::StateTreeEventDataError> {
+        Ok(crate::LuauValue::Record(
+            [(
+                Box::from("steps"),
+                crate::LuauValue::Integer(event.steps.into()),
+            )]
+            .into(),
+        ))
+    }
+
     #[derive(crate::StateTreeEvents)]
     #[state_tree(domain = Simulation)]
     enum SimulationEvents {
-        #[state_tree(name = "advance")]
+        #[state_tree(name = "advance", data = project_advance)]
         Advance(Advance),
         #[state_tree(name = "reset")]
         Reset(Reset),
@@ -494,6 +544,26 @@ mod tests {
 
     #[derive(Resource, Default)]
     struct ChangedInstances(usize);
+
+    #[derive(Message)]
+    struct EffectPublished {
+        entity: Entity,
+        amount: i64,
+    }
+
+    #[derive(Resource, Default)]
+    struct PublishedEffects(Vec<(Entity, i64)>);
+
+    fn collect_effects(
+        mut messages: MessageReader<EffectPublished>,
+        mut published: ResMut<PublishedEffects>,
+    ) {
+        published.0.extend(
+            messages
+                .read()
+                .map(|message| (message.entity, message.amount)),
+        );
+    }
 
     fn definition() -> StateTreeDefinition {
         let mut builder = StateTreeBuilder::new("messages");
@@ -517,6 +587,45 @@ mod tests {
     }
 
     #[test]
+    fn typed_effects_publish_concrete_messages_before_handle_effects() {
+        let source = format!(
+            r#"<scxml xmlns="{}" xmlns:bst="{}" datamodel="luau">
+                <state id="idle"><onentry><bst:effect name="publish"><bst:arg name="amount" expr="7"/></bst:effect></onentry></state>
+            </scxml>"#,
+            scxml::SCXML_NAMESPACE,
+            scxml::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let document = scxml::parse("effect.scxml", &source).unwrap();
+        let definition = scxml::compile(&document).unwrap();
+        let mut app = app();
+        app.register_state_tree_effect::<Simulation, EffectPublished, _>(
+            "publish",
+            |context, arguments| {
+                Ok(EffectPublished {
+                    entity: context.entity().ok_or_else(|| {
+                        StateTreeEffectError::new("Bevy effects require an entity")
+                    })?,
+                    amount: arguments.take("amount")?,
+                })
+            },
+        )
+        .init_resource::<PublishedEffects>()
+        .add_systems(Update, collect_effects.in_set(StateTreeSet::HandleEffects));
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(definition);
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+
+        app.update();
+
+        assert_eq!(app.world().resource::<PublishedEffects>().0, [(entity, 7)]);
+    }
+
+    #[test]
     fn plugin_preserves_an_existing_definition_asset_store() {
         let mut app = App::new();
         app.add_plugins(AssetPlugin::default())
@@ -532,6 +641,21 @@ mod tests {
             app.world()
                 .resource::<Assets<StateTreeDefinition>>()
                 .contains(handle.id())
+        );
+    }
+
+    #[test]
+    fn derived_events_project_opt_in_luau_data() {
+        let event = SimulationEvents::Advance(Advance {
+            entity: Entity::PLACEHOLDER,
+            steps: 9,
+        });
+
+        assert_eq!(
+            event.event_data().unwrap(),
+            Some(crate::LuauValue::Record(
+                [(Box::from("steps"), crate::LuauValue::Integer(9))].into(),
+            ))
         );
     }
 
