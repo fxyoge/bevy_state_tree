@@ -8,9 +8,9 @@ use super::{
     RootChild, Span, State, StateChild, Transition, TransitionType,
 };
 use crate::{
-    BuildError, StateId, StateTreeBuilder, StateTreeDefinition,
-    definition::{DataId, DraftAction},
-    luau::compile_expression,
+    BuildError, StateId, StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeDefinition,
+    StateTreeEffectArgument, StateTreeTransition,
+    definition::{is_luau_identifier, is_scxml_system_name},
 };
 
 /// Compiles the supported SCXML subset into the production state-tree runtime format.
@@ -86,7 +86,6 @@ struct Compiler<'a> {
     used_names: HashSet<String>,
     root_name: String,
     next_anonymous: usize,
-    data_ids: HashMap<String, DataId>,
 }
 
 impl<'a> Compiler<'a> {
@@ -108,7 +107,6 @@ impl<'a> Compiler<'a> {
             used_names,
             root_name,
             next_anonymous: 0,
-            data_ids: HashMap::new(),
         }
     }
 
@@ -213,8 +211,7 @@ impl<'a> Compiler<'a> {
                     "a root datamodel requires datamodel=\"luau\"",
                 );
             }
-            let mut names = Vec::<Box<str>>::new();
-            let mut initializers = Vec::new();
+            let mut declarations = Vec::new();
             if let Some(model) = models.first() {
                 if has_foreign_attributes(&model.attributes) {
                     return self.unsupported(model.span, "foreign datamodel attributes");
@@ -255,27 +252,24 @@ impl<'a> Compiler<'a> {
                             format!("`{id}` is reserved by the SCXML runtime"),
                         );
                     }
-                    if names.iter().any(|name| name.as_ref() == id) {
+                    if declarations
+                        .iter()
+                        .any(|declaration: &StateTreeData| declaration.name() == id)
+                    {
                         return self
                             .invalid_datamodel(data.span, format!("data id `{id}` is duplicated"));
                     }
-                    let initializer = data
-                        .expression
-                        .as_deref()
-                        .map(|expression| self.compile_luau(expression, false, data.span))
-                        .transpose()?;
-                    names.push(Box::<str>::from(id));
-                    initializers.push(initializer);
-                }
-            }
-            let ids = self.builder.set_luau_datamodel(names, initializers)?;
-            if let Some(model) = models.first() {
-                for (child, id) in model.children.iter().zip(ids) {
-                    if let DataModelChild::Data(data) = child {
-                        self.data_ids.insert(data.id.clone().unwrap(), id);
+                    let mut declaration = StateTreeData::new(id).at(data.span.start);
+                    if let Some(expression) = data.expression.as_deref() {
+                        declaration = declaration.with_initializer_at(expression, data.span.start);
                     }
+                    declarations.push(declaration);
                 }
             }
+            let source_name = &self.document.source_name;
+            self.builder
+                .luau_datamodel(declarations)
+                .map_err(|error| builder_error(source_name, error))?;
         }
         Ok(())
     }
@@ -312,8 +306,13 @@ impl<'a> Compiler<'a> {
                 _ => {}
             }
         }
-        self.builder.entry_actions(runtime, entry_actions)?;
-        self.builder.exit_actions(runtime, exit_actions)?;
+        let source_name = &self.document.source_name;
+        self.builder
+            .entry_actions(runtime, entry_actions)
+            .map_err(|error| builder_error(source_name, error))?;
+        self.builder
+            .exit_actions(runtime, exit_actions)
+            .map_err(|error| builder_error(source_name, error))?;
         self.records.push(Record {
             node: Node::State(state),
             runtime,
@@ -366,8 +365,13 @@ impl<'a> Compiler<'a> {
                 _ => {}
             }
         }
-        self.builder.entry_actions(runtime, entry_actions)?;
-        self.builder.exit_actions(runtime, exit_actions)?;
+        let source_name = &self.document.source_name;
+        self.builder
+            .entry_actions(runtime, entry_actions)
+            .map_err(|error| builder_error(source_name, error))?;
+        self.builder
+            .exit_actions(runtime, exit_actions)
+            .map_err(|error| builder_error(source_name, error))?;
         self.records.push(Record {
             node: Node::Parallel(parallel),
             runtime,
@@ -418,8 +422,13 @@ impl<'a> Compiler<'a> {
         }
         let name = self.node_name(state.id.as_deref());
         let runtime = self.builder.final_state(name, parent)?;
-        self.builder.entry_actions(runtime, entry_actions)?;
-        self.builder.exit_actions(runtime, exit_actions)?;
+        let source_name = &self.document.source_name;
+        self.builder
+            .entry_actions(runtime, entry_actions)
+            .map_err(|error| builder_error(source_name, error))?;
+        self.builder
+            .exit_actions(runtime, exit_actions)
+            .map_err(|error| builder_error(source_name, error))?;
         if let Some(id) = state.id.as_deref() {
             self.ids.insert(id, runtime);
         }
@@ -485,7 +494,10 @@ impl<'a> Compiler<'a> {
                 return self.invalid_initial(initial.span);
             };
             let actions = self.check_initial_transition(transition)?;
-            self.builder.initial_actions(state, actions)?;
+            let source_name = &self.document.source_name;
+            self.builder
+                .initial_actions(state, actions)
+                .map_err(|error| builder_error(source_name, error))?;
             self.target(
                 transition.targets.first().expect("checked target"),
                 transition.span,
@@ -513,7 +525,7 @@ impl<'a> Compiler<'a> {
     fn check_initial_transition(
         &mut self,
         transition: &Transition,
-    ) -> Result<Vec<DraftAction>, CompileError> {
+    ) -> Result<Vec<StateTreeAction>, CompileError> {
         self.reject_unknown_attributes(
             transition.span,
             "transition",
@@ -567,22 +579,13 @@ impl<'a> Compiler<'a> {
         if transition.transition_type == Some(TransitionType::Internal) {
             return self.unsupported(transition.span, "internal transitions");
         }
-        let condition = transition
-            .condition
-            .as_deref()
-            .map(|condition| {
-                if self.document.root.datamodel.as_deref() != Some("luau") {
-                    return self.invalid_datamodel(
-                        transition.span,
-                        "transition conditions require datamodel=\"luau\"",
-                    );
-                }
-                let expression = self.compile_luau(condition, true, transition.span)?;
-                self.builder
-                    .luau_expression(expression)
-                    .map_err(CompileError::from)
-            })
-            .transpose()?;
+        if transition.condition.is_some() && self.document.root.datamodel.as_deref() != Some("luau")
+        {
+            return self.invalid_datamodel(
+                transition.span,
+                "transition conditions require datamodel=\"luau\"",
+            );
+        }
         let actions = self.actions(&transition.content, transition.span)?;
         if has_foreign_attributes(&transition.attributes) {
             return self.unsupported(transition.span, "foreign transition attributes");
@@ -595,53 +598,27 @@ impl<'a> Compiler<'a> {
             .first()
             .map(|target| self.target(target, transition.span))
             .transpose()?;
-        if target.is_none() {
-            if transition.events.is_empty() {
-                self.builder.targetless_with_actions(
-                    source,
-                    None,
-                    condition,
-                    actions,
-                    Some(transition.span.start),
-                )?;
-            } else {
-                for event in &transition.events {
-                    self.builder.targetless_with_actions(
-                        source,
-                        Some(event.clone().into()),
-                        condition,
-                        actions.clone(),
-                        Some(transition.span.start),
-                    )?;
-                }
-            }
-            return Ok(());
-        }
-        let target = target.expect("checked transition target");
-        if transition.events.is_empty() {
-            self.builder.eventless_with_actions(
-                source,
-                condition,
-                target,
-                actions,
-                Some(transition.span.start),
-            )?;
+        let mut specification = if transition.events.is_empty() {
+            StateTreeTransition::eventless()
         } else {
-            for event in &transition.events {
-                self.builder.event_descriptor_with_actions(
-                    source,
-                    event.clone(),
-                    condition,
-                    target,
-                    actions.clone(),
-                    Some(transition.span.start),
-                )?;
-            }
+            StateTreeTransition::on_any(transition.events.iter().cloned())
         }
+        .at(transition.span.start)
+        .actions(actions);
+        if let Some(condition) = transition.condition.as_deref() {
+            specification = specification.condition_at(condition, transition.span.start);
+        }
+        if let Some(target) = target {
+            specification = specification.target(target);
+        }
+        let source_name = &self.document.source_name;
+        self.builder
+            .add_transition(source, specification)
+            .map_err(|error| builder_error(source_name, error))?;
         Ok(())
     }
 
-    fn entry_actions(&mut self, entry: &OnEntry) -> Result<Vec<DraftAction>, CompileError> {
+    fn entry_actions(&mut self, entry: &OnEntry) -> Result<Vec<StateTreeAction>, CompileError> {
         if has_foreign_attributes(&entry.attributes) {
             return self.unsupported(entry.span, "foreign onentry attributes");
         }
@@ -649,7 +626,7 @@ impl<'a> Compiler<'a> {
         self.actions(&entry.content, entry.span)
     }
 
-    fn exit_actions(&mut self, exit: &OnExit) -> Result<Vec<DraftAction>, CompileError> {
+    fn exit_actions(&mut self, exit: &OnExit) -> Result<Vec<StateTreeAction>, CompileError> {
         if has_foreign_attributes(&exit.attributes) {
             return self.unsupported(exit.span, "foreign onexit attributes");
         }
@@ -661,7 +638,7 @@ impl<'a> Compiler<'a> {
         &mut self,
         content: &[ExecutableContent],
         span: Span,
-    ) -> Result<Vec<DraftAction>, CompileError> {
+    ) -> Result<Vec<StateTreeAction>, CompileError> {
         content
             .iter()
             .map(|executable| match executable {
@@ -676,7 +653,7 @@ impl<'a> Compiler<'a> {
                         return self
                             .invalid_document(raise.span, "raise requires a non-empty event");
                     }
-                    Ok(DraftAction::Raise(Box::from(raise.event.as_str())))
+                    Ok(StateTreeAction::raise(raise.event.as_str()))
                 }
                 ExecutableContent::Raise(raise) => {
                     self.unsupported(raise.span, "foreign raise attributes")
@@ -695,19 +672,15 @@ impl<'a> Compiler<'a> {
                     let Some(location) = assign.location.as_deref() else {
                         return self.invalid_datamodel(assign.span, "assign requires a location");
                     };
-                    let Some(data) = self.data_ids.get(location).copied() else {
-                        return self.invalid_datamodel(
-                            assign.span,
-                            format!("assignment location `{location}` is not declared"),
-                        );
-                    };
                     let Some(source) = assign.expression.as_deref() else {
                         return self
                             .invalid_datamodel(assign.span, "assign requires an expression");
                     };
-                    let expression = self.compile_luau(source, false, assign.span)?;
-                    let expression = self.builder.luau_expression(expression)?;
-                    Ok(DraftAction::Assign { data, expression })
+                    Ok(StateTreeAction::assign_at(
+                        location,
+                        source,
+                        assign.span.start,
+                    ))
                 }
                 ExecutableContent::Assign(assign) => {
                     self.unsupported(assign.span, "non-expression Luau assignment")
@@ -723,7 +696,7 @@ impl<'a> Compiler<'a> {
             .collect()
     }
 
-    fn effect(&mut self, extension: &Extension) -> Result<DraftAction, CompileError> {
+    fn effect(&mut self, extension: &Extension) -> Result<StateTreeAction, CompileError> {
         let name = extension_attribute(extension, "name")
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| self.effect_error(extension.span, "effect requires a non-empty name"))?;
@@ -786,29 +759,18 @@ impl<'a> Compiler<'a> {
                     self.effect_error(argument.span, "effect arguments require datamodel=\"luau\"")
                 );
             }
-            let expression = self.compile_luau(expression, false, argument.span)?;
-            let expression = self.builder.luau_expression(expression)?;
-            arguments.push((Box::from(argument_name), expression));
+            arguments.push(StateTreeEffectArgument::at(
+                argument_name,
+                expression,
+                argument.span.start,
+            ));
         }
 
-        Ok(DraftAction::Effect {
-            name: Box::from(name),
+        Ok(StateTreeAction::effect_at(
+            name,
             arguments,
-            span_start: extension.span.start,
-        })
-    }
-
-    fn compile_luau(
-        &self,
-        source: &str,
-        boolean: bool,
-        span: Span,
-    ) -> Result<crate::luau::CompiledLuauExpression, CompileError> {
-        compile_expression(source, boolean, span.start).map_err(|error| CompileError::InvalidLuau {
-            source_name: self.document.source_name.clone(),
-            span_start: span.start,
-            message: error.to_string(),
-        })
+            extension.span.start,
+        ))
     }
 
     fn target(&self, target: &str, span: Span) -> Result<StateId, CompileError> {
@@ -906,6 +868,25 @@ impl<'a> Compiler<'a> {
     }
 }
 
+fn builder_error(source_name: &str, error: BuildError) -> CompileError {
+    match error {
+        BuildError::InvalidLuau {
+            span_start,
+            message,
+        } => CompileError::InvalidLuau {
+            source_name: source_name.to_owned(),
+            span_start,
+            message: message.into(),
+        },
+        BuildError::UnknownDataName { name, span_start } => CompileError::InvalidDataModel {
+            source_name: source_name.to_owned(),
+            span_start,
+            message: format!("assignment location `{name}` is not declared"),
+        },
+        error => CompileError::Build(error),
+    }
+}
+
 fn extension_attribute<'a>(extension: &'a Extension, name: &str) -> Option<&'a str> {
     extension
         .attributes
@@ -919,27 +900,6 @@ fn unqualified_attribute<'a>(attributes: &'a [Attribute], name: &str) -> Option<
         .iter()
         .find(|attribute| attribute.namespace.is_none() && attribute.local_name == name)
         .map(|attribute| attribute.value.as_str())
-}
-
-fn is_luau_identifier(value: &str) -> bool {
-    const RESERVED: &[&str] = &[
-        "and", "break", "continue", "do", "else", "elseif", "end", "export", "false", "for",
-        "function", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true",
-        "type", "until", "while",
-    ];
-    let mut bytes = value.bytes();
-    bytes
-        .next()
-        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
-        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-        && !RESERVED.contains(&value)
-}
-
-fn is_scxml_system_name(value: &str) -> bool {
-    matches!(
-        value,
-        "_event" | "_sessionid" | "_name" | "_ioprocessors" | "_x" | "In"
-    )
 }
 
 fn collect_ids(children: &[RootChild], ids: &mut HashSet<String>) {

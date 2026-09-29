@@ -9,6 +9,11 @@ useful diagnostics and future integrations do not require replacing the asset
 format. The compiler accepts only behavior with production runtime semantics.
 It rejects unsupported elements instead of silently ignoring them.
 
+Every semantic construct accepted by the SCXML compiler is also available
+through `StateTreeBuilder`. Parity tests compile paired SCXML and builder
+definitions and compare their complete runtime structure after normalizing
+generated identities and source-only diagnostic offsets.
+
 ## Asset Loading
 
 Installing `StateTreePlugin` registers `.scxml` as a Bevy asset source for

@@ -137,6 +137,32 @@ fn add_generated_definition(
 }
 ```
 
+The public builder can represent every semantic construct accepted by the
+SCXML compiler. Declarative specifications preserve datamodel, transition, and
+action order while the builder compiles them into the same dense runtime form:
+
+```rust,no_run
+# use bevy_state_tree::prelude::*;
+# fn definition() -> Result<StateTreeDefinition, BuildError> {
+let mut builder = StateTreeBuilder::new("counter");
+builder.luau_datamodel([StateTreeData::new("count").with_initializer("0")])?;
+let root = builder.compound_root("root")?;
+let active = builder.atomic("active", root)?;
+let done = builder.final_state("done", root)?;
+builder.initial(root, active)?;
+builder.entry_actions(active, [StateTreeAction::raise("ready")])?;
+builder.add_transition(
+    active,
+    StateTreeTransition::on("tick")
+        .condition("count < 10")
+        .target(done)
+        .actions([StateTreeAction::assign("count", "count + 1")]),
+)?;
+let definition = builder.build()?;
+# Ok(definition)
+# }
+```
+
 Malformed XML and unsupported runtime semantics fail asset loading. Typed event
 descriptors and effects are domain-specific, so they are linked later when an
 instance initializes. A linking failure leaves the loaded definition intact and

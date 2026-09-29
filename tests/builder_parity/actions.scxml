@@ -1,0 +1,29 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree"
+       name="actions" datamodel="luau" initial="parent">
+  <datamodel><data id="value" expr="1"/></datamodel>
+  <state id="parent">
+    <initial>
+      <transition target="source">
+        <assign location="value" expr="value + 1"/>
+        <raise event="initialized"/>
+      </transition>
+    </initial>
+    <state id="source">
+      <onentry>
+        <bst:effect name="record">
+          <bst:arg name="first" expr="value"/>
+          <bst:arg name="second" expr="value * 2"/>
+        </bst:effect>
+      </onentry>
+      <onexit><raise event="source.exited"/></onexit>
+      <transition event="initialized" target="done">
+        <assign location="value" expr="value + 1"/>
+        <raise event="transition.ran"/>
+      </transition>
+    </state>
+  </state>
+  <final id="done">
+    <onentry><bst:effect name="finished"/></onentry>
+  </final>
+</scxml>

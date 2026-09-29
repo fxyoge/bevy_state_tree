@@ -1,0 +1,16 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" name="hierarchy" initial="parent">
+  <state id="parent">
+    <onentry><raise event="parent.entered"/></onentry>
+    <onexit><raise event="parent.exited"/></onexit>
+    <initial>
+      <transition target="idle"><raise event="parent.ready"/></transition>
+    </initial>
+    <state id="idle"><transition event="activate" target="regions"/></state>
+    <parallel id="regions">
+      <state id="left"><state id="left_idle"/></state>
+      <state id="right"><state id="right_idle"/></state>
+    </parallel>
+    <transition event="finish" target="done"/>
+  </state>
+  <final id="done"/>
+</scxml>

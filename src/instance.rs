@@ -1482,7 +1482,7 @@ mod tests {
     use bevy_asset::Handle;
 
     use super::*;
-    use crate::StateTreeBuilder;
+    use crate::{StateTreeBuilder, StateTreeTransition};
 
     struct TestDomain;
 
@@ -1830,13 +1830,7 @@ mod tests {
         builder.initial(nested, running).unwrap();
         builder.transition(running, "finish", done).unwrap();
         builder
-            .targetless_with_actions(
-                nested,
-                Some("done.state.nested".into()),
-                None,
-                Vec::new(),
-                None,
-            )
+            .add_transition(nested, StateTreeTransition::on("done.state.nested"))
             .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 3);

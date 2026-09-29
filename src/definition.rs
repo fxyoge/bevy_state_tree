@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -11,7 +11,10 @@ use bevy_reflect::TypePath;
 use thiserror::Error;
 
 use crate::effect::{RegisteredEffect, StateTreeEffectRegistry};
-use crate::{StateTreeDomain, StateTreeEvents, luau::CompiledLuauExpression};
+use crate::{
+    StateTreeDomain, StateTreeEvents,
+    luau::{CompiledLuauExpression, compile_expression},
+};
 
 /// A compact state identifier local to one [`StateTreeDefinition`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -449,6 +452,9 @@ struct DraftState {
     entry_actions: Vec<DraftAction>,
     exit_actions: Vec<DraftAction>,
     initial_actions: Vec<DraftAction>,
+    entry_actions_set: bool,
+    exit_actions_set: bool,
+    initial_actions_set: bool,
     transitions: Vec<DraftTransition>,
 }
 
@@ -480,6 +486,258 @@ struct DraftLuauDataModel {
     names: Vec<Box<str>>,
     initializers: Vec<Option<ExpressionId>>,
     expressions: Vec<CompiledLuauExpression>,
+}
+
+#[derive(Clone, Debug)]
+struct AuthoredExpression {
+    source: Box<str>,
+    span_start: usize,
+}
+
+/// One declaration in an instance-local Luau datamodel.
+#[derive(Clone, Debug)]
+pub struct StateTreeData {
+    name: Box<str>,
+    initializer: Option<AuthoredExpression>,
+    span_start: usize,
+}
+
+impl StateTreeData {
+    /// Declares a value initialized to Luau `nil`.
+    pub fn new(name: impl Into<Box<str>>) -> Self {
+        Self {
+            name: name.into(),
+            initializer: None,
+            span_start: 0,
+        }
+    }
+
+    /// Returns the declared datamodel name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Sets the Luau expression evaluated when an instance initializes.
+    pub fn with_initializer(mut self, expression: impl Into<Box<str>>) -> Self {
+        self.initializer = Some(AuthoredExpression {
+            source: expression.into(),
+            span_start: self.span_start,
+        });
+        self
+    }
+
+    pub(crate) fn at(mut self, span_start: usize) -> Self {
+        self.span_start = span_start;
+        if let Some(initializer) = &mut self.initializer {
+            initializer.span_start = span_start;
+        }
+        self
+    }
+
+    pub(crate) fn with_initializer_at(
+        mut self,
+        expression: impl Into<Box<str>>,
+        span_start: usize,
+    ) -> Self {
+        self.initializer = Some(AuthoredExpression {
+            source: expression.into(),
+            span_start,
+        });
+        self
+    }
+}
+
+/// One named Luau argument supplied to a typed effect.
+#[derive(Clone, Debug)]
+pub struct StateTreeEffectArgument {
+    name: Box<str>,
+    expression: AuthoredExpression,
+}
+
+impl StateTreeEffectArgument {
+    pub fn new(name: impl Into<Box<str>>, expression: impl Into<Box<str>>) -> Self {
+        Self {
+            name: name.into(),
+            expression: AuthoredExpression {
+                source: expression.into(),
+                span_start: 0,
+            },
+        }
+    }
+
+    pub(crate) fn at(
+        name: impl Into<Box<str>>,
+        expression: impl Into<Box<str>>,
+        span_start: usize,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            expression: AuthoredExpression {
+                source: expression.into(),
+                span_start,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StateTreeActionKind {
+    Raise(Box<str>),
+    Assign {
+        location: Box<str>,
+        expression: AuthoredExpression,
+    },
+    Effect {
+        name: Box<str>,
+        arguments: Vec<StateTreeEffectArgument>,
+        span_start: usize,
+    },
+}
+
+/// Declarative executable content attached to a state or transition.
+#[derive(Clone, Debug)]
+pub struct StateTreeAction {
+    kind: StateTreeActionKind,
+}
+
+impl StateTreeAction {
+    /// Raises one payload-free event on the instance's internal queue.
+    pub fn raise(event: impl Into<Box<str>>) -> Self {
+        Self {
+            kind: StateTreeActionKind::Raise(event.into()),
+        }
+    }
+
+    /// Assigns the result of a Luau expression to a declared datamodel value.
+    pub fn assign(location: impl Into<Box<str>>, expression: impl Into<Box<str>>) -> Self {
+        Self::assign_at(location, expression, 0)
+    }
+
+    /// Emits one registered typed effect after evaluating its named arguments.
+    pub fn effect(
+        name: impl Into<Box<str>>,
+        arguments: impl IntoIterator<Item = StateTreeEffectArgument>,
+    ) -> Self {
+        Self::effect_at(name, arguments, 0)
+    }
+
+    pub(crate) fn assign_at(
+        location: impl Into<Box<str>>,
+        expression: impl Into<Box<str>>,
+        span_start: usize,
+    ) -> Self {
+        Self {
+            kind: StateTreeActionKind::Assign {
+                location: location.into(),
+                expression: AuthoredExpression {
+                    source: expression.into(),
+                    span_start,
+                },
+            },
+        }
+    }
+
+    pub(crate) fn effect_at(
+        name: impl Into<Box<str>>,
+        arguments: impl IntoIterator<Item = StateTreeEffectArgument>,
+        span_start: usize,
+    ) -> Self {
+        Self {
+            kind: StateTreeActionKind::Effect {
+                name: name.into(),
+                arguments: arguments.into_iter().collect(),
+                span_start,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StateTreeTransitionTrigger {
+    EventDescriptors(Vec<Box<str>>),
+    Eventless,
+}
+
+/// A complete transition authored through [`StateTreeBuilder`].
+#[derive(Clone, Debug)]
+pub struct StateTreeTransition {
+    trigger: StateTreeTransitionTrigger,
+    condition: Option<AuthoredExpression>,
+    target: Option<StateId>,
+    actions: Vec<StateTreeAction>,
+    span_start: usize,
+}
+
+impl StateTreeTransition {
+    /// Creates a transition selected by one SCXML-style event descriptor.
+    pub fn on(event: impl Into<Box<str>>) -> Self {
+        Self::on_any([event])
+    }
+
+    /// Creates a transition selected by any of the supplied event descriptors.
+    pub fn on_any<T>(events: impl IntoIterator<Item = T>) -> Self
+    where
+        T: Into<Box<str>>,
+    {
+        Self {
+            trigger: StateTreeTransitionTrigger::EventDescriptors(
+                events.into_iter().map(Into::into).collect(),
+            ),
+            condition: None,
+            target: None,
+            actions: Vec::new(),
+            span_start: 0,
+        }
+    }
+
+    /// Creates a transition considered while the instance stabilizes.
+    pub fn eventless() -> Self {
+        Self {
+            trigger: StateTreeTransitionTrigger::Eventless,
+            condition: None,
+            target: None,
+            actions: Vec::new(),
+            span_start: 0,
+        }
+    }
+
+    /// Adds a Luau guard expression.
+    pub fn condition(mut self, expression: impl Into<Box<str>>) -> Self {
+        self.condition = Some(AuthoredExpression {
+            source: expression.into(),
+            span_start: self.span_start,
+        });
+        self
+    }
+
+    /// Sets the transition target. A transition without a target only runs actions.
+    pub fn target(mut self, target: StateId) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// Sets the transition's executable content in execution order.
+    pub fn actions(mut self, actions: impl IntoIterator<Item = StateTreeAction>) -> Self {
+        self.actions = actions.into_iter().collect();
+        self
+    }
+
+    pub(crate) fn at(mut self, span_start: usize) -> Self {
+        self.span_start = span_start;
+        self
+    }
+
+    pub(crate) fn condition_at(
+        mut self,
+        expression: impl Into<Box<str>>,
+        span_start: usize,
+    ) -> Self {
+        self.condition = Some(AuthoredExpression {
+            source: expression.into(),
+            span_start,
+        });
+        self
+    }
 }
 
 /// Builds and validates a [`StateTreeDefinition`].
@@ -586,36 +844,13 @@ impl StateTreeBuilder {
         if event.trim().is_empty() {
             return Err(BuildError::EmptyEventName);
         }
-        self.add_transition(
+        self.push_transition(
             source,
             Some(EventPattern::Exact(event)),
             None,
             Some(target),
             Vec::new(),
             None,
-        )
-    }
-
-    pub(crate) fn event_descriptor_with_actions(
-        &mut self,
-        source: StateId,
-        descriptor: impl Into<Box<str>>,
-        condition: Option<ExpressionId>,
-        target: StateId,
-        actions: Vec<DraftAction>,
-        span_start: Option<usize>,
-    ) -> Result<&mut Self, BuildError> {
-        let descriptor = descriptor.into();
-        if descriptor.trim().is_empty() {
-            return Err(BuildError::EmptyEventName);
-        }
-        self.add_transition(
-            source,
-            Some(EventPattern::Descriptor(descriptor)),
-            condition,
-            Some(target),
-            actions,
-            span_start.and_then(|span| u32::try_from(span).ok()),
         )
     }
 
@@ -626,79 +861,314 @@ impl StateTreeBuilder {
         descriptor: impl Into<Box<str>>,
         target: StateId,
     ) -> Result<&mut Self, BuildError> {
-        self.event_descriptor_with_actions(source, descriptor, None, target, Vec::new(), None)
+        self.add_transition(source, StateTreeTransition::on(descriptor).target(target))
     }
 
     /// Adds an eventless external transition.
     pub fn eventless(&mut self, source: StateId, target: StateId) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, None, Some(target), Vec::new(), None)
+        self.push_transition(source, None, None, Some(target), Vec::new(), None)
     }
 
-    pub(crate) fn eventless_with_actions(
+    /// Declares the complete ordered root Luau datamodel.
+    ///
+    /// Calling this with an empty iterator enables Luau expressions without
+    /// declaring persistent values.
+    pub fn luau_datamodel(
+        &mut self,
+        declarations: impl IntoIterator<Item = StateTreeData>,
+    ) -> Result<&mut Self, BuildError> {
+        if self.datamodel.is_some() {
+            return Err(BuildError::MultipleDataModels);
+        }
+        let declarations: Vec<_> = declarations.into_iter().collect();
+        let mut names = Vec::with_capacity(declarations.len());
+        let mut initializers = Vec::with_capacity(declarations.len());
+        let mut seen = HashSet::with_capacity(declarations.len());
+        for declaration in declarations {
+            if !is_luau_identifier(&declaration.name) {
+                return Err(BuildError::InvalidDataName {
+                    name: declaration.name,
+                    span_start: declaration.span_start,
+                    reason: "is not a Luau identifier",
+                });
+            }
+            if is_scxml_system_name(&declaration.name) {
+                return Err(BuildError::InvalidDataName {
+                    name: declaration.name,
+                    span_start: declaration.span_start,
+                    reason: "is reserved by the state-tree runtime",
+                });
+            }
+            if !seen.insert(declaration.name.clone()) {
+                return Err(BuildError::DuplicateDataName {
+                    name: declaration.name,
+                    span_start: declaration.span_start,
+                });
+            }
+            let initializer = declaration
+                .initializer
+                .map(|expression| compile_authored_expression(expression, false))
+                .transpose()?;
+            names.push(declaration.name);
+            initializers.push(initializer);
+        }
+        self.set_compiled_luau_datamodel(names, initializers)?;
+        Ok(self)
+    }
+
+    /// Adds a complete SCXML-style transition specification.
+    pub fn add_transition(
         &mut self,
         source: StateId,
-        condition: Option<ExpressionId>,
-        target: StateId,
-        actions: Vec<DraftAction>,
-        span_start: Option<usize>,
+        transition: StateTreeTransition,
     ) -> Result<&mut Self, BuildError> {
-        self.add_transition(
-            source,
-            None,
-            condition,
-            Some(target),
-            actions,
-            span_start.and_then(|span| u32::try_from(span).ok()),
-        )
-    }
+        if matches!(self.require_state(source)?.kind, DraftKind::Final) {
+            return Err(BuildError::FinalHasTransition(source));
+        }
+        if let Some(target) = transition.target {
+            self.require_state(target)?;
+        }
+        match &transition.trigger {
+            StateTreeTransitionTrigger::EventDescriptors(events) => {
+                if events.is_empty() {
+                    return Err(BuildError::MissingEventDescriptor);
+                }
+                if let Some(event) = events
+                    .iter()
+                    .find(|event| event.contains(char::is_whitespace))
+                {
+                    return Err(BuildError::InvalidEventDescriptor(event.clone()));
+                }
+                if events.iter().any(|event| event.is_empty()) {
+                    return Err(BuildError::EmptyEventName);
+                }
+            }
+            StateTreeTransitionTrigger::Eventless
+                if transition.condition.is_none() && transition.target.is_none() =>
+            {
+                return Err(BuildError::EmptyTransition);
+            }
+            StateTreeTransitionTrigger::Eventless => {}
+        }
+        let expression_checkpoint = self.expression_count();
+        let condition = transition
+            .condition
+            .map(|condition| self.register_expression(condition, true))
+            .transpose();
+        let condition = match condition {
+            Ok(condition) => condition,
+            Err(error) => {
+                self.truncate_expressions(expression_checkpoint);
+                return Err(error);
+            }
+        };
+        let actions = match self.lower_actions(transition.actions) {
+            Ok(actions) => actions,
+            Err(error) => {
+                self.truncate_expressions(expression_checkpoint);
+                return Err(error);
+            }
+        };
+        let span_start = u32::try_from(transition.span_start).ok();
 
-    pub(crate) fn targetless_with_actions(
-        &mut self,
-        source: StateId,
-        event: Option<Box<str>>,
-        condition: Option<ExpressionId>,
-        actions: Vec<DraftAction>,
-        span_start: Option<usize>,
-    ) -> Result<&mut Self, BuildError> {
-        let event = event.map(EventPattern::Descriptor);
-        self.add_transition(
-            source,
-            event,
-            condition,
-            None,
-            actions,
-            span_start.and_then(|span| u32::try_from(span).ok()),
-        )
-    }
-
-    pub(crate) fn entry_actions(
-        &mut self,
-        state: StateId,
-        actions: Vec<DraftAction>,
-    ) -> Result<&mut Self, BuildError> {
-        self.require_state_mut(state)?.entry_actions = actions;
+        match transition.trigger {
+            StateTreeTransitionTrigger::EventDescriptors(events) => {
+                for event in events {
+                    self.push_transition(
+                        source,
+                        Some(EventPattern::Descriptor(event)),
+                        condition,
+                        transition.target,
+                        actions.clone(),
+                        span_start,
+                    )?;
+                }
+            }
+            StateTreeTransitionTrigger::Eventless => {
+                self.push_transition(
+                    source,
+                    None,
+                    condition,
+                    transition.target,
+                    actions,
+                    span_start,
+                )?;
+            }
+        }
         Ok(self)
     }
 
-    pub(crate) fn exit_actions(
+    /// Sets all entry actions for a state in execution order.
+    pub fn entry_actions(
         &mut self,
         state: StateId,
-        actions: Vec<DraftAction>,
+        actions: impl IntoIterator<Item = StateTreeAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.require_state_mut(state)?.exit_actions = actions;
+        self.require_state(state)?;
+        if self.states[state.index()].entry_actions_set {
+            return Err(BuildError::ActionsAlreadySet {
+                state,
+                location: "entry",
+            });
+        }
+        let expression_checkpoint = self.expression_count();
+        let actions = match self.lower_actions(actions.into_iter().collect()) {
+            Ok(actions) => actions,
+            Err(error) => {
+                self.truncate_expressions(expression_checkpoint);
+                return Err(error);
+            }
+        };
+        self.states[state.index()].entry_actions = actions;
+        self.states[state.index()].entry_actions_set = true;
         Ok(self)
     }
 
-    pub(crate) fn initial_actions(
+    /// Sets all exit actions for a state in execution order.
+    pub fn exit_actions(
         &mut self,
         state: StateId,
-        actions: Vec<DraftAction>,
+        actions: impl IntoIterator<Item = StateTreeAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.require_state_mut(state)?.initial_actions = actions;
+        self.require_state(state)?;
+        if self.states[state.index()].exit_actions_set {
+            return Err(BuildError::ActionsAlreadySet {
+                state,
+                location: "exit",
+            });
+        }
+        let expression_checkpoint = self.expression_count();
+        let actions = match self.lower_actions(actions.into_iter().collect()) {
+            Ok(actions) => actions,
+            Err(error) => {
+                self.truncate_expressions(expression_checkpoint);
+                return Err(error);
+            }
+        };
+        self.states[state.index()].exit_actions = actions;
+        self.states[state.index()].exit_actions_set = true;
         Ok(self)
     }
 
-    pub(crate) fn set_luau_datamodel(
+    /// Sets actions run after entering a compound state and before its initial child.
+    pub fn initial_actions(
+        &mut self,
+        state: StateId,
+        actions: impl IntoIterator<Item = StateTreeAction>,
+    ) -> Result<&mut Self, BuildError> {
+        self.require_state(state)?;
+        if !matches!(self.states[state.index()].kind, DraftKind::Compound { .. }) {
+            return Err(BuildError::InitialOnNonCompound(state));
+        }
+        if self.states[state.index()].initial_actions_set {
+            return Err(BuildError::ActionsAlreadySet {
+                state,
+                location: "initial",
+            });
+        }
+        let expression_checkpoint = self.expression_count();
+        let actions = match self.lower_actions(actions.into_iter().collect()) {
+            Ok(actions) => actions,
+            Err(error) => {
+                self.truncate_expressions(expression_checkpoint);
+                return Err(error);
+            }
+        };
+        self.states[state.index()].initial_actions = actions;
+        self.states[state.index()].initial_actions_set = true;
+        Ok(self)
+    }
+
+    fn expression_count(&self) -> usize {
+        self.datamodel
+            .as_ref()
+            .map_or(0, |datamodel| datamodel.expressions.len())
+    }
+
+    fn truncate_expressions(&mut self, len: usize) {
+        if let Some(datamodel) = &mut self.datamodel {
+            datamodel.expressions.truncate(len);
+        }
+    }
+
+    fn register_expression(
+        &mut self,
+        expression: AuthoredExpression,
+        boolean: bool,
+    ) -> Result<ExpressionId, BuildError> {
+        let expression = compile_authored_expression(expression, boolean)?;
+        self.luau_expression(expression)
+    }
+
+    fn lower_actions(
+        &mut self,
+        actions: Vec<StateTreeAction>,
+    ) -> Result<Vec<DraftAction>, BuildError> {
+        let mut lowered = Vec::with_capacity(actions.len());
+        for action in actions {
+            lowered.push(match action.kind {
+                StateTreeActionKind::Raise(event) => {
+                    if event.trim().is_empty() {
+                        return Err(BuildError::EmptyEventName);
+                    }
+                    DraftAction::Raise(event)
+                }
+                StateTreeActionKind::Assign {
+                    location,
+                    expression,
+                } => {
+                    let data = self
+                        .datamodel
+                        .as_ref()
+                        .and_then(|datamodel| {
+                            datamodel.names.iter().position(|name| name == &location)
+                        })
+                        .and_then(|index| u32::try_from(index).ok())
+                        .map(DataId)
+                        .ok_or_else(|| BuildError::UnknownDataName {
+                            name: location.clone(),
+                            span_start: expression.span_start,
+                        })?;
+                    let expression = self.register_expression(expression, false)?;
+                    DraftAction::Assign { data, expression }
+                }
+                StateTreeActionKind::Effect {
+                    name,
+                    arguments,
+                    span_start,
+                } => {
+                    if name.trim().is_empty() {
+                        return Err(BuildError::EmptyEffectName);
+                    }
+                    if !arguments.is_empty() && self.datamodel.is_none() {
+                        return Err(BuildError::MissingDataModel);
+                    }
+                    let mut seen = HashSet::with_capacity(arguments.len());
+                    let mut lowered_arguments = Vec::with_capacity(arguments.len());
+                    for argument in arguments {
+                        if argument.name.trim().is_empty() {
+                            return Err(BuildError::EmptyEffectArgumentName);
+                        }
+                        if !seen.insert(argument.name.clone()) {
+                            return Err(BuildError::DuplicateEffectArgument(argument.name));
+                        }
+                        lowered_arguments.push((
+                            argument.name,
+                            self.register_expression(argument.expression, false)?,
+                        ));
+                    }
+                    DraftAction::Effect {
+                        name,
+                        arguments: lowered_arguments,
+                        span_start,
+                    }
+                }
+            });
+        }
+        Ok(lowered)
+    }
+
+    fn set_compiled_luau_datamodel(
         &mut self,
         names: Vec<Box<str>>,
         initializers: Vec<Option<CompiledLuauExpression>>,
@@ -736,7 +1206,7 @@ impl StateTreeBuilder {
         Ok(ids)
     }
 
-    pub(crate) fn luau_expression(
+    fn luau_expression(
         &mut self,
         expression: CompiledLuauExpression,
     ) -> Result<ExpressionId, BuildError> {
@@ -1087,13 +1557,16 @@ impl StateTreeBuilder {
             entry_actions: Vec::new(),
             exit_actions: Vec::new(),
             initial_actions: Vec::new(),
+            entry_actions_set: false,
+            exit_actions_set: false,
+            initial_actions_set: false,
             transitions: Vec::new(),
         });
         self.names.insert(name, id);
         Ok(id)
     }
 
-    fn add_transition(
+    fn push_transition(
         &mut self,
         source: StateId,
         event: Option<EventPattern>,
@@ -1378,6 +1851,39 @@ fn append_entry_configuration(
     }
 }
 
+fn compile_authored_expression(
+    expression: AuthoredExpression,
+    boolean: bool,
+) -> Result<CompiledLuauExpression, BuildError> {
+    compile_expression(&expression.source, boolean, expression.span_start).map_err(|error| {
+        BuildError::InvalidLuau {
+            span_start: expression.span_start,
+            message: error.to_string().into(),
+        }
+    })
+}
+
+pub(crate) fn is_luau_identifier(value: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "and", "break", "continue", "do", "else", "elseif", "end", "export", "false", "for",
+        "function", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true",
+        "type", "until", "while",
+    ];
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        && !RESERVED.contains(&value)
+}
+
+pub(crate) fn is_scxml_system_name(value: &str) -> bool {
+    matches!(
+        value,
+        "_event" | "_sessionid" | "_name" | "_ioprocessors" | "_x" | "In"
+    )
+}
+
 /// A state-tree definition validation error.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum BuildError {
@@ -1421,6 +1927,38 @@ pub enum BuildError {
     MultipleDataModels,
     #[error("a Luau expression requires a datamodel")]
     MissingDataModel,
+    #[error("invalid Luau expression at byte {span_start}: {message}")]
+    InvalidLuau {
+        span_start: usize,
+        message: Box<str>,
+    },
+    #[error("data name `{name}` {reason} at byte {span_start}")]
+    InvalidDataName {
+        name: Box<str>,
+        span_start: usize,
+        reason: &'static str,
+    },
+    #[error("data name `{name}` is duplicated at byte {span_start}")]
+    DuplicateDataName { name: Box<str>, span_start: usize },
+    #[error("assignment location `{name}` is not declared at byte {span_start}")]
+    UnknownDataName { name: Box<str>, span_start: usize },
+    #[error("a transition must contain at least one event descriptor")]
+    MissingEventDescriptor,
+    #[error("event descriptor `{0}` must contain exactly one token")]
+    InvalidEventDescriptor(Box<str>),
+    #[error("an eventless transition requires a condition or target")]
+    EmptyTransition,
+    #[error("an effect name cannot be empty")]
+    EmptyEffectName,
+    #[error("an effect argument name cannot be empty")]
+    EmptyEffectArgumentName,
+    #[error("effect argument `{0}` is duplicated")]
+    DuplicateEffectArgument(Box<str>),
+    #[error("{location} actions are already set for state {state:?}")]
+    ActionsAlreadySet {
+        state: StateId,
+        location: &'static str,
+    },
     #[error("a definition cannot contain more than u32::MAX data items")]
     TooManyDataItems,
     #[error("a definition cannot contain more than u32::MAX expressions")]
@@ -1429,6 +1967,239 @@ pub enum BuildError {
     TooManyEffects,
     #[error("a definition cannot contain more than u32::MAX effect arguments")]
     TooManyEffectArguments,
+}
+
+#[cfg(test)]
+// The parity projection omits only process-local identities and source offsets.
+// It intentionally has no per-test configuration or field exclusions.
+#[derive(Debug, Eq, PartialEq)]
+struct DefinitionSemantics {
+    name: Box<str>,
+    root: u32,
+    states: Vec<StateSemantics>,
+    children: Vec<u32>,
+    transition_entries: Vec<EntrySemantics>,
+    transition_actions: Vec<ActionSemantics>,
+    effect_arguments: Vec<(Arc<str>, ExpressionId)>,
+    initial_entries: Vec<EntrySemantics>,
+    max_depth: usize,
+    max_active: usize,
+    has_parallel: bool,
+    datamodel: Option<DataModelSemantics>,
+    events: Vec<EventPattern>,
+    event_requirements: Vec<EventId>,
+    internal_events: Vec<EventId>,
+    effects: Vec<Box<str>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct StateSemantics {
+    name: Box<str>,
+    parent: Option<u32>,
+    depth: u32,
+    document_order: u32,
+    kind: StateKindSemantics,
+    child_start: u32,
+    child_len: u32,
+    entry_actions: Vec<ActionSemantics>,
+    exit_actions: Vec<ActionSemantics>,
+    initial_actions: Vec<ActionSemantics>,
+    transitions: Vec<TransitionSemantics>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+enum StateKindSemantics {
+    Atomic,
+    Compound { initial: u32, completion: EventId },
+    Parallel { completion: EventId },
+    Final,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct TransitionSemantics {
+    event: Option<EventId>,
+    condition: Option<ExpressionId>,
+    target: Option<u32>,
+    domain: Option<u32>,
+    exit_depth: u32,
+    entry_start: u32,
+    entry_len: u32,
+    action_start: u32,
+    action_len: u32,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct EntrySemantics {
+    state: u32,
+    take_initial: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+enum ActionSemantics {
+    Raise(EventId),
+    Assign {
+        data: DataId,
+        expression: ExpressionId,
+    },
+    Effect {
+        effect: EffectId,
+        argument_start: u32,
+        argument_len: u32,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct DataModelSemantics {
+    names: Vec<Box<str>>,
+    initializers: Vec<Option<ExpressionId>>,
+    expressions: Vec<ExpressionSemantics>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct ExpressionSemantics {
+    bytecode: Box<[u8]>,
+    reads_event_data: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn assert_definition_semantics_eq(
+    actual: &StateTreeDefinition,
+    expected: &StateTreeDefinition,
+) {
+    assert_eq!(definition_semantics(actual), definition_semantics(expected));
+}
+
+#[cfg(test)]
+fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics {
+    let compiled = &definition.compiled;
+    DefinitionSemantics {
+        name: compiled.name.clone(),
+        root: compiled.root.index,
+        states: compiled
+            .states
+            .iter()
+            .map(|state| StateSemantics {
+                name: state.name.clone(),
+                parent: state.parent.map(|state| state.index),
+                depth: state.depth,
+                document_order: state.document_order,
+                kind: match state.kind {
+                    StateKind::Atomic => StateKindSemantics::Atomic,
+                    StateKind::Compound {
+                        initial,
+                        completion,
+                    } => StateKindSemantics::Compound {
+                        initial: initial.index,
+                        completion,
+                    },
+                    StateKind::Parallel { completion } => {
+                        StateKindSemantics::Parallel { completion }
+                    }
+                    StateKind::Final => StateKindSemantics::Final,
+                },
+                child_start: state.child_start,
+                child_len: state.child_len,
+                entry_actions: state.entry_actions.iter().map(action_semantics).collect(),
+                exit_actions: state.exit_actions.iter().map(action_semantics).collect(),
+                initial_actions: state.initial_actions.iter().map(action_semantics).collect(),
+                transitions: state
+                    .transitions
+                    .iter()
+                    .map(|transition| TransitionSemantics {
+                        event: transition.event,
+                        condition: transition.condition,
+                        target: transition.target.map(|state| state.index),
+                        domain: transition.domain.map(|state| state.index),
+                        exit_depth: transition.exit_depth,
+                        entry_start: transition.entry_start,
+                        entry_len: transition.entry_len,
+                        action_start: transition.action_start,
+                        action_len: transition.action_len,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        children: compiled.children.iter().map(|state| state.index).collect(),
+        transition_entries: compiled
+            .transition_entries
+            .iter()
+            .map(entry_semantics)
+            .collect(),
+        transition_actions: compiled
+            .transition_actions
+            .iter()
+            .map(action_semantics)
+            .collect(),
+        effect_arguments: compiled
+            .effect_arguments
+            .iter()
+            .map(|argument| (Arc::clone(&argument.name), argument.expression))
+            .collect(),
+        initial_entries: compiled
+            .initial_entries
+            .iter()
+            .map(entry_semantics)
+            .collect(),
+        max_depth: compiled.max_depth,
+        max_active: compiled.max_active,
+        has_parallel: compiled.has_parallel,
+        datamodel: compiled
+            .datamodel
+            .as_ref()
+            .map(|datamodel| DataModelSemantics {
+                names: datamodel.names.to_vec(),
+                initializers: datamodel.initializers.to_vec(),
+                expressions: datamodel
+                    .expressions
+                    .iter()
+                    .map(|expression| ExpressionSemantics {
+                        bytecode: expression.bytecode.clone(),
+                        reads_event_data: expression.reads_event_data,
+                    })
+                    .collect(),
+            }),
+        events: compiled.events.to_vec(),
+        event_requirements: compiled
+            .event_requirements
+            .iter()
+            .map(|requirement| requirement.event)
+            .collect(),
+        internal_events: compiled.internal_events.to_vec(),
+        effects: compiled.effects.to_vec(),
+    }
+}
+
+#[cfg(test)]
+fn action_semantics(action: &Action) -> ActionSemantics {
+    match *action {
+        Action::Raise(event) => ActionSemantics::Raise(event),
+        Action::Assign { data, expression } => ActionSemantics::Assign { data, expression },
+        Action::Effect {
+            effect,
+            argument_start,
+            argument_len,
+            ..
+        } => ActionSemantics::Effect {
+            effect,
+            argument_start,
+            argument_len,
+        },
+    }
+}
+
+#[cfg(test)]
+fn entry_semantics(entry: &Entry) -> EntrySemantics {
+    EntrySemantics {
+        state: entry.state.index,
+        take_initial: entry.take_initial,
+    }
 }
 
 #[cfg(test)]
@@ -1527,6 +2298,70 @@ mod tests {
         assert_eq!(
             builder.transition(source, "  ", target).unwrap_err(),
             BuildError::EmptyEventName
+        );
+        assert_eq!(
+            builder
+                .add_transition(
+                    source,
+                    StateTreeTransition::on("advance fast").target(target),
+                )
+                .unwrap_err(),
+            BuildError::InvalidEventDescriptor("advance fast".into())
+        );
+    }
+
+    #[test]
+    fn rejects_luau_keywords_and_system_data_names() {
+        for name in ["if", "true", "_event", "_x", "In"] {
+            let mut builder = StateTreeBuilder::new("invalid-data");
+            assert!(builder.luau_datamodel([StateTreeData::new(name)]).is_err());
+        }
+    }
+
+    #[test]
+    fn rejected_transition_does_not_retain_expressions() {
+        fn definition(after_rejection: bool) -> StateTreeDefinition {
+            let mut builder = StateTreeBuilder::new("transactional");
+            builder.luau_datamodel([]).unwrap();
+            let root = builder.compound_root("root").unwrap();
+            let state = builder.atomic("state", root).unwrap();
+            builder.initial(root, state).unwrap();
+            if after_rejection {
+                assert_eq!(
+                    builder
+                        .add_transition(
+                            state,
+                            StateTreeTransition::on_any(std::iter::empty::<&str>())
+                                .condition("true"),
+                        )
+                        .unwrap_err(),
+                    BuildError::MissingEventDescriptor
+                );
+            }
+            builder
+                .add_transition(state, StateTreeTransition::eventless().condition("false"))
+                .unwrap();
+            builder.build().unwrap()
+        }
+
+        assert_definition_semantics_eq(&definition(true), &definition(false));
+    }
+
+    #[test]
+    fn action_lists_can_only_be_set_once() {
+        let mut builder = StateTreeBuilder::new("actions");
+        let root = builder.compound_root("root").unwrap();
+        let state = builder.atomic("state", root).unwrap();
+        builder.entry_actions(state, []).unwrap();
+
+        assert_eq!(
+            builder
+                .entry_actions(state, [StateTreeAction::raise("again")])
+                .unwrap_err(),
+            BuildError::ActionsAlreadySet {
+                state,
+                location: "entry"
+            }
         );
     }
 

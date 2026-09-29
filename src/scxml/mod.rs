@@ -8,6 +8,8 @@ mod analysis;
 mod ast;
 mod compile;
 mod loader;
+#[cfg(test)]
+mod parity_tests;
 mod parse;
 
 pub(crate) use loader::ScxmlLoader;
