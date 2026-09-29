@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree" datamodel="luau">
+  <state id="idle">
+    <onentry>
+      <bst:effect name="publish">
+        <bst:arg name="amount" expr="7"/>
+      </bst:effect>
+    </onentry>
+  </state>
+</scxml>

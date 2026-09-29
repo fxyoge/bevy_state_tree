@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use bevy_app::{App, TaskPoolPlugin};
-use bevy_asset::{AssetPlugin, Assets};
+use bevy_asset::{AssetPlugin, AssetServer, Assets, Handle, LoadState};
 use bevy_ecs::{
     event::{EntityEvent, Event},
     message::{Message, Messages},
@@ -11,28 +11,13 @@ use bevy_ecs::{
 };
 use bevy_state_tree::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeAppExt, StateTreeBuilder,
-    StateTreeDefinition, StateTreeEvents, StateTreeInstance, StateTreePlugin, StateTreeSet, scxml,
+    StateTreeDefinition, StateTreeEvents, StateTreeInstance, StateTreePlugin, StateTreeSet,
 };
 
-const TOGGLE: &str = include_str!("../../tests/scxml/benchmark_toggle.scxml");
-const LUAU: &str = include_str!("../../tests/scxml/benchmark_luau.scxml");
-const PARALLEL: &str = include_str!("../../tests/scxml/benchmark_parallel.scxml");
-const EFFECT: &str = r#"
-<scxml xmlns="http://www.w3.org/2005/07/scxml"
-       xmlns:bst="urn:bevy-state-tree" datamodel="luau">
-  <datamodel><data id="amount" expr="1"/></datamodel>
-  <state id="left">
-    <transition event="tick" target="right">
-      <bst:effect name="benchmark"><bst:arg name="amount" expr="amount"/></bst:effect>
-    </transition>
-  </state>
-  <state id="right">
-    <transition event="tick" target="left">
-      <bst:effect name="benchmark"><bst:arg name="amount" expr="amount"/></bst:effect>
-    </transition>
-  </state>
-</scxml>
-"#;
+const TOGGLE: &str = "tests/scxml/benchmark_toggle.scxml";
+const LUAU: &str = "tests/scxml/benchmark_luau.scxml";
+const PARALLEL: &str = "tests/scxml/benchmark_parallel.scxml";
+const EFFECT: &str = "benches/assets/benchmark_effect.scxml";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ScheduleLabel)]
 pub struct AiUpdate;
@@ -70,6 +55,11 @@ pub enum Executor {
     SingleThreaded,
 }
 
+pub enum BenchmarkDefinition {
+    Asset(&'static str),
+    Generated(StateTreeDefinition),
+}
+
 #[derive(Resource)]
 struct TargetCount(usize);
 
@@ -86,29 +76,37 @@ pub struct BenchmarkApp {
 }
 
 impl BenchmarkApp {
-    pub fn empty(definition: StateTreeDefinition, executor: Executor) -> Self {
+    pub fn empty(definition: BenchmarkDefinition, executor: Executor) -> Self {
         let mut app = App::new();
-        if matches!(executor, Executor::Parallel) {
-            app.add_plugins(TaskPoolPlugin::default());
-        }
-        app.add_plugins(AssetPlugin::default())
-            .init_schedule(AiUpdate)
-            .add_plugins(StateTreePlugin::<Simulation>::new(AiUpdate))
-            .insert_resource(QueuedEvent::None)
-            .add_systems(
-                AiUpdate,
-                queue_configured_event.in_set(StateTreeSet::QueueEvents),
-            );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin {
+                file_path: env!("CARGO_MANIFEST_DIR").into(),
+                watch_for_changes_override: Some(false),
+                use_asset_processor_override: Some(false),
+                ..Default::default()
+            },
+        ))
+        .init_schedule(AiUpdate)
+        .add_plugins(StateTreePlugin::<Simulation>::new(AiUpdate))
+        .insert_resource(QueuedEvent::None)
+        .add_systems(
+            AiUpdate,
+            queue_configured_event.in_set(StateTreeSet::QueueEvents),
+        );
         if matches!(executor, Executor::SingleThreaded) {
             app.edit_schedule(AiUpdate, |schedule| {
                 schedule.set_executor(SingleThreadedExecutor::new());
             });
         }
 
-        let handle = app
-            .world_mut()
-            .resource_mut::<Assets<StateTreeDefinition>>()
-            .add(definition);
+        let handle = match definition {
+            BenchmarkDefinition::Asset(path) => load_definition(&mut app, path),
+            BenchmarkDefinition::Generated(definition) => app
+                .world_mut()
+                .resource_mut::<Assets<StateTreeDefinition>>()
+                .add(definition),
+        };
         app.insert_resource(TargetCount(0));
         Self {
             app,
@@ -116,7 +114,7 @@ impl BenchmarkApp {
         }
     }
 
-    pub fn pending(definition: StateTreeDefinition, instances: usize, executor: Executor) -> Self {
+    pub fn pending(definition: BenchmarkDefinition, instances: usize, executor: Executor) -> Self {
         let mut benchmark = Self::empty(definition, executor);
         benchmark.spawn_instances(instances);
         benchmark
@@ -148,7 +146,7 @@ impl BenchmarkApp {
     }
 
     pub fn initialized(
-        definition: StateTreeDefinition,
+        definition: BenchmarkDefinition,
         instances: usize,
         executor: Executor,
     ) -> Self {
@@ -183,6 +181,26 @@ impl BenchmarkApp {
             .run_system_once(queue_entity_ticks)
             .expect("benchmark event system should run");
     }
+}
+
+fn load_definition(app: &mut App, path: &'static str) -> Handle<StateTreeDefinition> {
+    let handle = app
+        .world()
+        .resource::<AssetServer>()
+        .load::<StateTreeDefinition>(path);
+    for _ in 0..1_000 {
+        app.update();
+        match app
+            .world()
+            .resource::<AssetServer>()
+            .load_state(handle.id())
+        {
+            LoadState::Loaded => return handle,
+            LoadState::Failed(error) => panic!("failed to load benchmark definition: {error}"),
+            LoadState::NotLoaded | LoadState::Loading => std::thread::yield_now(),
+        }
+    }
+    panic!("timed out loading benchmark definition `{path}`");
 }
 
 fn queue_broadcast_tick(mut events: BroadcastStateTreeEventWriter<Simulation>) {
@@ -226,27 +244,27 @@ fn clear_benchmark_effects(mut effects: ResMut<Messages<BenchmarkEffect>>) {
     effects.clear();
 }
 
-pub fn toggle_definition() -> StateTreeDefinition {
-    compile("benchmark_toggle.scxml", TOGGLE)
+pub fn toggle_definition() -> BenchmarkDefinition {
+    BenchmarkDefinition::Asset(TOGGLE)
 }
 
-pub fn luau_definition() -> StateTreeDefinition {
-    compile("benchmark_luau.scxml", LUAU)
+pub fn luau_definition() -> BenchmarkDefinition {
+    BenchmarkDefinition::Asset(LUAU)
 }
 
-pub fn parallel_definition() -> StateTreeDefinition {
-    compile("benchmark_parallel.scxml", PARALLEL)
+pub fn parallel_definition() -> BenchmarkDefinition {
+    BenchmarkDefinition::Asset(PARALLEL)
 }
 
-pub fn effect_definition() -> StateTreeDefinition {
-    compile("benchmark_effect.scxml", EFFECT)
+pub fn effect_definition() -> BenchmarkDefinition {
+    BenchmarkDefinition::Asset(EFFECT)
 }
 
-pub fn entity_toggle_definition() -> StateTreeDefinition {
-    toggle_builder("entity-toggle", "tick.entity")
+pub fn entity_toggle_definition() -> BenchmarkDefinition {
+    BenchmarkDefinition::Generated(toggle_builder("entity-toggle", "tick.entity"))
 }
 
-pub fn deep_definition(depth: usize) -> StateTreeDefinition {
+pub fn deep_definition(depth: usize) -> BenchmarkDefinition {
     assert!(depth > 0);
     let mut builder = StateTreeBuilder::new(format!("depth-{depth}"));
     let root = builder.compound_root("root").unwrap();
@@ -255,10 +273,10 @@ pub fn deep_definition(depth: usize) -> StateTreeDefinition {
     builder.initial(root, left.0).unwrap();
     builder.transition(left.1, "tick", right.1).unwrap();
     builder.transition(right.1, "tick", left.1).unwrap();
-    builder.build().unwrap()
+    BenchmarkDefinition::Generated(builder.build().unwrap())
 }
 
-pub fn wide_parallel_definition(regions: usize) -> StateTreeDefinition {
+pub fn wide_parallel_definition(regions: usize) -> BenchmarkDefinition {
     assert!(regions > 0);
     let mut builder = StateTreeBuilder::new(format!("parallel-{regions}"));
     let root = builder.compound_root("root").unwrap();
@@ -278,10 +296,10 @@ pub fn wide_parallel_definition(regions: usize) -> StateTreeDefinition {
         builder.transition(left, "tick", right).unwrap();
         builder.transition(right, "tick", left).unwrap();
     }
-    builder.build().unwrap()
+    BenchmarkDefinition::Generated(builder.build().unwrap())
 }
 
-pub fn transition_scan_definition(candidates: usize) -> StateTreeDefinition {
+pub fn transition_scan_definition(candidates: usize) -> BenchmarkDefinition {
     let mut builder = StateTreeBuilder::new(format!("transition-scan-{candidates}"));
     let root = builder.compound_root("root").unwrap();
     let left = builder.atomic("left", root).unwrap();
@@ -293,7 +311,7 @@ pub fn transition_scan_definition(candidates: usize) -> StateTreeDefinition {
     }
     builder.transition(left, "tick", right).unwrap();
     builder.transition(right, "tick", left).unwrap();
-    builder.build().unwrap()
+    BenchmarkDefinition::Generated(builder.build().unwrap())
 }
 
 fn toggle_builder(name: &str, event: &str) -> StateTreeDefinition {
@@ -331,9 +349,4 @@ fn add_branch(
         parent = child;
     }
     (top, parent)
-}
-
-fn compile(name: &str, source: &str) -> StateTreeDefinition {
-    let document = scxml::parse(name, source).unwrap();
-    scxml::compile(&document).unwrap()
 }

@@ -556,7 +556,7 @@ fn process_external_event<D: StateTreeDomain>(
 #[cfg(test)]
 mod tests {
     use bevy_app::{App, TaskPoolPlugin, Update};
-    use bevy_asset::{AssetPlugin, Assets};
+    use bevy_asset::{AssetPlugin, AssetServer, Assets};
     use bevy_ecs::{
         event::{EntityEvent, Event},
         message::{Message, MessageReader},
@@ -568,7 +568,7 @@ mod tests {
     use super::*;
     use crate::{
         InstanceStatus, StateTreeAppExt, StateTreeBuilder, StateTreeEffectError,
-        StateTreeEventPayload, StateTreeEvents, scxml,
+        StateTreeEventPayload, StateTreeEvents,
     };
 
     struct Simulation;
@@ -655,23 +655,30 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((
             TaskPoolPlugin::default(),
-            AssetPlugin::default(),
+            AssetPlugin {
+                file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets").into(),
+                watch_for_changes_override: Some(false),
+                use_asset_processor_override: Some(false),
+                ..Default::default()
+            },
             StateTreePlugin::<Simulation>::new(Update),
         ));
         app
     }
 
+    fn update_until(app: &mut App, expectation: &str, predicate: impl Fn(&App) -> bool) {
+        for _ in 0..1_000 {
+            app.update();
+            if predicate(app) {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("timed out waiting for {expectation}");
+    }
+
     #[test]
     fn typed_effects_publish_concrete_messages_before_handle_effects() {
-        let source = format!(
-            r#"<scxml xmlns="{}" xmlns:bst="{}" datamodel="luau">
-                <state id="idle"><onentry><bst:effect name="publish"><bst:arg name="amount" expr="7"/></bst:effect></onentry></state>
-            </scxml>"#,
-            scxml::SCXML_NAMESPACE,
-            scxml::BEVY_STATE_TREE_NAMESPACE,
-        );
-        let document = scxml::parse("effect.scxml", &source).unwrap();
-        let definition = scxml::compile(&document).unwrap();
         let mut app = app();
         app.register_state_tree_effect::<Simulation, EffectPublished, _>(
             "publish",
@@ -686,16 +693,15 @@ mod tests {
         )
         .init_resource::<PublishedEffects>()
         .add_systems(Update, collect_effects.in_set(StateTreeSet::HandleEffects));
-        let handle = app
-            .world_mut()
-            .resource_mut::<Assets<StateTreeDefinition>>()
-            .add(definition);
+        let handle = app.world().resource::<AssetServer>().load("effect.scxml");
         let entity = app
             .world_mut()
             .spawn(StateTreeInstance::<Simulation>::new(handle))
             .id();
 
-        app.update();
+        update_until(&mut app, "the entry effect", |app| {
+            !app.world().resource::<PublishedEffects>().0.is_empty()
+        });
 
         assert_eq!(app.world().resource::<PublishedEffects>().0, [(entity, 7)]);
     }
@@ -761,24 +767,18 @@ mod tests {
 
     #[test]
     fn missing_effect_registration_is_a_recoverable_link_failure() {
-        let source = format!(
-            r#"<scxml xmlns="{}" xmlns:bst="{}"><state id="idle"><onentry><bst:effect name="publish"/></onentry></state></scxml>"#,
-            scxml::SCXML_NAMESPACE,
-            scxml::BEVY_STATE_TREE_NAMESPACE,
-        );
-        let document = scxml::parse("effect.scxml", &source).unwrap();
-        let definition = scxml::compile(&document).unwrap();
         let mut app = app();
-        let handle = app
-            .world_mut()
-            .resource_mut::<Assets<StateTreeDefinition>>()
-            .add(definition);
+        let handle = app.world().resource::<AssetServer>().load("effect.scxml");
         let entity = app
             .world_mut()
             .spawn(StateTreeInstance::<Simulation>::new(handle))
             .id();
 
-        app.update();
+        update_until(&mut app, "the effect link failure", |app| {
+            app.world()
+                .get::<StateTreeLinkFailure<Simulation>>(entity)
+                .is_some()
+        });
 
         assert!(matches!(
             &app.world()
@@ -793,10 +793,10 @@ mod tests {
 
         app.register_state_tree_effect::<Simulation, EffectPublished, _>(
             "publish",
-            |context, _arguments| {
+            |context, arguments| {
                 Ok(EffectPublished {
                     entity: context.entity().unwrap(),
-                    amount: 0,
+                    amount: arguments.take("amount")?,
                 })
             },
         );

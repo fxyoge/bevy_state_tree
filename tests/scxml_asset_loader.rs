@@ -1,10 +1,5 @@
-use std::path::Path;
-
 use bevy_app::{App, TaskPoolPlugin};
-use bevy_asset::{
-    AssetApp, AssetPlugin, AssetServer, Assets, LoadState,
-    io::{AssetSourceBuilder, AssetSourceId, memory::Dir, memory::MemoryAssetReader},
-};
+use bevy_asset::{AssetPlugin, AssetServer, Assets, LoadState};
 use bevy_ecs::schedule::ScheduleLabel;
 use bevy_state_tree::prelude::*;
 
@@ -27,25 +22,12 @@ impl StateTreeDomain for TestDomain {
     type Event = TestEvents;
 }
 
-fn test_app(sources: &[(&str, &str)]) -> App {
-    let directory = Dir::default();
-    for (path, source) in sources {
-        directory.insert_asset_text(Path::new(path), source);
-    }
-    let reader_directory = directory.clone();
-
+fn test_app() -> App {
     let mut app = App::new();
-    app.register_asset_source(
-        AssetSourceId::Default,
-        AssetSourceBuilder::new(move || {
-            Box::new(MemoryAssetReader {
-                root: reader_directory.clone(),
-            })
-        }),
-    )
-    .add_plugins((
+    app.add_plugins((
         TaskPoolPlugin::default(),
         AssetPlugin {
+            file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets").into(),
             watch_for_changes_override: Some(false),
             use_asset_processor_override: Some(false),
             ..Default::default()
@@ -64,12 +46,7 @@ fn update(app: &mut App) {
 
 #[test]
 fn plugin_loads_scxml_assets_and_initializes_instances() {
-    let mut app = test_app(&[(
-        "loaded.scxml",
-        r#"<scxml xmlns="http://www.w3.org/2005/07/scxml" name="loaded">
-  <state id="idle"/>
-</scxml>"#,
-    )]);
+    let mut app = test_app();
     let handle = app
         .world()
         .resource::<AssetServer>()
@@ -108,18 +85,7 @@ fn plugin_loads_scxml_assets_and_initializes_instances() {
 
 #[test]
 fn parser_and_compiler_errors_fail_asset_loading() {
-    let mut app = test_app(&[
-        (
-            "invalid.scxml",
-            r#"<scxml xmlns="http://www.w3.org/2005/07/scxml"><state>"#,
-        ),
-        (
-            "unsupported.scxml",
-            r#"<scxml xmlns="http://www.w3.org/2005/07/scxml">
-  <state id="parent"><history id="recent"/></state>
-</scxml>"#,
-        ),
-    ]);
+    let mut app = test_app();
     let invalid = app
         .world()
         .resource::<AssetServer>()
@@ -157,15 +123,7 @@ fn parser_and_compiler_errors_fail_asset_loading() {
 
 #[test]
 fn event_protocol_linking_remains_deferred_until_initialization() {
-    let mut app = test_app(&[(
-        "unlinked.scxml",
-        r#"<scxml xmlns="http://www.w3.org/2005/07/scxml">
-  <state id="idle">
-    <transition event="missing" target="done"/>
-  </state>
-  <final id="done"/>
-</scxml>"#,
-    )]);
+    let mut app = test_app();
     let handle = app
         .world()
         .resource::<AssetServer>()

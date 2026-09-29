@@ -3,7 +3,7 @@ mod support;
 use std::cell::RefCell;
 
 use divan::{Bencher, counter::ItemsCount};
-use support::{BenchmarkApp, Executor};
+use support::{BenchmarkApp, BenchmarkDefinition, Executor};
 
 fn main() {
     divan::main();
@@ -12,7 +12,7 @@ fn main() {
 fn process_broadcast(
     bencher: Bencher<'_, '_>,
     instances: usize,
-    definition: impl Fn() -> bevy_state_tree::StateTreeDefinition,
+    definition: impl Fn() -> BenchmarkDefinition,
 ) {
     let benchmark = RefCell::new(BenchmarkApp::initialized(
         definition(),

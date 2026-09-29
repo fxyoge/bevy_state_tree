@@ -1,7 +1,7 @@
 mod support;
 
 use divan::{AllocProfiler, Bencher, counter::ItemsCount};
-use support::{BenchmarkApp, Executor};
+use support::{BenchmarkApp, BenchmarkDefinition, Executor};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -13,7 +13,7 @@ fn main() {
 fn profile_processing(
     bencher: Bencher<'_, '_>,
     instances: usize,
-    definition: impl Fn() -> bevy_state_tree::StateTreeDefinition,
+    definition: impl Fn() -> BenchmarkDefinition,
 ) {
     bencher
         .counter(ItemsCount::new(instances))
@@ -50,7 +50,7 @@ fn profile_effect_processing(bencher: Bencher<'_, '_>, instances: usize) {
 fn profile_initialization(
     bencher: Bencher<'_, '_>,
     instances: usize,
-    definition: impl Fn() -> bevy_state_tree::StateTreeDefinition,
+    definition: impl Fn() -> BenchmarkDefinition,
 ) {
     bencher
         .counter(ItemsCount::new(instances))
@@ -64,7 +64,7 @@ fn profile_initialization(
 fn profile_spawn_and_initialization(
     bencher: Bencher<'_, '_>,
     instances: usize,
-    definition: impl Fn() -> bevy_state_tree::StateTreeDefinition,
+    definition: impl Fn() -> BenchmarkDefinition,
 ) {
     bencher
         .counter(ItemsCount::new(instances))
