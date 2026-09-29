@@ -17,6 +17,7 @@ bevy_ecs = { version = "0.19.1", features = ["multi_threaded"] }
 bevy_reflect = "0.19.1"
 bevy_tasks = "0.19.1"
 bevy_state_tree_macros = { version = "0.1.0", path = "macros" }
+full_moon = { version = "2.2.0", features = ["luau"] }
 mlua = { version = "0.11", features = ["luau", "vendored"] }
 quick-xml = "0.41"
 thiserror = "2.0"

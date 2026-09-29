@@ -5,6 +5,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use full_moon::{
+    ast::{Expression, FunctionCall, Index, Prefix, Suffix, Var, VarExpression},
+    tokenizer::{TokenReference, TokenType},
+    visitors::Visitor,
+};
 use mlua::{ChunkMode, Compiler, Error, Function, Lua, Table, Value};
 
 const FUNCTION_CACHE_CAPACITY: usize = 256;
@@ -44,13 +49,94 @@ pub(crate) fn compile_expression(
     } else {
         format!("return ({expression})")
     };
-    let bytecode = Compiler::new().compile(source)?;
+    let bytecode = Compiler::new().compile(&source)?;
+    let reads_event_data = reads_event_data(&source)?;
     Ok(CompiledLuauExpression {
         identity: NEXT_EXPRESSION_ID.fetch_add(1, Ordering::Relaxed),
         bytecode: bytecode.into_boxed_slice(),
         span_start,
-        reads_event_data: expression.contains("_event.data"),
+        reads_event_data,
     })
+}
+
+fn reads_event_data(source: &str) -> Result<bool, Error> {
+    let ast = full_moon::parse(source).map_err(|errors| Error::SyntaxError {
+        message: errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
+        incomplete_input: false,
+    })?;
+    let mut visitor = EventDataVisitor::default();
+    visitor.visit_ast(&ast);
+    Ok(visitor.found)
+}
+
+#[derive(Default)]
+struct EventDataVisitor {
+    found: bool,
+}
+
+impl EventDataVisitor {
+    fn inspect<'a>(&mut self, prefix: &Prefix, mut suffixes: impl Iterator<Item = &'a Suffix>) {
+        if !self.found && is_event_prefix(prefix) {
+            self.found = suffixes.next().is_some_and(is_data_index);
+        }
+    }
+}
+
+impl Visitor for EventDataVisitor {
+    fn visit_var_expression(&mut self, expression: &VarExpression) {
+        self.inspect(expression.prefix(), expression.suffixes());
+    }
+
+    fn visit_function_call(&mut self, expression: &FunctionCall) {
+        self.inspect(expression.prefix(), expression.suffixes());
+    }
+}
+
+fn is_event_prefix(prefix: &Prefix) -> bool {
+    match prefix {
+        Prefix::Name(name) => is_identifier(name, "_event"),
+        Prefix::Expression(expression) => is_event_expression(expression),
+        _ => false,
+    }
+}
+
+fn is_event_expression(expression: &Expression) -> bool {
+    match expression {
+        Expression::Parentheses { expression, .. }
+        | Expression::TypeAssertion { expression, .. } => is_event_expression(expression),
+        Expression::Var(Var::Name(name)) => is_identifier(name, "_event"),
+        _ => false,
+    }
+}
+
+fn is_data_index(suffix: &Suffix) -> bool {
+    let Suffix::Index(index) = suffix else {
+        return false;
+    };
+    match index {
+        Index::Dot { name, .. } => is_identifier(name, "data"),
+        Index::Brackets { expression, .. } => match expression {
+            Expression::String(value) => match value.token().token_type() {
+                TokenType::StringLiteral { literal, .. } => {
+                    literal.as_str() == "data" || literal.contains('\\')
+                }
+                _ => true,
+            },
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+fn is_identifier(token: &TokenReference, expected: &str) -> bool {
+    matches!(
+        token.token().token_type(),
+        TokenType::Identifier { identifier } if identifier.as_str() == expected
+    )
 }
 
 thread_local! {
@@ -331,6 +417,38 @@ mod tests {
                 ),
             ]))
         );
+    }
+
+    #[test]
+    fn detects_event_data_access_from_luau_syntax() {
+        for source in [
+            "_event.data",
+            "_event . data.amount",
+            "_event[\"data\"]",
+            "_event['data']",
+            "_event[key]",
+            "(_event).data",
+            "(_event :: any).data",
+            "_event-- comment\n.data",
+        ] {
+            let expression = compile_expression(source, false, 0).unwrap();
+            assert!(expression.reads_event_data, "missed {source:?}");
+        }
+    }
+
+    #[test]
+    fn ignores_event_data_text_without_an_access() {
+        for source in [
+            "\"_event.data\"",
+            "1 -- _event.data\n",
+            "other._event.data",
+            "_event.name",
+            "_event.foo.data",
+            "_event[\"name\"]",
+        ] {
+            let expression = compile_expression(source, false, 0).unwrap();
+            assert!(!expression.reads_event_data, "misclassified {source:?}");
+        }
     }
 
     #[test]
