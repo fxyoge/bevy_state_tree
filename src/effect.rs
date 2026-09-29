@@ -75,11 +75,11 @@ impl<'a, D: StateTreeDomain> StateTreeEffectContext<'a, D> {
 /// Evaluated named arguments supplied to one effect constructor.
 #[derive(Debug, Default)]
 pub struct StateTreeEffectArgs {
-    values: Vec<(Box<str>, LuauValue)>,
+    values: Vec<(Arc<str>, LuauValue)>,
 }
 
 impl StateTreeEffectArgs {
-    pub(crate) fn new(values: Vec<(Box<str>, LuauValue)>) -> Self {
+    pub(crate) fn new(values: Vec<(Arc<str>, LuauValue)>) -> Self {
         Self { values }
     }
 
@@ -120,7 +120,7 @@ impl StateTreeEffectArgs {
     pub(crate) fn finish(self) -> Result<(), StateTreeEffectError> {
         if let Some((name, _)) = self.values.first() {
             return Err(StateTreeEffectError::argument(
-                name.clone(),
+                Box::<str>::from(name.as_ref()),
                 "effect argument was not consumed by its constructor",
             ));
         }

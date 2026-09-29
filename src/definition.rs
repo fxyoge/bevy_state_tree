@@ -81,7 +81,7 @@ pub(crate) enum Action {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EffectArgument {
-    pub name: Box<str>,
+    pub name: Arc<str>,
     pub expression: ExpressionId,
 }
 
@@ -1231,7 +1231,7 @@ fn compile_action(
             let argument_start = u32::try_from(effect_arguments.len())
                 .map_err(|_| BuildError::TooManyEffectArguments)?;
             effect_arguments.extend(arguments.iter().map(|(name, expression)| EffectArgument {
-                name: name.clone(),
+                name: Arc::from(name.as_ref()),
                 expression: *expression,
             }));
             Ok(Action::Effect {
