@@ -141,9 +141,20 @@ case-specific Rust assertions.
 
 ## Benchmarks
 
-Run `just bench` to process broadcast events through Bevy's ECS and compute task
-pool across as many as one million independent trees. The benchmark definitions
-are the `benchmark_*.scxml` cases in `tests/scxml`, where their behavior is also
-covered by the semantic trace corpus. Parsing, compilation, entity spawning,
-instance initialization, and event queueing happen outside the timed region;
-results report aggregate instance throughput for the scheduled AI processing.
+Run `just bench` for both throughput and allocation profiles, or use
+`just bench-execution` and `just bench-allocation` separately. Throughput cases
+cover broadcast processing across as many as one million independent trees,
+sparse entity events in a population of 100,000, initialization, deep re-entry,
+transition scanning, typed effects, and wide parallel configurations. Parsing,
+compilation, and spawning remain outside steady-state timings; each measured
+schedule run queues and processes exactly one configured event.
+
+The allocation suite uses Divan's global allocator profiler and a single-threaded
+Bevy schedule, so Bevy-owned worker threads cannot hide allocations.
+Initialization cases measure the full pending-to-running lifecycle, while
+spawn-and-initialize cases additionally include ECS component storage after
+warming the empty schedule. Divan's `max alloc` column is peak net requested
+memory attributed to the measured interval, not process RSS or total live heap;
+setup-owned deallocations may reduce it in processing cases. Allocation
+profiling affects timing, so compare its allocation columns rather than its
+timings with the parallel throughput suite.

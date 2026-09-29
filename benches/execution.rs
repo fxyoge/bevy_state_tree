@@ -1,93 +1,103 @@
+mod support;
+
 use std::cell::RefCell;
 
-use bevy_app::{App, TaskPoolPlugin};
-use bevy_asset::{AssetPlugin, Assets};
-use bevy_ecs::{event::Event, schedule::ScheduleLabel, system::RunSystemOnce};
-use bevy_state_tree::{
-    BroadcastStateTreeEventWriter, StateTreeDefinition, StateTreeEvents, StateTreeInstance,
-    StateTreePlugin, scxml,
-};
 use divan::{Bencher, counter::ItemsCount};
-
-const TOGGLE: &str = include_str!("../tests/scxml/benchmark_toggle.scxml");
-const LUAU: &str = include_str!("../tests/scxml/benchmark_luau.scxml");
-const PARALLEL: &str = include_str!("../tests/scxml/benchmark_parallel.scxml");
+use support::{BenchmarkApp, Executor};
 
 fn main() {
     divan::main();
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ScheduleLabel)]
-struct AiUpdate;
-
-struct Simulation;
-
-#[derive(Event)]
-struct Tick;
-
-#[derive(StateTreeEvents)]
-#[state_tree(domain = Simulation)]
-enum Events {
-    #[state_tree(name = "tick", broadcast)]
-    Tick(Tick),
-}
-
-fn queue_tick(mut events: BroadcastStateTreeEventWriter<Simulation>) {
-    events.write(Tick);
-}
-
-fn benchmark_app(source_name: &str, source: &str, instances: usize) -> App {
-    let document = scxml::parse(source_name, source).unwrap();
-    let definition = scxml::compile(&document).unwrap();
-
-    let mut app = App::new();
-    app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
-        .init_schedule(AiUpdate)
-        .add_plugins(StateTreePlugin::<Simulation>::new(AiUpdate));
-    let handle = app
-        .world_mut()
-        .resource_mut::<Assets<StateTreeDefinition>>()
-        .add(definition);
-    app.world_mut()
-        .spawn_batch((0..instances).map(|_| StateTreeInstance::<Simulation>::new(handle.clone())));
-
-    // Link and initialize every instance before measuring event processing.
-    app.world_mut().run_schedule(AiUpdate);
-    app
-}
-
-fn process_population(
+fn process_broadcast(
     bencher: Bencher<'_, '_>,
     instances: usize,
-    source_name: &'static str,
-    source: &'static str,
+    definition: impl Fn() -> bevy_state_tree::StateTreeDefinition,
 ) {
-    let app = RefCell::new(benchmark_app(source_name, source, instances));
-
+    let benchmark = RefCell::new(BenchmarkApp::initialized(
+        definition(),
+        instances,
+        Executor::Parallel,
+    ));
+    benchmark.borrow_mut().enable_broadcast_events();
     bencher
         .counter(ItemsCount::new(instances))
-        .with_inputs(|| {
-            app.borrow_mut()
-                .world_mut()
-                .run_system_once(queue_tick)
-                .unwrap();
-        })
-        .bench_local_values(|()| {
-            app.borrow_mut().world_mut().run_schedule(AiUpdate);
-        });
+        .bench_local(|| benchmark.borrow_mut().run_schedule());
+}
+
+fn process_effects(bencher: Bencher<'_, '_>, instances: usize) {
+    let mut benchmark = BenchmarkApp::empty(support::effect_definition(), Executor::Parallel);
+    benchmark.register_benchmark_effect();
+    benchmark.spawn_instances(instances);
+    benchmark.run_schedule();
+    benchmark.enable_broadcast_events();
+    let benchmark = RefCell::new(benchmark);
+    bencher
+        .counter(ItemsCount::new(instances))
+        .bench_local(|| benchmark.borrow_mut().run_schedule());
 }
 
 #[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 20)]
-fn process_toggle_population(bencher: Bencher<'_, '_>, instances: usize) {
-    process_population(bencher, instances, "benchmark_toggle.scxml", TOGGLE);
+fn broadcast_toggle(bencher: Bencher<'_, '_>, instances: usize) {
+    process_broadcast(bencher, instances, support::toggle_definition);
 }
 
-#[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 10)]
-fn process_luau_population(bencher: Bencher<'_, '_>, instances: usize) {
-    process_population(bencher, instances, "benchmark_luau.scxml", LUAU);
+#[divan::bench(args = [1_000, 100_000], sample_count = 10)]
+fn broadcast_luau(bencher: Bencher<'_, '_>, instances: usize) {
+    process_broadcast(bencher, instances, support::luau_definition);
 }
 
-#[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 10)]
-fn process_parallel_population(bencher: Bencher<'_, '_>, instances: usize) {
-    process_population(bencher, instances, "benchmark_parallel.scxml", PARALLEL);
+#[divan::bench(args = [1_000, 100_000], sample_count = 10)]
+fn broadcast_parallel_two_regions(bencher: Bencher<'_, '_>, instances: usize) {
+    process_broadcast(bencher, instances, support::parallel_definition);
+}
+
+#[divan::bench(args = [1_000, 100_000], sample_count = 10)]
+fn broadcast_typed_effect(bencher: Bencher<'_, '_>, instances: usize) {
+    process_effects(bencher, instances);
+}
+
+#[divan::bench(args = [4, 16, 64, 128], sample_count = 10)]
+fn depth_reentry(bencher: Bencher<'_, '_>, depth: usize) {
+    process_broadcast(bencher, 1_000, || support::deep_definition(depth));
+}
+
+#[divan::bench(args = [2, 8, 32, 64], sample_count = 10)]
+fn parallel_width(bencher: Bencher<'_, '_>, regions: usize) {
+    process_broadcast(bencher, 1_000, || {
+        support::wide_parallel_definition(regions)
+    });
+}
+
+#[divan::bench(args = [1, 8, 32, 128], sample_count = 10)]
+fn transition_scan_fanout(bencher: Bencher<'_, '_>, candidates: usize) {
+    process_broadcast(bencher, 1_000, || {
+        support::transition_scan_definition(candidates)
+    });
+}
+
+#[divan::bench(args = [1, 100, 1_000], sample_count = 10)]
+fn sparse_entity_events(bencher: Bencher<'_, '_>, targets: usize) {
+    let benchmark = RefCell::new(BenchmarkApp::initialized(
+        support::entity_toggle_definition(),
+        100_000,
+        Executor::Parallel,
+    ));
+    benchmark.borrow_mut().enable_entity_events(targets);
+    bencher
+        .counter(ItemsCount::new(targets))
+        .bench_local(|| benchmark.borrow_mut().run_schedule());
+}
+
+#[divan::bench(args = [1_000, 10_000], sample_count = 5)]
+fn initialize_toggle(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            BenchmarkApp::pending(support::toggle_definition(), instances, Executor::Parallel)
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
 }

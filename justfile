@@ -14,3 +14,10 @@ _test-lib:
 
 bench:
   cargo bench --bench execution
+  cargo bench --bench allocation
+
+bench-execution:
+  cargo bench --bench execution
+
+bench-allocation:
+  cargo bench --bench allocation
