@@ -1,10 +1,15 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-use mlua::{ChunkMode, Compiler, Error, Lua, Table, Value};
+use mlua::{ChunkMode, Compiler, Error, Function, Lua, Table, Value};
+
+const FUNCTION_CACHE_CAPACITY: usize = 256;
+
+static NEXT_EXPRESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A portable value stored in one Luau state-tree datamodel.
 ///
@@ -23,6 +28,7 @@ pub enum LuauValue {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledLuauExpression {
+    identity: u64,
     pub bytecode: Box<[u8]>,
     pub span_start: usize,
     pub reads_event_data: bool,
@@ -40,6 +46,7 @@ pub(crate) fn compile_expression(
     };
     let bytecode = Compiler::new().compile(source)?;
     Ok(CompiledLuauExpression {
+        identity: NEXT_EXPRESSION_ID.fetch_add(1, Ordering::Relaxed),
         bytecode: bytecode.into_boxed_slice(),
         span_start,
         reads_event_data: expression.contains("_event.data"),
@@ -57,12 +64,21 @@ pub(crate) fn evaluate(
     event_name: Option<&str>,
     event_data: Option<&LuauValue>,
 ) -> Result<LuauValue, Error> {
-    WORKER.with_borrow(|worker| worker.evaluate(expression, names, values, event_name, event_data))
+    WORKER.with_borrow_mut(|worker| {
+        worker.evaluate(expression, names, values, event_name, event_data)
+    })
 }
 
 struct LuauWorker {
     lua: Lua,
     interrupts: Rc<Cell<usize>>,
+    functions: HashMap<u64, CachedFunction>,
+    cache_access: u64,
+}
+
+struct CachedFunction {
+    function: Function,
+    last_access: u64,
 }
 
 impl LuauWorker {
@@ -82,11 +98,16 @@ impl LuauWorker {
             }
             Ok(mlua::VmState::Continue)
         });
-        Self { lua, interrupts }
+        Self {
+            lua,
+            interrupts,
+            functions: HashMap::new(),
+            cache_access: 0,
+        }
     }
 
     fn evaluate(
-        &self,
+        &mut self,
         expression: &CompiledLuauExpression,
         names: &[Box<str>],
         values: &[LuauValue],
@@ -125,13 +146,41 @@ impl LuauWorker {
             environment.set("_event", event)?;
         }
 
-        let value = self
+        let function = self.function(expression)?;
+        function.set_environment(environment)?;
+        let value = function.call(())?;
+        from_lua(value, &mut Conversion::new(), 0)
+    }
+
+    fn function(&mut self, expression: &CompiledLuauExpression) -> Result<Function, Error> {
+        self.cache_access = self.cache_access.wrapping_add(1);
+        if let Some(cached) = self.functions.get_mut(&expression.identity) {
+            cached.last_access = self.cache_access;
+            return Ok(cached.function.clone());
+        }
+
+        if self.functions.len() == FUNCTION_CACHE_CAPACITY {
+            let oldest = self
+                .functions
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_access)
+                .map(|(identity, _)| *identity)
+                .expect("a full function cache is not empty");
+            self.functions.remove(&oldest);
+        }
+        let function = self
             .lua
             .load(expression.bytecode.as_ref())
             .set_mode(ChunkMode::Binary)
-            .set_environment(environment)
-            .eval()?;
-        from_lua(value, &mut Conversion::new(), 0)
+            .into_function()?;
+        self.functions.insert(
+            expression.identity,
+            CachedFunction {
+                function: function.clone(),
+                last_access: self.cache_access,
+            },
+        );
+        Ok(function)
     }
 }
 
