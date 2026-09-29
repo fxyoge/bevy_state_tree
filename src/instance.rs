@@ -853,7 +853,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 selected.push(candidate);
             }
         }
-        selected.sort_by_key(|candidate| compiled.state(candidate.source).document_order);
+        selected.sort_unstable_by_key(|candidate| compiled.state(candidate.source).document_order);
         Ok(())
     }
 
@@ -908,7 +908,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 }
             }
         }
-        runtime.exited.sort_by(|left, right| {
+        runtime.exited.sort_unstable_by(|left, right| {
             compiled
                 .state(*right)
                 .depth
@@ -976,17 +976,17 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
         runtime
             .entries
-            .sort_by_key(|entry| compiled.state(entry.state).document_order);
+            .sort_unstable_by_key(|entry| compiled.state(entry.state).document_order);
         for index in 0..runtime.entries.len() {
             let entry = runtime.entries[index];
             if let Err(fault) = self.enter_state(&compiled, entry, context, effects, trace) {
                 self.active
-                    .sort_by_key(|state| compiled.state(*state).document_order);
+                    .sort_unstable_by_key(|state| compiled.state(*state).document_order);
                 return Err(fault);
             }
         }
         self.active
-            .sort_by_key(|state| compiled.state(*state).document_order);
+            .sort_unstable_by_key(|state| compiled.state(*state).document_order);
         Ok(())
     }
 
