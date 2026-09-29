@@ -489,6 +489,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return Ok(());
         };
         let transition = selected.transition;
+        if transition.target.is_none() {
+            let action_start = transition.action_start as usize;
+            let action_end = action_start + transition.action_len as usize;
+            return self.execute_actions(
+                &compiled,
+                &compiled.transition_actions[action_start..action_end],
+                event_name,
+                trace,
+            );
+        }
         let exited: Vec<_> = self.active[transition.exit_depth as usize..]
             .iter()
             .rev()
@@ -548,9 +558,13 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         trace.record(StateTreeTraceRecord::TransitionSelected {
             source: &compiled.state(selected.source).name,
         });
-        trace.record(StateTreeTraceRecord::TransitionTarget {
-            state: &compiled.state(selected.transition.target).name,
-        });
+        if let Some(target) = selected.transition.target {
+            trace.record(StateTreeTraceRecord::TransitionTarget {
+                state: &compiled.state(target).name,
+            });
+        } else {
+            trace.record(StateTreeTraceRecord::TransitionTargetless);
+        }
     }
 
     fn enter_state<T: StateTreeTrace + ?Sized>(

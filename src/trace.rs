@@ -42,6 +42,7 @@ pub enum StateTreeTraceRecord<'a> {
     MicrostepStarted { index: usize },
     TransitionSelected { source: &'a str },
     TransitionTarget { state: &'a str },
+    TransitionTargetless,
     StateExitStarted { state: &'a str },
     StateExited { state: &'a str },
     StateEntered { state: &'a str },
@@ -109,6 +110,9 @@ impl StateTreeTrace for StateTreeEventLog {
             }
             StateTreeTraceRecord::TransitionTarget { state } => {
                 writeln!(self.output, "target {state:?}").unwrap();
+            }
+            StateTreeTraceRecord::TransitionTargetless => {
+                self.output.push_str("targetless\n");
             }
             StateTreeTraceRecord::StateExitStarted { state } => {
                 writeln!(self.output, "exit begin {state:?}").unwrap();

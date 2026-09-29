@@ -127,7 +127,7 @@ pub(crate) struct Entry {
 pub(crate) struct Transition {
     pub event: Option<EventId>,
     pub condition: Option<ExpressionId>,
-    pub target: StateId,
+    pub target: Option<StateId>,
     pub exit_depth: u32,
     pub entry_start: u32,
     pub entry_len: u32,
@@ -279,7 +279,7 @@ struct DraftState {
 struct DraftTransition {
     event: Option<EventPattern>,
     condition: Option<ExpressionId>,
-    target: StateId,
+    target: Option<StateId>,
     actions: Vec<DraftAction>,
 }
 
@@ -398,7 +398,7 @@ impl StateTreeBuilder {
             source,
             Some(EventPattern::Exact(event)),
             None,
-            target,
+            Some(target),
             Vec::new(),
         )
     }
@@ -419,7 +419,7 @@ impl StateTreeBuilder {
             source,
             Some(EventPattern::Descriptor(descriptor)),
             condition,
-            target,
+            Some(target),
             actions,
         )
     }
@@ -436,7 +436,7 @@ impl StateTreeBuilder {
 
     /// Adds an eventless external transition.
     pub fn eventless(&mut self, source: StateId, target: StateId) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, None, target, Vec::new())
+        self.add_transition(source, None, None, Some(target), Vec::new())
     }
 
     pub(crate) fn eventless_with_actions(
@@ -446,7 +446,18 @@ impl StateTreeBuilder {
         target: StateId,
         actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, condition, target, actions)
+        self.add_transition(source, None, condition, Some(target), actions)
+    }
+
+    pub(crate) fn targetless_with_actions(
+        &mut self,
+        source: StateId,
+        event: Option<Box<str>>,
+        condition: Option<ExpressionId>,
+        actions: Vec<DraftAction>,
+    ) -> Result<&mut Self, BuildError> {
+        let event = event.map(EventPattern::Descriptor);
+        self.add_transition(source, event, condition, None, actions)
     }
 
     pub(crate) fn entry_actions(
@@ -585,25 +596,31 @@ impl StateTreeBuilder {
                     }
                     None => None,
                 };
+                let (exit_depth, entry_start, entry_len) = if let Some(target) = transition.target {
+                    let entry_start = u32::try_from(transition_entries.len())
+                        .map_err(|_| BuildError::TooManyStates)?;
+                    let entry_len = append_transition_entries(
+                        state_id,
+                        target,
+                        &self.states,
+                        &depths,
+                        &mut transition_entries,
+                    )?;
+                    (
+                        transition_exit_depth(state_id, target, &self.states, &depths),
+                        entry_start,
+                        entry_len,
+                    )
+                } else {
+                    (0, 0, 0)
+                };
                 transitions.push(Transition {
                     event,
                     condition: transition.condition,
                     target: transition.target,
-                    exit_depth: transition_exit_depth(
-                        state_id,
-                        transition.target,
-                        &self.states,
-                        &depths,
-                    ),
-                    entry_start: u32::try_from(transition_entries.len())
-                        .map_err(|_| BuildError::TooManyStates)?,
-                    entry_len: append_transition_entries(
-                        state_id,
-                        transition.target,
-                        &self.states,
-                        &depths,
-                        &mut transition_entries,
-                    )?,
+                    exit_depth,
+                    entry_start,
+                    entry_len,
                     action_start: u32::try_from(transition_actions.len())
                         .map_err(|_| BuildError::TooManyActions)?,
                     action_len: append_actions(
@@ -709,10 +726,12 @@ impl StateTreeBuilder {
         source: StateId,
         event: Option<EventPattern>,
         condition: Option<ExpressionId>,
-        target: StateId,
+        target: Option<StateId>,
         actions: Vec<DraftAction>,
     ) -> Result<&mut Self, BuildError> {
-        self.require_state(target)?;
+        if let Some(target) = target {
+            self.require_state(target)?;
+        }
         let state = self.require_state_mut(source)?;
         if matches!(state.kind, DraftKind::Final) {
             return Err(BuildError::FinalHasTransition(source));
@@ -972,11 +991,11 @@ mod tests {
         let definition = builder.build().unwrap();
         assert_eq!(
             definition.compiled.state(first).transitions[0].target,
-            second
+            Some(second)
         );
         assert_eq!(
             definition.compiled.state(first).transitions[1].target,
-            first
+            Some(first)
         );
     }
 

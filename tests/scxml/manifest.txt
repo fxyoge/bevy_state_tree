@@ -7,3 +7,4 @@ ignored_event
 implicit_initial
 onentry_order
 onexit_order
+targetless_transition

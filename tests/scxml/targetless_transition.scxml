@@ -1,0 +1,10 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" datamodel="luau">
+  <datamodel>
+    <data id="count" expr="0"/>
+  </datamodel>
+  <state id="idle">
+    <transition event="tick">
+      <assign location="count" expr="count + 1"/>
+    </transition>
+  </state>
+</scxml>

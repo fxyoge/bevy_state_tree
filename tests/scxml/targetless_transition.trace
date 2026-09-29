@@ -1,0 +1,20 @@
+state-tree-trace 1
+macrostep initialize
+assign "count" = 0
+enter "#document"
+enter "idle"
+configuration
+active "#document"
+active "idle"
+status running
+macrostep end
+macrostep external "tick"
+microstep 1
+transition "idle"
+targetless
+assign "count" = 1
+configuration
+active "#document"
+active "idle"
+status running
+macrostep end

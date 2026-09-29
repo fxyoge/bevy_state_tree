@@ -453,10 +453,31 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&transition.attributes) {
             return self.unsupported(transition.span, "foreign transition attributes");
         }
-        if transition.targets.len() != 1 {
-            return self.unsupported(transition.span, "targetless or multi-target transitions");
+        if transition.targets.len() > 1 {
+            return self.unsupported(transition.span, "multi-target transitions");
         }
-        let target = self.target(&transition.targets[0], transition.span)?;
+        let target = transition
+            .targets
+            .first()
+            .map(|target| self.target(target, transition.span))
+            .transpose()?;
+        if target.is_none() {
+            if transition.events.is_empty() {
+                self.builder
+                    .targetless_with_actions(source, None, condition, actions)?;
+            } else {
+                for event in &transition.events {
+                    self.builder.targetless_with_actions(
+                        source,
+                        Some(event.clone().into()),
+                        condition,
+                        actions.clone(),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        let target = target.expect("checked transition target");
         if transition.events.is_empty() {
             self.builder
                 .eventless_with_actions(source, condition, target, actions)?;
