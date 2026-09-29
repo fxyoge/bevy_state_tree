@@ -598,6 +598,16 @@ fn decode_history(
     source_name: &str,
     source: &str,
 ) -> Result<History, Diagnostic> {
+    if let Some(value) = attribute(element, "type")
+        && !matches!(value, "shallow" | "deep")
+    {
+        return Err(error_at(
+            source_name,
+            source,
+            element.span.start,
+            format!("invalid history type `{value}`"),
+        ));
+    }
     let mut children = Vec::new();
     for child in &element.children {
         if !is_scxml(child) {

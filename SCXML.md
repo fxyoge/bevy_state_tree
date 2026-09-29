@@ -43,6 +43,19 @@ then transition actions run in document order, then entries run in document
 order. A parallel state raises `done.state.<id>` after all of its regions have
 completed. Multi-target transitions remain unsupported.
 
+## Completion
+
+Entering a final child of a nested compound state raises `done.state.<id>` once
+for that active configuration. A targetless handler does not leave and re-enter
+the completed state, so it does not cause the completion event to repeat.
+
+Entering a final child of the document root sets the instance status to
+`Complete`. The synthetic document root and reached final state remain active
+for inspection, and subsequent external events are ignored. Unlike SCXML
+interpreter shutdown, completion does not execute the final state's exit
+actions. Applications should put terminal output on final entry or the incoming
+transition and let ECS lifecycle code replace or remove the completed instance.
+
 ## Send
 
 SCXML `<send>` will not be supported. Its generic string event, dynamic

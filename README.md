@@ -93,6 +93,17 @@ Instances that initialize before event processing receive events queued during
 that schedule run. Instances still waiting for their definition asset receive
 no events, and queued entity events are discarded rather than replayed later.
 
+Definitions are linked against each domain's typed event protocol and effect
+registry before initialization. An unmatched event descriptor or unregistered
+effect leaves the instance pending and adds a queryable
+`StateTreeLinkFailure<D>` component. Replacing the asset or registering the
+missing effect retries linking without changing successfully running instances.
+
+Entering a final child of the document root sets the instance status to
+`Complete` and retains the root and reached final state for inspection. This is
+not implicit teardown: the final state's exit actions do not run, and an ECS
+system remains responsible for replacing or removing the completed controller.
+
 ## Typed Effects
 
 Bevy-specific executable content uses the `urn:bevy-state-tree` namespace:
@@ -117,6 +128,8 @@ Construction follows statechart action order, but message delivery order between
 parallel instances is unspecified. Constructor, argument, and payload projection
 errors fault only the affected instance. Headless callers use
 `StateTreeExecution::{new,process_event}_with_sink` to receive portable requests.
+Headless constructors return `Result` because the definition must still link to
+the execution's typed event protocol.
 
 ## Semantic Tests
 

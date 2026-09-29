@@ -21,7 +21,7 @@ use bevy_tasks::ComputeTaskPool;
 
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
-    StateTreeDomain, StateTreeInstance,
+    StateTreeDomain, StateTreeInstance, StateTreeLinkError,
     definition::{CompiledDefinition, LinkedDefinition},
     effect::{BevyEffectSink, StateTreeEffectRegistry},
     instance::PendingStateTree,
@@ -143,8 +143,13 @@ struct StateTreeAssetsInstalled;
 
 #[derive(Resource)]
 struct LinkedStateTreeDefinitions<D: StateTreeDomain> {
-    definitions: HashMap<u64, Weak<LinkedDefinition<D>>>,
+    definitions: HashMap<(u64, u64), CachedLinkedDefinition<D>>,
     marker: PhantomData<fn() -> D>,
+}
+
+enum CachedLinkedDefinition<D: StateTreeDomain> {
+    Linked(Weak<LinkedDefinition<D>>),
+    Failed(Weak<StateTreeLinkError>),
 }
 
 impl<D: StateTreeDomain> Default for LinkedStateTreeDefinitions<D> {
@@ -161,18 +166,54 @@ impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
         &mut self,
         compiled: Arc<CompiledDefinition>,
         effects: &StateTreeEffectRegistry<D>,
-    ) -> Arc<LinkedDefinition<D>> {
-        if let Some(linked) = self
-            .definitions
-            .get(&compiled.identity)
-            .and_then(Weak::upgrade)
-        {
-            return linked;
+    ) -> Result<Arc<LinkedDefinition<D>>, Arc<StateTreeLinkError>> {
+        self.definitions.retain(|_, cached| match cached {
+            CachedLinkedDefinition::Linked(linked) => linked.strong_count() > 0,
+            CachedLinkedDefinition::Failed(error) => error.strong_count() > 0,
+        });
+        let key = (compiled.identity, effects.revision());
+        if let Some(cached) = self.definitions.get(&key) {
+            match cached {
+                CachedLinkedDefinition::Linked(linked) => {
+                    if let Some(linked) = linked.upgrade() {
+                        return Ok(linked);
+                    }
+                }
+                CachedLinkedDefinition::Failed(error) => {
+                    if let Some(error) = error.upgrade() {
+                        return Err(error);
+                    }
+                }
+            }
         }
-        let identity = compiled.identity;
-        let linked = Arc::new(LinkedDefinition::new(compiled, Some(effects)));
-        self.definitions.insert(identity, Arc::downgrade(&linked));
-        linked
+        match LinkedDefinition::new(compiled, Some(effects)) {
+            Ok(linked) => {
+                let linked = Arc::new(linked);
+                self.definitions
+                    .insert(key, CachedLinkedDefinition::Linked(Arc::downgrade(&linked)));
+                Ok(linked)
+            }
+            Err(error) => {
+                let error = Arc::new(error);
+                self.definitions
+                    .insert(key, CachedLinkedDefinition::Failed(Arc::downgrade(&error)));
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A pending state-tree instance whose available definition cannot link to its domain.
+#[derive(Component, Clone, Debug)]
+pub struct StateTreeLinkFailure<D: StateTreeDomain> {
+    error: Arc<StateTreeLinkError>,
+    marker: PhantomData<fn() -> D>,
+}
+
+impl<D: StateTreeDomain> StateTreeLinkFailure<D> {
+    /// Returns the cached domain-link error.
+    pub fn error(&self) -> &StateTreeLinkError {
+        &self.error
     }
 }
 
@@ -335,20 +376,50 @@ where
     }
 }
 
+type PendingStateTrees<'w, 's, D> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut StateTreeInstance<D>,
+        Option<&'static StateTreeLinkFailure<D>>,
+    ),
+    With<PendingStateTree<D>>,
+>;
+
 fn initialize_pending<D: StateTreeDomain>(
     commands: ParallelCommands,
     definitions: Res<Assets<StateTreeDefinition>>,
     mut linked_definitions: ResMut<LinkedStateTreeDefinitions<D>>,
     effects: Res<StateTreeEffectRegistry<D>>,
     settings: Res<StateTreeSettings<D>>,
-    mut instances: Query<(Entity, &mut StateTreeInstance<D>), With<PendingStateTree<D>>>,
+    mut instances: PendingStateTrees<'_, '_, D>,
 ) {
-    for (entity, mut instance) in &mut instances {
+    for (entity, mut instance, previous_failure) in &mut instances {
         let Some(definition) = definitions.get(instance.definition()) else {
+            if previous_failure.is_some() {
+                commands.command_scope(|mut commands| {
+                    commands.entity(entity).remove::<StateTreeLinkFailure<D>>();
+                });
+            }
             continue;
         };
+        let linked = match linked_definitions.get_or_insert(definition.compiled.clone(), &effects) {
+            Ok(linked) => linked,
+            Err(error) => {
+                if previous_failure.is_none_or(|previous| !Arc::ptr_eq(&previous.error, &error)) {
+                    commands.command_scope(|mut commands| {
+                        commands.entity(entity).insert(StateTreeLinkFailure::<D> {
+                            error,
+                            marker: PhantomData,
+                        });
+                    });
+                }
+                continue;
+            }
+        };
         instance.initialize(
-            linked_definitions.get_or_insert(definition.compiled.clone(), &effects),
+            linked,
             settings.max_microsteps.get(),
             Some(entity),
             &mut BevyEffectSink {
@@ -356,7 +427,9 @@ fn initialize_pending<D: StateTreeDomain>(
             },
         );
         commands.command_scope(|mut commands| {
-            commands.entity(entity).remove::<PendingStateTree<D>>();
+            commands
+                .entity(entity)
+                .remove::<(PendingStateTree<D>, StateTreeLinkFailure<D>)>();
         });
     }
 }
@@ -623,6 +696,123 @@ mod tests {
         app.update();
 
         assert_eq!(app.world().resource::<PublishedEffects>().0, [(entity, 7)]);
+    }
+
+    #[test]
+    fn invalid_links_remain_pending_until_the_asset_is_replaced() {
+        let mut builder = StateTreeBuilder::new("invalid-link");
+        let root = builder.compound_root("root").unwrap();
+        let idle = builder.atomic("idle", root).unwrap();
+        let done = builder.atomic("done", root).unwrap();
+        builder.initial(root, idle).unwrap();
+        builder.transition(idle, "adavnce", done).unwrap();
+        let mut app = app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(builder.build().unwrap());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .id();
+
+        app.update();
+
+        let entity_ref = app.world().entity(entity);
+        assert_eq!(
+            entity_ref
+                .get::<StateTreeInstance<Simulation>>()
+                .unwrap()
+                .status(),
+            &InstanceStatus::Pending
+        );
+        assert!(matches!(
+            &entity_ref
+                .get::<StateTreeLinkFailure<Simulation>>()
+                .unwrap()
+                .error()
+                .issues()[0],
+            crate::StateTreeLinkIssue::UnmatchedEventDescriptor { descriptor, .. }
+                if descriptor.as_ref() == "adavnce"
+        ));
+
+        app.world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .insert(handle.id(), definition())
+            .unwrap();
+        app.update();
+
+        let entity_ref = app.world().entity(entity);
+        assert_eq!(
+            entity_ref
+                .get::<StateTreeInstance<Simulation>>()
+                .unwrap()
+                .status(),
+            &InstanceStatus::Running
+        );
+        assert!(
+            entity_ref
+                .get::<StateTreeLinkFailure<Simulation>>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_effect_registration_is_a_recoverable_link_failure() {
+        let source = format!(
+            r#"<scxml xmlns="{}" xmlns:bst="{}"><state id="idle"><onentry><bst:effect name="publish"/></onentry></state></scxml>"#,
+            scxml::SCXML_NAMESPACE,
+            scxml::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let document = scxml::parse("effect.scxml", &source).unwrap();
+        let definition = scxml::compile(&document).unwrap();
+        let mut app = app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(definition);
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+
+        app.update();
+
+        assert!(matches!(
+            &app.world()
+                .entity(entity)
+                .get::<StateTreeLinkFailure<Simulation>>()
+                .unwrap()
+                .error()
+                .issues()[0],
+            crate::StateTreeLinkIssue::MissingEffect { effect, .. }
+                if effect.as_ref() == "publish"
+        ));
+
+        app.register_state_tree_effect::<Simulation, EffectPublished, _>(
+            "publish",
+            |context, _arguments| {
+                Ok(EffectPublished {
+                    entity: context.entity().unwrap(),
+                    amount: 0,
+                })
+            },
+        );
+        app.update();
+
+        let entity_ref = app.world().entity(entity);
+        assert_eq!(
+            entity_ref
+                .get::<StateTreeInstance<Simulation>>()
+                .unwrap()
+                .status(),
+            &InstanceStatus::Running
+        );
+        assert!(
+            entity_ref
+                .get::<StateTreeLinkFailure<Simulation>>()
+                .is_none()
+        );
     }
 
     #[test]

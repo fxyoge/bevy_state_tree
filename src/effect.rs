@@ -294,12 +294,14 @@ where
 #[derive(Resource)]
 pub(crate) struct StateTreeEffectRegistry<D: StateTreeDomain> {
     effects: HashMap<Box<str>, Arc<dyn RegisteredEffect<D>>>,
+    revision: u64,
 }
 
 impl<D: StateTreeDomain> Default for StateTreeEffectRegistry<D> {
     fn default() -> Self {
         Self {
             effects: HashMap::new(),
+            revision: 0,
         }
     }
 }
@@ -307,6 +309,10 @@ impl<D: StateTreeDomain> Default for StateTreeEffectRegistry<D> {
 impl<D: StateTreeDomain> StateTreeEffectRegistry<D> {
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredEffect<D>>> {
         self.effects.get(name).cloned()
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 }
 
@@ -444,6 +450,7 @@ impl StateTreeAppExt for App {
             previous.is_none(),
             "state-tree effect `{name}` was registered more than once"
         );
+        registry.revision = registry.revision.wrapping_add(1);
         self
     }
 }

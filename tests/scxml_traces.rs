@@ -94,7 +94,8 @@ fn scxml_cases_match_their_semantic_traces() {
 
         let mut log = StateTreeEventLog::new();
         let mut execution =
-            StateTreeExecution::<HarnessEvent>::new_traced(&definition, MICROSTEP_LIMIT, &mut log);
+            StateTreeExecution::<HarnessEvent>::new_traced(&definition, MICROSTEP_LIMIT, &mut log)
+                .unwrap();
         let events_path = case.with_extension("events");
         if events_path.exists() {
             let events = fs::read_to_string(&events_path).expect("read SCXML case events");

@@ -164,6 +164,12 @@ pub(crate) struct Transition {
     pub action_len: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EventRequirement {
+    event: EventId,
+    span_start: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledLuauDataModel {
     pub names: Box<[Box<str>]>,
@@ -187,6 +193,8 @@ pub(crate) struct CompiledDefinition {
     pub has_parallel: bool,
     pub datamodel: Option<CompiledLuauDataModel>,
     events: Box<[EventPattern]>,
+    event_requirements: Box<[EventRequirement]>,
+    internal_events: Box<[EventId]>,
     effects: Box<[Box<str>]>,
 }
 
@@ -255,7 +263,48 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
     pub fn new(
         compiled: Arc<CompiledDefinition>,
         effects: Option<&StateTreeEffectRegistry<D>>,
-    ) -> Self {
+    ) -> Result<Self, StateTreeLinkError> {
+        let mut issues = Vec::new();
+        for requirement in &compiled.event_requirements {
+            let pattern = &compiled.events[requirement.event.index()];
+            let matches_external = D::Event::AUTHORED_NAMES
+                .iter()
+                .any(|name| event_pattern_matches(pattern, name));
+            let matches_internal = compiled.internal_events.iter().any(|event| {
+                let EventPattern::Exact(name) = &compiled.events[event.index()] else {
+                    return false;
+                };
+                event_pattern_matches(pattern, name)
+            });
+            let wildcard =
+                matches!(pattern, EventPattern::Descriptor(value) if value.as_ref() == "*");
+            if !matches_external && !matches_internal && !wildcard {
+                issues.push(StateTreeLinkIssue::UnmatchedEventDescriptor {
+                    descriptor: match pattern {
+                        EventPattern::Exact(value) | EventPattern::Descriptor(value) => {
+                            value.clone()
+                        }
+                    },
+                    span_start: requirement.span_start.map(|span| span as usize),
+                });
+            }
+        }
+        if let Some(registry) = effects {
+            for (index, name) in compiled.effects.iter().enumerate() {
+                if registry.get(name).is_none() {
+                    issues.push(StateTreeLinkIssue::MissingEffect {
+                        effect: name.clone(),
+                        span_start: first_effect_span(&compiled, EffectId(index as u32)),
+                    });
+                }
+            }
+        }
+        if !issues.is_empty() {
+            return Err(StateTreeLinkError {
+                definition: compiled.name.clone(),
+                issues: issues.into_boxed_slice(),
+            });
+        }
         let external_events = D::Event::AUTHORED_NAMES
             .iter()
             .map(|name| EventSet::for_name(&compiled.events, name))
@@ -264,11 +313,11 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
             .effect_names()
             .map(|name| effects.and_then(|effects| effects.get(name)))
             .collect();
-        Self {
+        Ok(Self {
             compiled,
             external_events,
             effects: linked_effects,
-        }
+        })
     }
 
     pub fn external_event(&self, index: usize) -> Option<&EventSet> {
@@ -278,6 +327,64 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
     pub fn effect(&self, effect: EffectId) -> Option<&Arc<dyn RegisteredEffect<D>>> {
         self.effects.get(effect.index()).and_then(Option::as_ref)
     }
+}
+
+fn first_effect_span(compiled: &CompiledDefinition, effect: EffectId) -> Option<usize> {
+    compiled
+        .states
+        .iter()
+        .flat_map(|state| {
+            state
+                .entry_actions
+                .iter()
+                .chain(state.exit_actions.iter())
+                .chain(state.initial_actions.iter())
+        })
+        .chain(compiled.transition_actions.iter())
+        .find_map(|action| match action {
+            Action::Effect {
+                effect: candidate,
+                span_start,
+                ..
+            } if *candidate == effect => Some(*span_start as usize),
+            _ => None,
+        })
+}
+
+/// A definition could not be linked to a domain's typed runtime protocol.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("state-tree definition `{definition}` has {count} link issue(s)", count = .issues.len())]
+pub struct StateTreeLinkError {
+    definition: Box<str>,
+    issues: Box<[StateTreeLinkIssue]>,
+}
+
+impl StateTreeLinkError {
+    /// Returns the authored definition name.
+    pub fn definition(&self) -> &str {
+        &self.definition
+    }
+
+    /// Returns every issue found during the same link attempt.
+    pub fn issues(&self) -> &[StateTreeLinkIssue] {
+        &self.issues
+    }
+}
+
+/// One domain-dependent state-tree link problem.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum StateTreeLinkIssue {
+    #[error("event descriptor `{descriptor}` matches no typed or internal event")]
+    UnmatchedEventDescriptor {
+        descriptor: Box<str>,
+        span_start: Option<usize>,
+    },
+    #[error("effect `{effect}` is not registered for this domain")]
+    MissingEffect {
+        effect: Box<str>,
+        span_start: Option<usize>,
+    },
 }
 
 fn event_pattern_matches(pattern: &EventPattern, event: &str) -> bool {
@@ -351,6 +458,7 @@ struct DraftTransition {
     condition: Option<ExpressionId>,
     target: Option<StateId>,
     actions: Vec<DraftAction>,
+    span_start: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -475,7 +583,7 @@ impl StateTreeBuilder {
         target: StateId,
     ) -> Result<&mut Self, BuildError> {
         let event = event.into();
-        if event.is_empty() {
+        if event.trim().is_empty() {
             return Err(BuildError::EmptyEventName);
         }
         self.add_transition(
@@ -484,6 +592,7 @@ impl StateTreeBuilder {
             None,
             Some(target),
             Vec::new(),
+            None,
         )
     }
 
@@ -494,9 +603,10 @@ impl StateTreeBuilder {
         condition: Option<ExpressionId>,
         target: StateId,
         actions: Vec<DraftAction>,
+        span_start: Option<usize>,
     ) -> Result<&mut Self, BuildError> {
         let descriptor = descriptor.into();
-        if descriptor.is_empty() {
+        if descriptor.trim().is_empty() {
             return Err(BuildError::EmptyEventName);
         }
         self.add_transition(
@@ -505,6 +615,7 @@ impl StateTreeBuilder {
             condition,
             Some(target),
             actions,
+            span_start.and_then(|span| u32::try_from(span).ok()),
         )
     }
 
@@ -515,12 +626,12 @@ impl StateTreeBuilder {
         descriptor: impl Into<Box<str>>,
         target: StateId,
     ) -> Result<&mut Self, BuildError> {
-        self.event_descriptor_with_actions(source, descriptor, None, target, Vec::new())
+        self.event_descriptor_with_actions(source, descriptor, None, target, Vec::new(), None)
     }
 
     /// Adds an eventless external transition.
     pub fn eventless(&mut self, source: StateId, target: StateId) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, None, Some(target), Vec::new())
+        self.add_transition(source, None, None, Some(target), Vec::new(), None)
     }
 
     pub(crate) fn eventless_with_actions(
@@ -529,8 +640,16 @@ impl StateTreeBuilder {
         condition: Option<ExpressionId>,
         target: StateId,
         actions: Vec<DraftAction>,
+        span_start: Option<usize>,
     ) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, None, condition, Some(target), actions)
+        self.add_transition(
+            source,
+            None,
+            condition,
+            Some(target),
+            actions,
+            span_start.and_then(|span| u32::try_from(span).ok()),
+        )
     }
 
     pub(crate) fn targetless_with_actions(
@@ -539,9 +658,17 @@ impl StateTreeBuilder {
         event: Option<Box<str>>,
         condition: Option<ExpressionId>,
         actions: Vec<DraftAction>,
+        span_start: Option<usize>,
     ) -> Result<&mut Self, BuildError> {
         let event = event.map(EventPattern::Descriptor);
-        self.add_transition(source, event, condition, None, actions)
+        self.add_transition(
+            source,
+            event,
+            condition,
+            None,
+            actions,
+            span_start.and_then(|span| u32::try_from(span).ok()),
+        )
     }
 
     pub(crate) fn entry_actions(
@@ -643,6 +770,7 @@ impl StateTreeBuilder {
 
         let mut events = Vec::<EventPattern>::new();
         let mut event_ids = HashMap::<EventPattern, EventId>::new();
+        let mut event_requirements = Vec::new();
         let mut states = Vec::with_capacity(self.states.len());
         let mut transition_entries = Vec::new();
         let mut transition_actions = Vec::new();
@@ -717,6 +845,12 @@ impl StateTreeBuilder {
                     }
                     None => None,
                 };
+                if let Some(event) = event {
+                    event_requirements.push(EventRequirement {
+                        event,
+                        span_start: transition.span_start,
+                    });
+                }
                 let (exit_depth, entry_start, entry_len) = if let Some(target) = transition.target {
                     let entry_start = u32::try_from(transition_entries.len())
                         .map_err(|_| BuildError::TooManyStates)?;
@@ -834,6 +968,57 @@ impl StateTreeBuilder {
             initializers: datamodel.initializers.into_boxed_slice(),
             expressions: datamodel.expressions.into_boxed_slice(),
         });
+        let mut completable = vec![false; states.len()];
+        for index in (0..states.len()).rev() {
+            completable[index] = match states[index].kind {
+                StateKind::Compound { .. } => {
+                    let start = states[index].child_start as usize;
+                    let end = start + states[index].child_len as usize;
+                    children[start..end]
+                        .iter()
+                        .any(|child| states[child.index()].kind == StateKind::Final)
+                }
+                StateKind::Parallel { .. } => {
+                    let start = states[index].child_start as usize;
+                    let end = start + states[index].child_len as usize;
+                    !children[start..end].is_empty()
+                        && children[start..end]
+                            .iter()
+                            .all(|child| completable[child.index()])
+                }
+                StateKind::Atomic | StateKind::Final => false,
+            };
+        }
+        let mut internal_events = Vec::new();
+        for (index, state) in states.iter().enumerate() {
+            if let StateKind::Compound { completion, .. } | StateKind::Parallel { completion } =
+                state.kind
+                && state.parent.is_some()
+                && completable[index]
+                && !internal_events.contains(&completion)
+            {
+                internal_events.push(completion);
+            }
+            for action in state
+                .entry_actions
+                .iter()
+                .chain(state.exit_actions.iter())
+                .chain(state.initial_actions.iter())
+            {
+                if let Action::Raise(event) = action
+                    && !internal_events.contains(event)
+                {
+                    internal_events.push(*event);
+                }
+            }
+        }
+        for action in &transition_actions {
+            if let Action::Raise(event) = action
+                && !internal_events.contains(event)
+            {
+                internal_events.push(*event);
+            }
+        }
 
         Ok(StateTreeDefinition {
             compiled: Arc::new(CompiledDefinition {
@@ -851,6 +1036,8 @@ impl StateTreeBuilder {
                 has_parallel,
                 datamodel,
                 events: events.into_boxed_slice(),
+                event_requirements: event_requirements.into_boxed_slice(),
+                internal_events: internal_events.into_boxed_slice(),
                 effects: effects.into_boxed_slice(),
             }),
         })
@@ -868,6 +1055,9 @@ impl StateTreeBuilder {
             DraftKind::Compound { .. } | DraftKind::Parallel
         ) {
             return Err(BuildError::ChildOfNonCompound(parent));
+        }
+        if kind == DraftKind::Final && parent_state.kind == DraftKind::Parallel {
+            return Err(BuildError::FinalChildOfParallel(parent));
         }
         self.add_state(name, Some(parent), kind)
     }
@@ -910,6 +1100,7 @@ impl StateTreeBuilder {
         condition: Option<ExpressionId>,
         target: Option<StateId>,
         actions: Vec<DraftAction>,
+        span_start: Option<u32>,
     ) -> Result<&mut Self, BuildError> {
         if let Some(target) = target {
             self.require_state(target)?;
@@ -923,6 +1114,7 @@ impl StateTreeBuilder {
             condition,
             target,
             actions,
+            span_start,
         });
         Ok(self)
     }
@@ -1217,6 +1409,8 @@ pub enum BuildError {
     ParallelHasNoRegions(StateId),
     #[error("final state {0:?} cannot have outgoing transitions")]
     FinalHasTransition(StateId),
+    #[error("parallel state {0:?} cannot contain a final child")]
+    FinalChildOfParallel(StateId),
     #[error("a definition cannot contain more than u32::MAX states")]
     TooManyStates,
     #[error("a definition cannot contain more than u32::MAX event names")]
@@ -1308,6 +1502,31 @@ mod tests {
         assert_eq!(
             builder.build().unwrap_err(),
             BuildError::ParallelHasNoRegions(parallel)
+        );
+    }
+
+    #[test]
+    fn rejects_final_states_directly_below_parallel_states() {
+        let mut builder = StateTreeBuilder::new("invalid-parallel-final");
+        let root = builder.compound_root("root").unwrap();
+        let parallel = builder.parallel("parallel", root).unwrap();
+
+        assert_eq!(
+            builder.final_state("done", parallel),
+            Err(BuildError::FinalChildOfParallel(parallel))
+        );
+    }
+
+    #[test]
+    fn rejects_whitespace_only_event_names() {
+        let mut builder = StateTreeBuilder::new("invalid-event");
+        let root = builder.compound_root("root").unwrap();
+        let source = builder.atomic("source", root).unwrap();
+        let target = builder.atomic("target", root).unwrap();
+
+        assert_eq!(
+            builder.transition(source, "  ", target).unwrap_err(),
+            BuildError::EmptyEventName
         );
     }
 

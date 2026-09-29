@@ -26,6 +26,12 @@ pub enum CompileError {
         span_start: usize,
         feature: &'static str,
     },
+    #[error("{source_name}@{span_start}: invalid SCXML: {message}")]
+    InvalidDocument {
+        source_name: String,
+        span_start: usize,
+        message: String,
+    },
     #[error("{source_name}@{span_start}: unknown state target `{target}`")]
     UnknownTarget {
         source_name: String,
@@ -133,6 +139,14 @@ impl<'a> Compiler<'a> {
     }
 
     fn reject_root_features(&self) -> Result<(), CompileError> {
+        if let Some(version) = self.document.root.version.as_deref()
+            && version != "1.0"
+        {
+            return self.invalid_document(
+                self.document.root.span,
+                format!("unsupported SCXML version `{version}`"),
+            );
+        }
         if self
             .document
             .root
@@ -154,6 +168,12 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&self.document.root.attributes) {
             return self.unsupported(self.document.root.span, "foreign root attributes");
         }
+        self.reject_unknown_attributes(
+            self.document.root.span,
+            "scxml",
+            &self.document.root.attributes,
+            &["name", "version", "initial", "binding", "datamodel"],
+        )?;
         for child in &self.document.root.children {
             let (span, feature) = match child {
                 RootChild::State(_)
@@ -199,6 +219,7 @@ impl<'a> Compiler<'a> {
                 if has_foreign_attributes(&model.attributes) {
                     return self.unsupported(model.span, "foreign datamodel attributes");
                 }
+                self.reject_unknown_attributes(model.span, "datamodel", &model.attributes, &[])?;
                 for child in &model.children {
                     let DataModelChild::Data(data) = child else {
                         let DataModelChild::Extension(extension) = child else {
@@ -213,6 +234,12 @@ impl<'a> Compiler<'a> {
                     {
                         return self.unsupported(data.span, "non-expression Luau data");
                     }
+                    self.reject_unknown_attributes(
+                        data.span,
+                        "data",
+                        &data.attributes,
+                        &["id", "expr", "src"],
+                    )?;
                     let Some(id) = data.id.as_deref() else {
                         return self.invalid_datamodel(data.span, "data requires an id");
                     };
@@ -257,6 +284,7 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&state.attributes) {
             return self.unsupported(state.span, "foreign state attributes");
         }
+        self.reject_unknown_attributes(state.span, "state", &state.attributes, &["id", "initial"])?;
         let compound = state.children.iter().any(|child| {
             matches!(
                 child,
@@ -323,6 +351,7 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&parallel.attributes) {
             return self.unsupported(parallel.span, "foreign parallel attributes");
         }
+        self.reject_unknown_attributes(parallel.span, "parallel", &parallel.attributes, &["id"])?;
         let name = self.node_name(parallel.id.as_deref());
         let runtime = self.builder.parallel(name, parent)?;
         if let Some(id) = parallel.id.as_deref() {
@@ -372,6 +401,7 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&state.attributes) {
             return self.unsupported(state.span, "foreign final-state attributes");
         }
+        self.reject_unknown_attributes(state.span, "final", &state.attributes, &["id"])?;
         let mut entry_actions = Vec::new();
         let mut exit_actions = Vec::new();
         for child in &state.children {
@@ -447,6 +477,7 @@ impl<'a> Compiler<'a> {
             if has_foreign_attributes(&initial.attributes) || !initial.extensions.is_empty() {
                 return self.unsupported(initial.span, "extended initial declarations");
             }
+            self.reject_unknown_attributes(initial.span, "initial", &initial.attributes, &[])?;
             if !attribute.is_empty() {
                 return self.unsupported(initial.span, "multiple initial declarations");
             }
@@ -483,6 +514,12 @@ impl<'a> Compiler<'a> {
         &mut self,
         transition: &Transition,
     ) -> Result<Vec<DraftAction>, CompileError> {
+        self.reject_unknown_attributes(
+            transition.span,
+            "transition",
+            &transition.attributes,
+            &["event", "cond", "target", "type"],
+        )?;
         if transition.targets.len() != 1 {
             return self.invalid_initial(transition.span);
         }
@@ -501,6 +538,32 @@ impl<'a> Compiler<'a> {
         source: StateId,
         transition: &Transition,
     ) -> Result<(), CompileError> {
+        self.reject_unknown_attributes(
+            transition.span,
+            "transition",
+            &transition.attributes,
+            &["event", "cond", "target", "type"],
+        )?;
+        let target_attribute = unqualified_attribute(&transition.attributes, "target");
+        if transition
+            .event
+            .as_deref()
+            .is_some_and(|event| event.trim().is_empty())
+        {
+            return self.invalid_document(transition.span, "transition event cannot be empty");
+        }
+        if target_attribute.is_some_and(|target| target.trim().is_empty()) {
+            return self.invalid_document(transition.span, "transition target cannot be empty");
+        }
+        if transition.event.is_none()
+            && transition.condition.is_none()
+            && target_attribute.is_none()
+        {
+            return self.invalid_document(
+                transition.span,
+                "transition requires an event, condition, or target",
+            );
+        }
         if transition.transition_type == Some(TransitionType::Internal) {
             return self.unsupported(transition.span, "internal transitions");
         }
@@ -534,8 +597,13 @@ impl<'a> Compiler<'a> {
             .transpose()?;
         if target.is_none() {
             if transition.events.is_empty() {
-                self.builder
-                    .targetless_with_actions(source, None, condition, actions)?;
+                self.builder.targetless_with_actions(
+                    source,
+                    None,
+                    condition,
+                    actions,
+                    Some(transition.span.start),
+                )?;
             } else {
                 for event in &transition.events {
                     self.builder.targetless_with_actions(
@@ -543,6 +611,7 @@ impl<'a> Compiler<'a> {
                         Some(event.clone().into()),
                         condition,
                         actions.clone(),
+                        Some(transition.span.start),
                     )?;
                 }
             }
@@ -550,8 +619,13 @@ impl<'a> Compiler<'a> {
         }
         let target = target.expect("checked transition target");
         if transition.events.is_empty() {
-            self.builder
-                .eventless_with_actions(source, condition, target, actions)?;
+            self.builder.eventless_with_actions(
+                source,
+                condition,
+                target,
+                actions,
+                Some(transition.span.start),
+            )?;
         } else {
             for event in &transition.events {
                 self.builder.event_descriptor_with_actions(
@@ -560,6 +634,7 @@ impl<'a> Compiler<'a> {
                     condition,
                     target,
                     actions.clone(),
+                    Some(transition.span.start),
                 )?;
             }
         }
@@ -570,6 +645,7 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&entry.attributes) {
             return self.unsupported(entry.span, "foreign onentry attributes");
         }
+        self.reject_unknown_attributes(entry.span, "onentry", &entry.attributes, &[])?;
         self.actions(&entry.content, entry.span)
     }
 
@@ -577,6 +653,7 @@ impl<'a> Compiler<'a> {
         if has_foreign_attributes(&exit.attributes) {
             return self.unsupported(exit.span, "foreign onexit attributes");
         }
+        self.reject_unknown_attributes(exit.span, "onexit", &exit.attributes, &[])?;
         self.actions(&exit.content, exit.span)
     }
 
@@ -589,6 +666,16 @@ impl<'a> Compiler<'a> {
             .iter()
             .map(|executable| match executable {
                 ExecutableContent::Raise(raise) if !has_foreign_attributes(&raise.attributes) => {
+                    self.reject_unknown_attributes(
+                        raise.span,
+                        "raise",
+                        &raise.attributes,
+                        &["event"],
+                    )?;
+                    if raise.event.trim().is_empty() {
+                        return self
+                            .invalid_document(raise.span, "raise requires a non-empty event");
+                    }
                     Ok(DraftAction::Raise(Box::from(raise.event.as_str())))
                 }
                 ExecutableContent::Raise(raise) => {
@@ -599,6 +686,12 @@ impl<'a> Compiler<'a> {
                         && assign.source.is_none()
                         && !has_substantive_content(assign.content.as_ref()) =>
                 {
+                    self.reject_unknown_attributes(
+                        assign.span,
+                        "assign",
+                        &assign.attributes,
+                        &["location", "expr", "src"],
+                    )?;
                     let Some(location) = assign.location.as_deref() else {
                         return self.invalid_datamodel(assign.span, "assign requires a location");
                     };
@@ -769,6 +862,41 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    fn invalid_document<T>(
+        &self,
+        span: Span,
+        message: impl Into<String>,
+    ) -> Result<T, CompileError> {
+        Err(CompileError::InvalidDocument {
+            source_name: self.document.source_name.clone(),
+            span_start: span.start,
+            message: message.into(),
+        })
+    }
+
+    fn reject_unknown_attributes(
+        &self,
+        span: Span,
+        element: &str,
+        attributes: &[Attribute],
+        allowed: &[&str],
+    ) -> Result<(), CompileError> {
+        let Some(attribute) = attributes.iter().find(|attribute| {
+            attribute.namespace.is_none()
+                && attribute.name != "xmlns"
+                && !allowed.contains(&attribute.local_name.as_str())
+        }) else {
+            return Ok(());
+        };
+        self.invalid_document(
+            span,
+            format!(
+                "unknown attribute `{}` on <{element}>",
+                attribute.local_name
+            ),
+        )
+    }
+
     fn effect_error(&self, span: Span, message: impl Into<String>) -> CompileError {
         CompileError::InvalidEffect {
             source_name: self.document.source_name.clone(),
@@ -781,6 +909,13 @@ impl<'a> Compiler<'a> {
 fn extension_attribute<'a>(extension: &'a Extension, name: &str) -> Option<&'a str> {
     extension
         .attributes
+        .iter()
+        .find(|attribute| attribute.namespace.is_none() && attribute.local_name == name)
+        .map(|attribute| attribute.value.as_str())
+}
+
+fn unqualified_attribute<'a>(attributes: &'a [Attribute], name: &str) -> Option<&'a str> {
+    attributes
         .iter()
         .find(|attribute| attribute.namespace.is_none() && attribute.local_name == name)
         .map(|attribute| attribute.value.as_str())
@@ -967,6 +1102,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_supported_syntax() {
+        let cases = [
+            (
+                r#"<scxml xmlns="{NS}"><state><transition/></state></scxml>"#,
+                "transition requires an event, condition, or target",
+            ),
+            (
+                r#"<scxml xmlns="{NS}"><state><transition event=" "/></state></scxml>"#,
+                "transition event cannot be empty",
+            ),
+            (
+                r#"<scxml xmlns="{NS}"><state><transition target=" "/></state></scxml>"#,
+                "transition target cannot be empty",
+            ),
+            (
+                r#"<scxml xmlns="{NS}"><state><onentry><raise/></onentry></state></scxml>"#,
+                "raise requires a non-empty event",
+            ),
+            (
+                r#"<scxml xmlns="{NS}"><state targett="typo"/></scxml>"#,
+                "unknown attribute `targett` on <state>",
+            ),
+            (
+                r#"<scxml xmlns="{NS}" version="2.0"><state/></scxml>"#,
+                "unsupported SCXML version `2.0`",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let document = scxml::parse("invalid.scxml", &source.replace("{NS}", NS)).unwrap();
+            assert!(
+                compile(&document)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
     fn authored_descriptors_match_generated_completion_events() {
         let document = scxml::parse(
             "completion.scxml",
@@ -984,16 +1159,67 @@ mod tests {
         let definition = compile(&document).unwrap();
 
         let execution =
-            StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap());
+            StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
+                .unwrap();
 
         assert_eq!(execution.status(), &InstanceStatus::Complete);
         assert_eq!(execution.active_state_names().last(), Some("pass"));
     }
 
+    #[test]
+    fn linking_rejects_unmatched_external_event_descriptors() {
+        let document = scxml::parse(
+            "typo.scxml",
+            &format!(
+                r#"<scxml xmlns="{NS}"><state id="waiting"><transition event="adavnce" target="done"/></state><final id="done"/></scxml>"#
+            ),
+        )
+        .unwrap();
+        let definition = compile(&document).unwrap();
+
+        let error = StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            &error.issues()[0],
+            crate::StateTreeLinkIssue::UnmatchedEventDescriptor {
+                descriptor,
+                span_start: Some(_),
+            } if descriptor.as_ref() == "adavnce"
+        ));
+    }
+
+    #[test]
+    fn root_completion_retains_final_without_running_its_exit_actions() {
+        let document = scxml::parse(
+            "complete.scxml",
+            &format!(
+                r#"<scxml xmlns="{NS}" datamodel="luau" initial="done">
+                    <datamodel><data id="exited" expr="false"/></datamodel>
+                    <final id="done"><onexit><assign location="exited" expr="true"/></onexit></final>
+                </scxml>"#
+            ),
+        )
+        .unwrap();
+        let definition = compile(&document).unwrap();
+
+        let execution =
+            StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
+                .unwrap();
+
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert_eq!(
+            execution.active_state_names().collect::<Vec<_>>(),
+            ["#document", "done"]
+        );
+        assert_eq!(execution.data("exited"), Some(&LuauValue::Boolean(false)));
+    }
+
     fn execute(source: &str) -> StateTreeExecution<NoEvents> {
         let document = scxml::parse("raises.scxml", source).unwrap();
         let definition = compile(&document).unwrap();
-        StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(32).unwrap())
+        StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(32).unwrap()).unwrap()
     }
 
     #[derive(Default)]
@@ -1028,7 +1254,8 @@ mod tests {
             &definition,
             NonZeroUsize::new(8).unwrap(),
             &mut effects,
-        );
+        )
+        .unwrap();
 
         assert_eq!(execution.status(), &InstanceStatus::Running);
         assert_eq!(effects.0, [("record".to_owned(), 5)]);
@@ -1066,7 +1293,8 @@ mod tests {
         let document = scxml::parse("payload.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
         let mut execution =
-            StateTreeExecution::<PayloadEvent>::new(&definition, NonZeroUsize::new(8).unwrap());
+            StateTreeExecution::<PayloadEvent>::new(&definition, NonZeroUsize::new(8).unwrap())
+                .unwrap();
 
         assert!(
             execution.process_event(&PayloadEvent { amount: 7 }, NonZeroUsize::new(8).unwrap(),)
@@ -1103,7 +1331,8 @@ mod tests {
         let mut execution = StateTreeExecution::<FailedProjectionEvent>::new(
             &definition,
             NonZeroUsize::new(8).unwrap(),
-        );
+        )
+        .unwrap();
 
         assert!(execution.process_event(
             &FailedProjectionEvent::Trigger,
@@ -1128,7 +1357,8 @@ mod tests {
         let mut execution = StateTreeExecution::<FailedProjectionEvent>::new(
             &definition,
             NonZeroUsize::new(8).unwrap(),
-        );
+        )
+        .unwrap();
 
         assert!(execution.process_event(
             &FailedProjectionEvent::Trigger,
@@ -1392,9 +1622,11 @@ mod tests {
         .unwrap();
         let definition = compile(&document).unwrap();
         let mut first =
-            StateTreeExecution::<CounterEvent>::new(&definition, NonZeroUsize::new(8).unwrap());
+            StateTreeExecution::<CounterEvent>::new(&definition, NonZeroUsize::new(8).unwrap())
+                .unwrap();
         let second =
-            StateTreeExecution::<CounterEvent>::new(&definition, NonZeroUsize::new(8).unwrap());
+            StateTreeExecution::<CounterEvent>::new(&definition, NonZeroUsize::new(8).unwrap())
+                .unwrap();
 
         assert!(first.process_event(&CounterEvent::Tick, NonZeroUsize::new(8).unwrap()));
 

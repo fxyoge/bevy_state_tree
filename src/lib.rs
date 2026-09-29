@@ -37,7 +37,10 @@ mod trace;
 pub mod scxml;
 
 pub use bevy_state_tree_macros::StateTreeEvents;
-pub use definition::{BuildError, StateId, StateTreeBuilder, StateTreeDefinition};
+pub use definition::{
+    BuildError, StateId, StateTreeBuilder, StateTreeDefinition, StateTreeLinkError,
+    StateTreeLinkIssue,
+};
 pub use effect::{
     FromStateTreeValue, StateTreeAppExt, StateTreeEffectArgs, StateTreeEffectContext,
     StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
@@ -51,8 +54,8 @@ pub use instance::{
 };
 pub use luau::LuauValue;
 pub use plugin::{
-    BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreePlugin, StateTreeSet,
-    StateTreeSettings,
+    BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeLinkFailure,
+    StateTreePlugin, StateTreeSet, StateTreeSettings,
 };
 pub use trace::{
     NoStateTreeTrace, StateTreeEventLog, StateTreeTrace, StateTreeTraceRecord,
@@ -68,7 +71,8 @@ pub mod prelude {
         StateTreeDomain, StateTreeEffectArgs, StateTreeEffectContext, StateTreeEffectError,
         StateTreeEffectRequest, StateTreeEffectSink, StateTreeEventDataError, StateTreeEventLog,
         StateTreeEventPayload, StateTreeEvents, StateTreeExecution, StateTreeInstance,
-        StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTrace, StateTreeTraceRecord,
+        StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin,
+        StateTreeSet, StateTreeSettings, StateTreeTrace, StateTreeTraceRecord,
         StateTreeTraceTrigger,
     };
 }

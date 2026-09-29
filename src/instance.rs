@@ -23,7 +23,8 @@ use crate::effect::{
 };
 use crate::{
     LuauValue, NoStateTreeTrace, StateTreeDefinition, StateTreeDomain, StateTreeEvents,
-    StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, luau, plugin::StateTreeEventInbox,
+    StateTreeLinkError, StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, luau,
+    plugin::StateTreeEventInbox,
 };
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -104,7 +105,13 @@ pub struct StateTreeExecution<E: StateTreeEvents> {
 
 impl<E: StateTreeEvents> StateTreeExecution<E> {
     /// Links and initializes a definition for headless execution.
-    pub fn new(definition: &StateTreeDefinition, microstep_limit: NonZeroUsize) -> Self {
+    ///
+    /// Linking fails when an authored event descriptor cannot match either the
+    /// typed event protocol or an event produced internally by the definition.
+    pub fn new(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+    ) -> Result<Self, StateTreeLinkError> {
         Self::new_traced(definition, microstep_limit, &mut NoStateTreeTrace)
     }
 
@@ -113,7 +120,7 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         definition: &StateTreeDefinition,
         microstep_limit: NonZeroUsize,
         sink: &mut S,
-    ) -> Self {
+    ) -> Result<Self, StateTreeLinkError> {
         Self::new_traced_with_sink(definition, microstep_limit, sink, &mut NoStateTreeTrace)
     }
 
@@ -122,11 +129,11 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         definition: &StateTreeDefinition,
         microstep_limit: NonZeroUsize,
         trace: &mut T,
-    ) -> Self {
+    ) -> Result<Self, StateTreeLinkError> {
         let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
             Arc::clone(&definition.compiled),
             None,
-        ));
+        )?);
         let mut instance = StateTreeInstance::new(Handle::default());
         instance.initialize_traced(
             linked,
@@ -135,7 +142,7 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
             &mut RejectEffects,
             trace,
         );
-        Self { instance }
+        Ok(Self { instance })
     }
 
     /// Links and initializes a definition while delivering effects and tracing execution.
@@ -144,11 +151,11 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         microstep_limit: NonZeroUsize,
         sink: &mut S,
         trace: &mut T,
-    ) -> Self {
+    ) -> Result<Self, StateTreeLinkError> {
         let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
             Arc::clone(&definition.compiled),
             None,
-        ));
+        )?);
         let mut instance = StateTreeInstance::new(Handle::default());
         instance.initialize_traced(
             linked,
@@ -157,7 +164,7 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
             &mut HeadlessEffectSink { sink },
             trace,
         );
-        Self { instance }
+        Ok(Self { instance })
     }
 
     /// Returns the current execution status.
@@ -244,6 +251,9 @@ pub enum InstanceStatus {
     /// The instance is stable and can receive events.
     Running,
     /// The instance entered a final child of the root state.
+    ///
+    /// The root and reached final state remain active for inspection. Completion
+    /// is not an implicit teardown, so the final state's exit actions do not run.
     Complete,
     /// Execution stopped because the definition could not stabilize.
     ///
@@ -520,6 +530,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 return true;
             }
         };
+        let configuration_changed = self.selected_step_changes_configuration(transition);
 
         self.trace_selected_step(1, transition, trace);
         if let Err(fault) = self.take_selected_step(
@@ -536,7 +547,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             self.finish_current_macrostep(trace);
             return true;
         }
-        self.update_completion(trace);
+        if configuration_changed {
+            self.update_completion(trace);
+        }
         if self.status == InstanceStatus::Running {
             self.stabilize(
                 microstep_limit,
@@ -579,6 +592,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .as_ref()
             .and_then(|linked| linked.compiled.event_name(event))
             .map(str::to_owned);
+        let configuration_changed = self.selected_step_changes_configuration(transition);
         self.trace_selected_step(1, transition, &mut NoStateTreeTrace);
         if let Err(fault) = self.take_selected_step(
             transition,
@@ -593,7 +607,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             self.status = InstanceStatus::Faulted(fault);
             return true;
         }
-        self.update_completion(&mut NoStateTreeTrace);
+        if configuration_changed {
+            self.update_completion(&mut NoStateTreeTrace);
+        }
         if self.status == InstanceStatus::Running {
             self.stabilize(
                 microstep_limit,
@@ -659,6 +675,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit });
                 return;
             }
+            let configuration_changed = self.selected_step_changes_configuration(transition);
             self.trace_selected_step(transitions_taken + 1, transition, trace);
             if let Err(fault) = self.take_selected_step(
                 transition,
@@ -674,7 +691,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 return;
             }
             transitions_taken += 1;
-            self.update_completion(trace);
+            if configuration_changed {
+                self.update_completion(trace);
+            }
             if self.status != InstanceStatus::Running {
                 return;
             }
@@ -737,6 +756,19 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             result.map(|()| (!runtime.selected.is_empty()).then_some(SelectedStep::Parallel));
         self.parallel = Some(runtime);
         selected
+    }
+
+    fn selected_step_changes_configuration(&self, selected: SelectedStep) -> bool {
+        match selected {
+            SelectedStep::Single(selected) => selected.transition.target.is_some(),
+            SelectedStep::Parallel => self
+                .parallel
+                .as_ref()
+                .expect("parallel runtime exists")
+                .selected
+                .iter()
+                .any(|selected| selected.transition.target.is_some()),
+        }
     }
 
     fn select_parallel_transition_set(
@@ -1458,7 +1490,7 @@ mod tests {
     struct TestEvents;
 
     impl crate::StateTreeEvents for TestEvents {
-        const AUTHORED_NAMES: &'static [&'static str] = &[];
+        const AUTHORED_NAMES: &'static [&'static str] = &["advance", "finish"];
 
         fn event_index(&self) -> usize {
             unreachable!()
@@ -1472,10 +1504,10 @@ mod tests {
     fn instance(definition: &StateTreeDefinition, limit: usize) -> StateTreeInstance<TestDomain> {
         let mut instance = StateTreeInstance::new(Handle::default());
         instance.initialize(
-            Arc::new(LinkedDefinition::<TestDomain>::new(
-                Arc::clone(&definition.compiled),
-                None,
-            )),
+            Arc::new(
+                LinkedDefinition::<TestDomain>::new(Arc::clone(&definition.compiled), None)
+                    .unwrap(),
+            ),
             limit,
             None,
             &mut RejectEffects,
@@ -1507,7 +1539,8 @@ mod tests {
         builder.event_descriptor(waiting, "combat", done).unwrap();
         let definition = builder.build().unwrap();
         let mut execution =
-            StateTreeExecution::<DescriptorEvents>::new(&definition, NonZeroUsize::new(8).unwrap());
+            StateTreeExecution::<DescriptorEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
+                .unwrap();
 
         assert!(execution.process_event(&DescriptorEvents::Combat, NonZeroUsize::new(8).unwrap()));
         assert_eq!(execution.status(), &InstanceStatus::Complete);
@@ -1784,6 +1817,37 @@ mod tests {
         assert_eq!(
             instance.active_state_names().collect::<Vec<_>>(),
             ["root", "stable"]
+        );
+    }
+
+    #[test]
+    fn targetless_completion_handler_does_not_repeat_completion() {
+        let mut builder = StateTreeBuilder::new("targetless-completion");
+        let root = builder.compound_root("root").unwrap();
+        let nested = builder.compound("nested", root).unwrap();
+        let running = builder.atomic("running", nested).unwrap();
+        let done = builder.final_state("done", nested).unwrap();
+        builder.initial(root, nested).unwrap();
+        builder.initial(nested, running).unwrap();
+        builder.transition(running, "finish", done).unwrap();
+        builder
+            .targetless_with_actions(
+                nested,
+                Some("done.state.nested".into()),
+                None,
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 3);
+
+        instance.process_authored_event("finish", 3);
+
+        assert_eq!(instance.status(), &InstanceStatus::Running);
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "nested", "done"]
         );
     }
 }
