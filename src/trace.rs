@@ -2,6 +2,13 @@ use std::fmt::Write;
 
 use crate::{InstanceStatus, LuauValue, RuntimeFault};
 
+/// How a shallow-history target selected its descendant configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateTreeHistoryResolution {
+    Default,
+    Stored,
+}
+
 /// Receives an ordered semantic trace from one state-tree execution.
 ///
 /// Records describe deterministic semantic execution, including operations
@@ -52,7 +59,15 @@ pub enum StateTreeTraceRecord<'a> {
     TransitionTarget {
         state: &'a str,
     },
+    TransitionHistoryTarget {
+        history: &'a str,
+        owner: &'a str,
+    },
     TransitionTargetless,
+    HistoryResolved {
+        history: &'a str,
+        resolution: StateTreeHistoryResolution,
+    },
     StateExitStarted {
         state: &'a str,
     },
@@ -160,8 +175,21 @@ impl StateTreeTrace for StateTreeEventLog {
             StateTreeTraceRecord::TransitionTarget { state } => {
                 writeln!(self.output, "target {state:?}").unwrap();
             }
+            StateTreeTraceRecord::TransitionHistoryTarget { history, owner } => {
+                writeln!(self.output, "target history {history:?} owner {owner:?}").unwrap();
+            }
             StateTreeTraceRecord::TransitionTargetless => {
                 self.output.push_str("targetless\n");
+            }
+            StateTreeTraceRecord::HistoryResolved {
+                history,
+                resolution,
+            } => {
+                let resolution = match resolution {
+                    StateTreeHistoryResolution::Default => "default",
+                    StateTreeHistoryResolution::Stored => "stored",
+                };
+                writeln!(self.output, "history {history:?} {resolution}").unwrap();
             }
             StateTreeTraceRecord::StateExitStarted { state } => {
                 writeln!(self.output, "exit begin {state:?}").unwrap();

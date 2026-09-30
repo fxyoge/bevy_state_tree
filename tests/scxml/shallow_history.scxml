@@ -1,0 +1,18 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="outside">
+  <state id="owner" initial="first">
+    <history id="recent">
+      <transition target="first">
+        <raise event="history.default"/>
+      </transition>
+    </history>
+    <state id="first">
+      <transition event="advance" target="second"/>
+    </state>
+    <state id="second">
+      <transition event="finish" target="outside"/>
+    </state>
+  </state>
+  <state id="outside">
+    <transition event="advance" target="recent"/>
+  </state>
+</scxml>

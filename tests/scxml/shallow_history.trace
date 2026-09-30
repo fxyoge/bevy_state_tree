@@ -1,0 +1,68 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "outside"
+configuration
+active "#document"
+active "outside"
+status running
+macrostep end
+macrostep external "advance"
+microstep 1
+transition "outside"
+target history "recent" owner "owner"
+exit begin "outside"
+exit "outside"
+history "recent" default
+enter "owner"
+raise "history.default"
+enter "first"
+consume internal "history.default"
+configuration
+active "#document"
+active "owner"
+active "first"
+status running
+macrostep end
+macrostep external "advance"
+microstep 1
+transition "first"
+target "second"
+exit begin "first"
+exit "first"
+enter "second"
+configuration
+active "#document"
+active "owner"
+active "second"
+status running
+macrostep end
+macrostep external "finish"
+microstep 1
+transition "second"
+target "outside"
+exit begin "second"
+exit begin "owner"
+exit "second"
+exit "owner"
+enter "outside"
+configuration
+active "#document"
+active "outside"
+status running
+macrostep end
+macrostep external "advance"
+microstep 1
+transition "outside"
+target history "recent" owner "owner"
+exit begin "outside"
+exit "outside"
+history "recent" stored
+enter "owner"
+enter "second"
+configuration
+active "#document"
+active "owner"
+active "second"
+status running
+macrostep end

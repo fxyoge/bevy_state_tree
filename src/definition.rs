@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -28,6 +29,44 @@ pub struct StateId {
 impl StateId {
     pub(crate) fn index(self) -> usize {
         self.index as usize
+    }
+}
+
+/// A compact shallow-history identifier local to one [`StateTreeDefinition`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HistoryId {
+    definition: u64,
+    index: u32,
+}
+
+impl HistoryId {
+    pub(crate) fn index(self) -> usize {
+        self.index as usize
+    }
+}
+
+/// A state-tree transition or compound initial target.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StateTreeTarget {
+    State(StateId),
+    History(HistoryId),
+}
+
+impl From<StateId> for StateTreeTarget {
+    fn from(state: StateId) -> Self {
+        Self::State(state)
+    }
+}
+
+impl From<HistoryId> for StateTreeTarget {
+    fn from(history: HistoryId) -> Self {
+        Self::History(history)
+    }
+}
+
+impl PartialEq<StateId> for StateTreeTarget {
+    fn eq(&self, other: &StateId) -> bool {
+        *self == Self::State(*other)
     }
 }
 
@@ -144,7 +183,7 @@ enum EventPattern {
 pub(crate) enum StateKind {
     Atomic,
     Compound {
-        initial: StateId,
+        initial: StateTreeTarget,
         completion: EventId,
     },
     Parallel {
@@ -165,6 +204,7 @@ pub(crate) struct StateNode {
     pub entry_actions: Box<[Action]>,
     pub exit_actions: Box<[Action]>,
     pub initial_actions: Box<[Action]>,
+    pub history_slot: Option<HistorySlotId>,
     pub activity_start: u32,
     pub activity_len: u32,
     pub transitions: Box<[Transition]>,
@@ -186,6 +226,55 @@ pub(crate) struct ActivityDefinition {
 pub(crate) struct Entry {
     pub state: StateId,
     pub take_initial: bool,
+    pub history_default: Option<HistoryIndex>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryIndex(NonZeroU32);
+
+impl HistoryIndex {
+    pub(crate) fn from_id(id: HistoryId) -> Self {
+        Self(NonZeroU32::new(id.index + 1).expect("history indices never equal u32::MAX"))
+    }
+
+    pub(crate) fn index(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistorySlotId(u32);
+
+impl HistorySlotId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HistoryDefinition {
+    pub name: Box<str>,
+    pub owner: StateId,
+    pub slot: HistorySlotId,
+    pub default: StateId,
+    pub action_start: u32,
+    pub action_len: u32,
+    pub entry_start: u32,
+    pub entry_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistorySlotDefinition {
+    pub owner: StateId,
+    pub child_plan_start: u32,
+    pub child_plan_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryChildPlan {
+    pub child: StateId,
+    pub entry_start: u32,
+    pub entry_len: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,7 +288,7 @@ pub(crate) enum TransitionTrigger {
 pub(crate) struct Transition {
     pub trigger: TransitionTrigger,
     pub condition: Option<ExpressionId>,
-    pub target: Option<StateId>,
+    pub target: Option<StateTreeTarget>,
     pub domain: Option<StateId>,
     pub exit_depth: u32,
     pub entry_start: u32,
@@ -232,6 +321,11 @@ pub(crate) struct CompiledDefinition {
     pub transition_actions: Box<[Action]>,
     pub named_arguments: Box<[NamedArgument]>,
     pub activities: Box<[ActivityDefinition]>,
+    pub histories: Box<[HistoryDefinition]>,
+    pub history_slots: Box<[HistorySlotDefinition]>,
+    pub history_child_plans: Box<[HistoryChildPlan]>,
+    pub history_entries: Box<[Entry]>,
+    pub history_subtree_ends: Option<Box<[u32]>>,
     pub initial_entries: Box<[Entry]>,
     pub max_depth: usize,
     pub max_active: usize,
@@ -245,7 +339,12 @@ pub(crate) struct CompiledDefinition {
 }
 
 impl CompiledDefinition {
-    pub fn state(&self, id: StateId) -> &StateNode {
+    pub fn state(&self, target: impl Into<StateTreeTarget>) -> &StateNode {
+        let id = match target.into() {
+            StateTreeTarget::State(state) => state,
+            // Runtime tracing can still name an unresolved history target by its owner.
+            StateTreeTarget::History(history) => self.history(history).owner,
+        };
         debug_assert_eq!(id.definition, self.identity);
         &self.states[id.index()]
     }
@@ -254,6 +353,30 @@ impl CompiledDefinition {
         let state = self.state(id);
         let start = state.child_start as usize;
         &self.children[start..start + state.child_len as usize]
+    }
+
+    pub(crate) fn history(&self, id: HistoryId) -> &HistoryDefinition {
+        debug_assert_eq!(id.definition, self.identity);
+        &self.histories[id.index()]
+    }
+
+    pub(crate) fn history_by_index(&self, id: HistoryIndex) -> &HistoryDefinition {
+        &self.histories[id.index()]
+    }
+
+    pub(crate) fn history_slot(&self, id: HistorySlotId) -> &HistorySlotDefinition {
+        &self.history_slots[id.index()]
+    }
+
+    pub(crate) fn history_child_plans(&self, slot: HistorySlotId) -> &[HistoryChildPlan] {
+        let slot = self.history_slot(slot);
+        let start = slot.child_plan_start as usize;
+        &self.history_child_plans[start..start + slot.child_plan_len as usize]
+    }
+
+    pub(crate) fn history_entries(&self, start: u32, len: u32) -> &[Entry] {
+        let start = start as usize;
+        &self.history_entries[start..start + len as usize]
     }
 
     pub fn internal_event_matches(&self, candidate: EventId, emitted: EventId) -> bool {
@@ -495,12 +618,28 @@ impl StateTreeDefinition {
     pub fn state_count(&self) -> usize {
         self.compiled.states.len()
     }
+
+    /// Returns the shallow-history name associated with an ID from this definition.
+    pub fn history_name(&self, history: HistoryId) -> Option<&str> {
+        if history.definition != self.compiled.identity {
+            return None;
+        }
+        self.compiled
+            .histories
+            .get(history.index())
+            .map(|history| history.name.as_ref())
+    }
+
+    /// Returns the number of shallow-history declarations in the definition.
+    pub fn history_count(&self) -> usize {
+        self.compiled.histories.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DraftKind {
     Atomic,
-    Compound { initial: Option<StateId> },
+    Compound { initial: Option<StateTreeTarget> },
     Parallel,
     Final,
 }
@@ -532,10 +671,19 @@ struct DraftActivity {
 struct DraftTransition {
     trigger: DraftTransitionTrigger,
     condition: Option<ExpressionId>,
-    target: Option<StateId>,
+    target: Option<StateTreeTarget>,
     internal: bool,
     actions: Vec<DraftAction>,
     span_start: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct DraftHistory {
+    name: Box<str>,
+    owner: StateId,
+    default: Option<StateId>,
+    actions: Vec<DraftAction>,
+    actions_set: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -782,7 +930,7 @@ enum StateTreeTransitionTrigger {
 pub struct StateTreeTransition {
     trigger: StateTreeTransitionTrigger,
     condition: Option<AuthoredExpression>,
-    target: Option<StateId>,
+    target: Option<StateTreeTarget>,
     internal: bool,
     actions: Vec<StateTreeAction>,
     span_start: usize,
@@ -849,8 +997,8 @@ impl StateTreeTransition {
     }
 
     /// Sets the transition target. A transition without a target only runs actions.
-    pub fn target(mut self, target: StateId) -> Self {
-        self.target = Some(target);
+    pub fn target(mut self, target: impl Into<StateTreeTarget>) -> Self {
+        self.target = Some(target.into());
         self
     }
 
@@ -899,7 +1047,8 @@ pub struct StateTreeBuilder {
     identity: u64,
     name: Box<str>,
     states: Vec<DraftState>,
-    names: HashMap<Box<str>, StateId>,
+    histories: Vec<DraftHistory>,
+    names: HashSet<Box<str>>,
     root: Option<StateId>,
     datamodel: Option<DraftLuauDataModel>,
 }
@@ -911,7 +1060,8 @@ impl StateTreeBuilder {
             identity: NEXT_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             states: Vec::new(),
-            names: HashMap::new(),
+            histories: Vec::new(),
+            names: HashSet::new(),
             root: None,
             datamodel: None,
         }
@@ -969,10 +1119,28 @@ impl StateTreeBuilder {
     }
 
     /// Selects the direct child entered with a compound state.
-    pub fn initial(&mut self, compound: StateId, child: StateId) -> Result<&mut Self, BuildError> {
-        self.require_state(child)?;
-        if self.states[child.index()].parent != Some(compound) {
-            return Err(BuildError::InitialNotDirectChild { compound, child });
+    pub fn initial(
+        &mut self,
+        compound: StateId,
+        target: impl Into<StateTreeTarget>,
+    ) -> Result<&mut Self, BuildError> {
+        let target = target.into();
+        match target {
+            StateTreeTarget::State(child) => {
+                self.require_state(child)?;
+                if self.states[child.index()].parent != Some(compound) {
+                    return Err(BuildError::InitialNotDirectChild { compound, child });
+                }
+            }
+            StateTreeTarget::History(history) => {
+                let draft = self.require_history(history)?;
+                if draft.owner != compound {
+                    return Err(BuildError::InitialHistoryOwnedByAnotherState {
+                        compound,
+                        history,
+                    });
+                }
+            }
         }
 
         let state = self.require_state_mut(compound)?;
@@ -982,7 +1150,89 @@ impl StateTreeBuilder {
         if initial.is_some() {
             return Err(BuildError::InitialAlreadySet(compound));
         }
-        *initial = Some(child);
+        *initial = Some(target);
+        Ok(self)
+    }
+
+    /// Adds a shallow-history pseudostate owned by a compound or parallel state.
+    pub fn shallow_history(
+        &mut self,
+        name: impl Into<Box<str>>,
+        owner: StateId,
+    ) -> Result<HistoryId, BuildError> {
+        let owner_state = self.require_state(owner)?;
+        if owner_state.parent.is_none() {
+            return Err(BuildError::HistoryOnRoot(owner));
+        }
+        if !matches!(
+            owner_state.kind,
+            DraftKind::Compound { .. } | DraftKind::Parallel
+        ) {
+            return Err(BuildError::HistoryOnNonContainer(owner));
+        }
+        let name = name.into();
+        if name.is_empty() {
+            return Err(BuildError::EmptyHistoryName);
+        }
+        if self.names.contains(name.as_ref()) {
+            return Err(BuildError::DuplicateHistoryName(name));
+        }
+        if self.histories.len() >= u32::MAX as usize {
+            return Err(BuildError::TooManyHistories);
+        }
+        let id = HistoryId {
+            definition: self.identity,
+            index: u32::try_from(self.histories.len()).map_err(|_| BuildError::TooManyHistories)?,
+        };
+        self.histories.push(DraftHistory {
+            name: name.clone(),
+            owner,
+            default: None,
+            actions: Vec::new(),
+            actions_set: false,
+        });
+        self.names.insert(name);
+        Ok(id)
+    }
+
+    /// Sets the history default to one direct child of its owner.
+    pub fn history_default(
+        &mut self,
+        history: HistoryId,
+        child: StateId,
+    ) -> Result<&mut Self, BuildError> {
+        self.require_state(child)?;
+        let draft = self.require_history(history)?;
+        if self.states[child.index()].parent != Some(draft.owner) {
+            return Err(BuildError::HistoryDefaultNotDirectChild { history, child });
+        }
+        if draft.default.is_some() {
+            return Err(BuildError::HistoryDefaultAlreadySet(history));
+        }
+        self.histories[history.index()].default = Some(child);
+        Ok(self)
+    }
+
+    /// Sets executable content run when a history target uses its default.
+    pub fn history_actions(
+        &mut self,
+        history: HistoryId,
+        actions: impl IntoIterator<Item = StateTreeAction>,
+    ) -> Result<&mut Self, BuildError> {
+        let draft = self.require_history(history)?;
+        if draft.actions_set {
+            return Err(BuildError::HistoryActionsAlreadySet(history));
+        }
+        let expression_checkpoint = self.expression_count();
+        let actions = match self.lower_actions(actions.into_iter().collect()) {
+            Ok(actions) => actions,
+            Err(error) => {
+                self.truncate_expressions(expression_checkpoint);
+                return Err(error);
+            }
+        };
+        self.histories[history.index()].actions = actions;
+        self.histories[history.index()].actions_set = true;
         Ok(self)
     }
 
@@ -1043,7 +1293,7 @@ impl StateTreeBuilder {
             return Err(BuildError::FinalHasTransition(source));
         }
         if let Some(target) = transition.target {
-            self.require_state(target)?;
+            self.require_target(target)?;
         }
         match &transition.trigger {
             StateTreeTransitionTrigger::EventDescriptors(events) => {
@@ -1424,6 +1674,14 @@ impl StateTreeBuilder {
             return Err(BuildError::EmptyDefinitionName);
         }
         let root = self.root.ok_or(BuildError::MissingRoot)?;
+        for (index, history) in self.histories.iter().enumerate() {
+            if history.default.is_none() {
+                return Err(BuildError::MissingHistoryDefault(HistoryId {
+                    definition: self.identity,
+                    index: u32::try_from(index).map_err(|_| BuildError::TooManyHistories)?,
+                }));
+            }
+        }
 
         let mut depths = Vec::with_capacity(self.states.len());
         for draft in &self.states {
@@ -1445,6 +1703,18 @@ impl StateTreeBuilder {
         let mut effect_ids = HashMap::<Box<str>, EffectId>::new();
         let mut effect_arguments = Vec::new();
         let mut activities = Vec::new();
+        let mut history_slots_by_state = vec![None; self.states.len()];
+        let mut history_slot_owners = Vec::new();
+        for history in &self.histories {
+            if history_slots_by_state[history.owner.index()].is_none() {
+                let slot = HistorySlotId(
+                    u32::try_from(history_slot_owners.len())
+                        .map_err(|_| BuildError::TooManyHistorySlots)?,
+                );
+                history_slots_by_state[history.owner.index()] = Some(slot);
+                history_slot_owners.push(history.owner);
+            }
+        }
         let mut children_by_state = vec![Vec::new(); self.states.len()];
         for (index, draft) in self.states.iter().enumerate() {
             if let Some(parent) = draft.parent {
@@ -1467,6 +1737,15 @@ impl StateTreeBuilder {
             order = order.checked_add(1).ok_or(BuildError::TooManyStates)?;
             pending.extend(children_by_state[state.index()].iter().rev().copied());
         }
+        let history_subtree_ends = (!self.histories.is_empty()).then(|| {
+            let mut ends: Vec<u32> = document_orders.iter().map(|order| order + 1).collect();
+            for index in (0..self.states.len()).rev() {
+                if let Some(parent) = self.states[index].parent {
+                    ends[parent.index()] = ends[parent.index()].max(ends[index]);
+                }
+            }
+            ends.into_boxed_slice()
+        });
 
         for (index, draft) in self.states.iter().enumerate() {
             let state_id = StateId {
@@ -1525,21 +1804,25 @@ impl StateTreeBuilder {
                     }
                 };
                 let (exit_depth, entry_start, entry_len) = if let Some(target) = transition.target {
+                    let effective_target = target_state(target, &self.histories);
                     let entry_start = u32::try_from(transition_entries.len())
                         .map_err(|_| BuildError::TooManyStates)?;
                     let entry_len = append_transition_entries(
                         state_id,
                         target,
                         transition.internal,
-                        &self.states,
-                        &depths,
-                        &children_by_state,
+                        DraftHierarchy {
+                            states: &self.states,
+                            depths: &depths,
+                            children: &children_by_state,
+                            histories: &self.histories,
+                        },
                         &mut transition_entries,
                     )?;
                     (
                         transition_exit_depth(
                             state_id,
-                            target,
+                            effective_target,
                             transition.internal,
                             &self.states,
                             &depths,
@@ -1555,9 +1838,11 @@ impl StateTreeBuilder {
                     condition: transition.condition,
                     target: transition.target,
                     domain: transition.target.and_then(|target| {
+                        // Every legal shallow-history value is an immediate child of
+                        // the owner, so its default child yields the same domain.
                         transition_domain(
                             state_id,
-                            target,
+                            target_state(target, &self.histories),
                             transition.internal,
                             &self.states,
                             &depths,
@@ -1616,6 +1901,7 @@ impl StateTreeBuilder {
                     &mut effect_ids,
                     &mut effect_arguments,
                 )?,
+                history_slot: history_slots_by_state[index],
                 activity_start: u32::try_from(activities.len())
                     .map_err(|_| BuildError::TooManyActivities)?,
                 activity_len: {
@@ -1668,8 +1954,95 @@ impl StateTreeBuilder {
             None,
             &self.states,
             &children_by_state,
+            &self.histories,
             &mut initial_entries,
         );
+
+        let mut history_entries = Vec::new();
+        let mut history_child_plans = Vec::new();
+        let mut history_slots = Vec::with_capacity(history_slot_owners.len());
+        for owner in history_slot_owners {
+            let child_plan_start =
+                u32::try_from(history_child_plans.len()).map_err(|_| BuildError::TooManyStates)?;
+            for child in &children_by_state[owner.index()] {
+                let entry_start =
+                    u32::try_from(history_entries.len()).map_err(|_| BuildError::TooManyStates)?;
+                append_entry_configuration(
+                    *child,
+                    None,
+                    &self.states,
+                    &children_by_state,
+                    &self.histories,
+                    &mut history_entries,
+                );
+                history_child_plans.push(HistoryChildPlan {
+                    child: *child,
+                    entry_start,
+                    entry_len: u32::try_from(history_entries.len())
+                        .map_err(|_| BuildError::TooManyStates)?
+                        - entry_start,
+                });
+            }
+            history_slots.push(HistorySlotDefinition {
+                owner,
+                child_plan_start,
+                child_plan_len: u32::try_from(history_child_plans.len())
+                    .map_err(|_| BuildError::TooManyStates)?
+                    - child_plan_start,
+            });
+        }
+
+        let mut histories = Vec::with_capacity(self.histories.len());
+        for draft in &self.histories {
+            let default = draft.default.expect("history defaults were validated");
+            let entry_start =
+                u32::try_from(history_entries.len()).map_err(|_| BuildError::TooManyStates)?;
+            if self.states[draft.owner.index()].kind == DraftKind::Parallel {
+                for child in &children_by_state[draft.owner.index()] {
+                    append_entry_configuration(
+                        *child,
+                        None,
+                        &self.states,
+                        &children_by_state,
+                        &self.histories,
+                        &mut history_entries,
+                    );
+                }
+            } else {
+                append_entry_configuration(
+                    default,
+                    None,
+                    &self.states,
+                    &children_by_state,
+                    &self.histories,
+                    &mut history_entries,
+                );
+            }
+            let action_start =
+                u32::try_from(transition_actions.len()).map_err(|_| BuildError::TooManyActions)?;
+            let action_len = append_actions(
+                &draft.actions,
+                &mut events,
+                &mut event_ids,
+                &mut effects,
+                &mut effect_ids,
+                &mut effect_arguments,
+                &mut transition_actions,
+            )?;
+            histories.push(HistoryDefinition {
+                name: draft.name.clone(),
+                owner: draft.owner,
+                slot: history_slots_by_state[draft.owner.index()]
+                    .expect("a history owner has a capture slot"),
+                default,
+                action_start,
+                action_len,
+                entry_start,
+                entry_len: u32::try_from(history_entries.len())
+                    .map_err(|_| BuildError::TooManyStates)?
+                    - entry_start,
+            });
+        }
         let max_depth = depths.iter().copied().max().unwrap_or(0).saturating_add(1) as usize;
         let mut max_configurations = vec![1usize; self.states.len()];
         for index in (0..self.states.len()).rev() {
@@ -1763,6 +2136,11 @@ impl StateTreeBuilder {
                 transition_actions: transition_actions.into_boxed_slice(),
                 named_arguments: effect_arguments.into_boxed_slice(),
                 activities: activities.into_boxed_slice(),
+                histories: histories.into_boxed_slice(),
+                history_slots: history_slots.into_boxed_slice(),
+                history_child_plans: history_child_plans.into_boxed_slice(),
+                history_entries: history_entries.into_boxed_slice(),
+                history_subtree_ends,
                 initial_entries: initial_entries.into_boxed_slice(),
                 max_depth,
                 max_active: max_configurations[root.index()],
@@ -1806,7 +2184,7 @@ impl StateTreeBuilder {
         if name.is_empty() {
             return Err(BuildError::EmptyStateName);
         }
-        if self.names.contains_key(name.as_ref()) {
+        if self.names.contains(name.as_ref()) {
             return Err(BuildError::DuplicateStateName(name));
         }
         let raw = u32::try_from(self.states.len()).map_err(|_| BuildError::TooManyStates)?;
@@ -1827,7 +2205,7 @@ impl StateTreeBuilder {
             transitions: Vec::new(),
             activities: Vec::new(),
         });
-        self.names.insert(name, id);
+        self.names.insert(name);
         Ok(id)
     }
 
@@ -1836,12 +2214,12 @@ impl StateTreeBuilder {
         source: StateId,
         trigger: DraftTransitionTrigger,
         condition: Option<ExpressionId>,
-        target: Option<(StateId, bool)>,
+        target: Option<(StateTreeTarget, bool)>,
         actions: Vec<DraftAction>,
         span_start: Option<u32>,
     ) -> Result<&mut Self, BuildError> {
         if let Some((target, _)) = target {
-            self.require_state(target)?;
+            self.require_target(target)?;
         }
         let (target, internal) =
             target.map_or((None, false), |(target, internal)| (Some(target), internal));
@@ -1876,6 +2254,31 @@ impl StateTreeBuilder {
         self.states
             .get_mut(id.index())
             .ok_or(BuildError::UnknownState(id))
+    }
+
+    fn require_history(&self, id: HistoryId) -> Result<&DraftHistory, BuildError> {
+        if id.definition != self.identity {
+            return Err(BuildError::ForeignHistory(id));
+        }
+        self.histories
+            .get(id.index())
+            .ok_or(BuildError::UnknownHistory(id))
+    }
+
+    fn require_target(&self, target: StateTreeTarget) -> Result<(), BuildError> {
+        match target {
+            StateTreeTarget::State(state) => self.require_state(state).map(|_| ()),
+            StateTreeTarget::History(history) => self.require_history(history).map(|_| ()),
+        }
+    }
+}
+
+fn target_state(target: StateTreeTarget, histories: &[DraftHistory]) -> StateId {
+    match target {
+        StateTreeTarget::State(state) => state,
+        StateTreeTarget::History(history) => histories[history.index()]
+            .default
+            .expect("history defaults were validated"),
     }
 }
 
@@ -2037,38 +2440,75 @@ fn transition_exit_depth(
         .map_or(0, |state| depths[state.index()] + 1)
 }
 
+#[derive(Clone, Copy)]
+struct DraftHierarchy<'a> {
+    states: &'a [DraftState],
+    depths: &'a [u32],
+    children: &'a [Vec<StateId>],
+    histories: &'a [DraftHistory],
+}
+
 fn append_transition_entries(
     source: StateId,
-    target: StateId,
+    target: StateTreeTarget,
     internal: bool,
-    states: &[DraftState],
-    depths: &[u32],
-    children: &[Vec<StateId>],
+    hierarchy: DraftHierarchy<'_>,
     entries: &mut Vec<Entry>,
 ) -> Result<u32, BuildError> {
-    let domain = transition_domain(source, target, internal, states, depths);
+    let effective_target = target_state(target, hierarchy.histories);
+    let domain = transition_domain(
+        source,
+        effective_target,
+        internal,
+        hierarchy.states,
+        hierarchy.depths,
+    );
     let start = entries.len();
-    let mut reverse = Vec::with_capacity(depths[target.index()] as usize + 1);
-    let mut cursor = Some(target);
+    let mut reverse = Vec::with_capacity(hierarchy.depths[effective_target.index()] as usize + 1);
+    let mut cursor = Some(effective_target);
     while cursor != domain {
         let state = cursor.expect("transition target and source share the definition root");
         reverse.push(state);
-        cursor = states[state.index()].parent;
+        cursor = hierarchy.states[state.index()].parent;
     }
     reverse.reverse();
 
-    if domain.is_some_and(|state| states[state.index()].kind == DraftKind::Parallel) {
+    if domain.is_some_and(|state| hierarchy.states[state.index()].kind == DraftKind::Parallel) {
         let explicit = reverse.first().copied();
-        for child in &children[domain.expect("checked domain").index()] {
+        for child in &hierarchy.children[domain.expect("checked domain").index()] {
             let path = (Some(*child) == explicit).then_some(reverse.as_slice());
-            append_entry_configuration(*child, path, states, children, entries);
+            append_entry_configuration(
+                *child,
+                path,
+                hierarchy.states,
+                hierarchy.children,
+                hierarchy.histories,
+                entries,
+            );
         }
     } else {
         let first = reverse
             .first()
             .copied()
             .expect("an external transition always re-enters at least its target");
-        append_entry_configuration(first, Some(&reverse), states, children, entries);
+        append_entry_configuration(
+            first,
+            Some(&reverse),
+            hierarchy.states,
+            hierarchy.children,
+            hierarchy.histories,
+            entries,
+        );
+    }
+
+    if let StateTreeTarget::History(history) = target {
+        let owner = hierarchy.histories[history.index()].owner;
+        if let Some(entry) = entries[start..]
+            .iter_mut()
+            .find(|entry| entry.state == owner)
+        {
+            entry.history_default = Some(HistoryIndex::from_id(history));
+        }
     }
 
     u32::try_from(entries.len() - start).map_err(|_| BuildError::TooManyStates)
@@ -2090,6 +2530,7 @@ fn append_entry_configuration(
     explicit_path: Option<&[StateId]>,
     states: &[DraftState],
     children: &[Vec<StateId>],
+    histories: &[DraftHistory],
     entries: &mut Vec<Entry>,
 ) {
     #[derive(Clone, Copy)]
@@ -2108,17 +2549,31 @@ fn append_entry_configuration(
     }) = pending.pop()
     {
         let explicit_child = explicit_path.and_then(|path| path.get(1)).copied();
+        let (initial_child, history_default) = match states[state.index()].kind {
+            DraftKind::Compound { initial } if explicit_child.is_none() => match initial {
+                Some(StateTreeTarget::State(child)) => (Some(child), None),
+                Some(StateTreeTarget::History(history)) => (
+                    histories[history.index()].default,
+                    Some(HistoryIndex::from_id(history)),
+                ),
+                None => (None, None),
+            },
+            _ => (None, None),
+        };
         let take_initial = matches!(states[state.index()].kind, DraftKind::Compound { .. })
             && explicit_child.is_none();
         entries.push(Entry {
             state,
             take_initial,
+            history_default,
         });
 
         match states[state.index()].kind {
             DraftKind::Atomic | DraftKind::Final => {}
             DraftKind::Compound { initial } => {
-                let child = explicit_child.or(initial);
+                let child = explicit_child
+                    .or(initial_child)
+                    .or_else(|| initial.map(|target| target_state(target, histories)));
                 if let Some(child) = child {
                     pending.push(Pending {
                         state: child,
@@ -2188,10 +2643,14 @@ pub enum BuildError {
     EmptyDefinitionName,
     #[error("a state name cannot be empty")]
     EmptyStateName,
+    #[error("a history name cannot be empty")]
+    EmptyHistoryName,
     #[error("an event name cannot be empty")]
     EmptyEventName,
-    #[error("state name `{0}` is duplicated")]
+    #[error("state name `{0}` duplicates another state or history name")]
     DuplicateStateName(Box<str>),
+    #[error("history name `{0}` duplicates another state or history name")]
+    DuplicateHistoryName(Box<str>),
     #[error("a definition must have exactly one compound root")]
     MissingRoot,
     #[error("a definition cannot have more than one root")]
@@ -2200,6 +2659,10 @@ pub enum BuildError {
     UnknownState(StateId),
     #[error("state {0:?} belongs to another definition")]
     ForeignState(StateId),
+    #[error("history {0:?} does not exist")]
+    UnknownHistory(HistoryId),
+    #[error("history {0:?} belongs to another definition")]
+    ForeignHistory(HistoryId),
     #[error("state {0:?} cannot contain child states")]
     ChildOfNonCompound(StateId),
     #[error("state {0:?} is not compound and cannot have an initial child")]
@@ -2210,6 +2673,23 @@ pub enum BuildError {
     InitialAlreadySet(StateId),
     #[error("compound state {0:?} has no initial child")]
     MissingInitial(StateId),
+    #[error("history {history:?} is not owned by compound state {compound:?}")]
+    InitialHistoryOwnedByAnotherState {
+        compound: StateId,
+        history: HistoryId,
+    },
+    #[error("the synthetic root state {0:?} cannot own history")]
+    HistoryOnRoot(StateId),
+    #[error("state {0:?} is not compound or parallel and cannot own history")]
+    HistoryOnNonContainer(StateId),
+    #[error("state {child:?} is not a direct child of history {history:?}'s owner")]
+    HistoryDefaultNotDirectChild { history: HistoryId, child: StateId },
+    #[error("history {0:?} already has a default child")]
+    HistoryDefaultAlreadySet(HistoryId),
+    #[error("history {0:?} has no default child")]
+    MissingHistoryDefault(HistoryId),
+    #[error("default actions are already set for history {0:?}")]
+    HistoryActionsAlreadySet(HistoryId),
     #[error("parallel state {0:?} has no regions")]
     ParallelHasNoRegions(StateId),
     #[error("final state {0:?} cannot have outgoing transitions")]
@@ -2218,6 +2698,10 @@ pub enum BuildError {
     FinalChildOfParallel(StateId),
     #[error("a definition cannot contain more than u32::MAX states")]
     TooManyStates,
+    #[error("a definition cannot contain more than u32::MAX histories")]
+    TooManyHistories,
+    #[error("a definition cannot contain more than u32::MAX history capture slots")]
+    TooManyHistorySlots,
     #[error("a definition cannot contain more than u32::MAX event names")]
     TooManyEvents,
     #[error("a definition cannot contain more than u32::MAX executable actions")]
@@ -2303,6 +2787,10 @@ struct DefinitionSemantics {
     transition_actions: Vec<ActionSemantics>,
     named_arguments: Vec<(Arc<str>, ExpressionId)>,
     activities: Vec<ActivitySemantics>,
+    histories: Vec<HistorySemantics>,
+    history_slots: Vec<HistorySlotSemantics>,
+    history_child_plans: Vec<HistoryChildPlanSemantics>,
+    history_entries: Vec<EntrySemantics>,
     initial_entries: Vec<EntrySemantics>,
     max_depth: usize,
     max_active: usize,
@@ -2340,6 +2828,7 @@ struct StateSemantics {
     entry_actions: Vec<ActionSemantics>,
     exit_actions: Vec<ActionSemantics>,
     initial_actions: Vec<ActionSemantics>,
+    history_slot: Option<u32>,
     activity_start: u32,
     activity_len: u32,
     transitions: Vec<TransitionSemantics>,
@@ -2349,8 +2838,13 @@ struct StateSemantics {
 #[derive(Debug, Eq, PartialEq)]
 enum StateKindSemantics {
     Atomic,
-    Compound { initial: u32, completion: EventId },
-    Parallel { completion: EventId },
+    Compound {
+        initial: TargetSemantics,
+        completion: EventId,
+    },
+    Parallel {
+        completion: EventId,
+    },
     Final,
 }
 
@@ -2359,7 +2853,7 @@ enum StateKindSemantics {
 struct TransitionSemantics {
     trigger: TransitionTrigger,
     condition: Option<ExpressionId>,
-    target: Option<u32>,
+    target: Option<TargetSemantics>,
     domain: Option<u32>,
     exit_depth: u32,
     entry_start: u32,
@@ -2373,6 +2867,43 @@ struct TransitionSemantics {
 struct EntrySemantics {
     state: u32,
     take_initial: bool,
+    history_default: Option<u32>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetSemantics {
+    State(u32),
+    History(u32),
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct HistorySemantics {
+    name: Box<str>,
+    owner: u32,
+    slot: u32,
+    default: u32,
+    action_start: u32,
+    action_len: u32,
+    entry_start: u32,
+    entry_len: u32,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct HistorySlotSemantics {
+    owner: u32,
+    child_plan_start: u32,
+    child_plan_len: u32,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct HistoryChildPlanSemantics {
+    child: u32,
+    entry_start: u32,
+    entry_len: u32,
 }
 
 #[cfg(test)]
@@ -2433,7 +2964,7 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                         initial,
                         completion,
                     } => StateKindSemantics::Compound {
-                        initial: initial.index,
+                        initial: target_semantics(initial),
                         completion,
                     },
                     StateKind::Parallel { completion } => {
@@ -2446,6 +2977,7 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                 entry_actions: state.entry_actions.iter().map(action_semantics).collect(),
                 exit_actions: state.exit_actions.iter().map(action_semantics).collect(),
                 initial_actions: state.initial_actions.iter().map(action_semantics).collect(),
+                history_slot: state.history_slot.map(|slot| slot.0),
                 activity_start: state.activity_start,
                 activity_len: state.activity_len,
                 transitions: state
@@ -2454,7 +2986,7 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                     .map(|transition| TransitionSemantics {
                         trigger: transition.trigger,
                         condition: transition.condition,
-                        target: transition.target.map(|state| state.index),
+                        target: transition.target.map(target_semantics),
                         domain: transition.domain.map(|state| state.index),
                         exit_depth: transition.exit_depth,
                         entry_start: transition.entry_start,
@@ -2493,6 +3025,43 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                 done: activity.done,
                 error: activity.error,
             })
+            .collect(),
+        histories: compiled
+            .histories
+            .iter()
+            .map(|history| HistorySemantics {
+                name: history.name.clone(),
+                owner: history.owner.index,
+                slot: history.slot.0,
+                default: history.default.index,
+                action_start: history.action_start,
+                action_len: history.action_len,
+                entry_start: history.entry_start,
+                entry_len: history.entry_len,
+            })
+            .collect(),
+        history_slots: compiled
+            .history_slots
+            .iter()
+            .map(|slot| HistorySlotSemantics {
+                owner: slot.owner.index,
+                child_plan_start: slot.child_plan_start,
+                child_plan_len: slot.child_plan_len,
+            })
+            .collect(),
+        history_child_plans: compiled
+            .history_child_plans
+            .iter()
+            .map(|plan| HistoryChildPlanSemantics {
+                child: plan.child.index,
+                entry_start: plan.entry_start,
+                entry_len: plan.entry_len,
+            })
+            .collect(),
+        history_entries: compiled
+            .history_entries
+            .iter()
+            .map(entry_semantics)
             .collect(),
         initial_entries: compiled
             .initial_entries
@@ -2552,12 +3121,26 @@ fn entry_semantics(entry: &Entry) -> EntrySemantics {
     EntrySemantics {
         state: entry.state.index,
         take_initial: entry.take_initial,
+        history_default: entry.history_default.map(|history| history.index() as u32),
+    }
+}
+
+#[cfg(test)]
+fn target_semantics(target: StateTreeTarget) -> TargetSemantics {
+    match target {
+        StateTreeTarget::State(state) => TargetSemantics::State(state.index),
+        StateTreeTarget::History(history) => TargetSemantics::History(history.index),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_layout_remains_compact_with_history_support() {
+        assert_eq!(std::mem::size_of::<Entry>(), 24);
+    }
 
     #[test]
     fn builds_deep_hierarchy_without_recursion() {
@@ -2596,11 +3179,11 @@ mod tests {
         let definition = builder.build().unwrap();
         assert_eq!(
             definition.compiled.state(first).transitions[0].target,
-            Some(second)
+            Some(second.into())
         );
         assert_eq!(
             definition.compiled.state(first).transitions[1].target,
-            Some(first)
+            Some(first.into())
         );
     }
 
@@ -2642,6 +3225,117 @@ mod tests {
         assert_eq!(
             builder.initial(root, second).unwrap_err(),
             BuildError::InitialAlreadySet(root)
+        );
+    }
+
+    #[test]
+    fn compiles_shallow_history_targets_and_shared_owner_slot() {
+        let mut builder = StateTreeBuilder::new("history");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let second = builder.atomic("second", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, first).unwrap();
+        let recent = builder.shallow_history("recent", owner).unwrap();
+        let fallback = builder.shallow_history("fallback", owner).unwrap();
+        builder.history_default(recent, first).unwrap();
+        builder.history_default(fallback, second).unwrap();
+        builder
+            .history_actions(recent, [StateTreeAction::raise("history.default")])
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("return").target(recent))
+            .unwrap();
+        builder
+            .add_transition(
+                owner,
+                StateTreeTransition::on("reset").target(recent).internal(),
+            )
+            .unwrap();
+
+        let definition = builder.build().unwrap();
+        let compiled = &definition.compiled;
+        assert_eq!(definition.history_name(recent), Some("recent"));
+        assert_eq!(definition.history_count(), 2);
+        assert_eq!(compiled.histories[0].slot, compiled.histories[1].slot);
+        assert_eq!(
+            compiled.state(owner).history_slot,
+            Some(compiled.histories[0].slot)
+        );
+        assert_eq!(
+            compiled.state(outside).transitions[0].target,
+            Some(recent.into())
+        );
+        assert_eq!(compiled.state(outside).transitions[0].domain, Some(root));
+        assert_eq!(compiled.state(owner).transitions[0].domain, Some(owner));
+        assert_eq!(compiled.histories[0].action_len, 1);
+        assert_eq!(
+            compiled
+                .history_child_plans(compiled.histories[0].slot)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn history_can_be_a_compound_initial_target() {
+        let mut builder = StateTreeBuilder::new("initial-history");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let child = builder.atomic("child", owner).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, child).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, history).unwrap();
+
+        let definition = builder.build().unwrap();
+        let owner_entry = definition
+            .compiled
+            .initial_entries
+            .iter()
+            .find(|entry| entry.state == owner)
+            .unwrap();
+        assert_eq!(
+            owner_entry.history_default,
+            Some(HistoryIndex::from_id(history))
+        );
+        assert_eq!(
+            definition.compiled.state(owner).kind,
+            StateKind::Compound {
+                initial: history.into(),
+                completion: match definition.compiled.state(owner).kind {
+                    StateKind::Compound { completion, .. } => completion,
+                    _ => unreachable!(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_history_owners_and_defaults() {
+        let mut builder = StateTreeBuilder::new("invalid-history");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let child = builder.atomic("child", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+
+        assert_eq!(
+            builder.shallow_history("root-history", root),
+            Err(BuildError::HistoryOnRoot(root))
+        );
+        assert_eq!(
+            builder.shallow_history("leaf-history", child),
+            Err(BuildError::HistoryOnNonContainer(child))
+        );
+        let history = builder.shallow_history("recent", owner).unwrap();
+        assert_eq!(
+            builder.history_default(history, outside).unwrap_err(),
+            BuildError::HistoryDefaultNotDirectChild {
+                history,
+                child: outside,
+            }
         );
     }
 

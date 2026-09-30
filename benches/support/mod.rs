@@ -347,6 +347,25 @@ pub fn activity_definition() -> BenchmarkDefinition {
     BenchmarkDefinition::Generated(builder.build().unwrap())
 }
 
+pub fn history_definition() -> BenchmarkDefinition {
+    let mut builder = StateTreeBuilder::new("history");
+    let root = builder.compound_root("root").unwrap();
+    let owner = builder.compound("owner", root).unwrap();
+    let active = builder.atomic("active", owner).unwrap();
+    let outside = builder.atomic("outside", root).unwrap();
+    let history = builder.shallow_history("recent", owner).unwrap();
+    builder.history_default(history, active).unwrap();
+    builder.initial(root, owner).unwrap();
+    builder.initial(owner, active).unwrap();
+    builder
+        .add_transition(active, StateTreeTransition::on("tick").target(outside))
+        .unwrap();
+    builder
+        .add_transition(outside, StateTreeTransition::on("tick").target(history))
+        .unwrap();
+    BenchmarkDefinition::Generated(builder.build().unwrap())
+}
+
 pub fn entity_toggle_definition() -> BenchmarkDefinition {
     BenchmarkDefinition::Generated(toggle_builder("entity-toggle", "tick.entity"))
 }

@@ -6,6 +6,7 @@ external_transition
 faulting_exit
 ignored_event
 implicit_initial
+shallow_history
 internal_transition
 onentry_order
 onexit_order

@@ -32,6 +32,28 @@ definition_parity_test!(minimal_luau_parity, "minimal_luau", minimal_luau_defini
 definition_parity_test!(after_transition_parity, "after", after_definition);
 definition_parity_test!(internal_transition_parity, "internal", internal_definition);
 definition_parity_test!(activity_parity, "activity", activity_definition);
+definition_parity_test!(history_parity, "history", history_definition);
+
+fn history_definition() -> Result<StateTreeDefinition, BuildError> {
+    let mut builder = StateTreeBuilder::new("history");
+    let root = builder.compound_root("#document")?;
+    let owner = builder.compound("owner", root)?;
+    let first = builder.atomic("first", owner)?;
+    let second = builder.atomic("second", owner)?;
+    let outside = builder.atomic("outside", root)?;
+    let recent = builder.shallow_history("recent", owner)?;
+
+    builder.history_default(recent, first)?;
+    builder.history_actions(recent, [StateTreeAction::raise("history.default")])?;
+    builder.initial(root, owner)?;
+    builder.initial(owner, recent)?;
+    builder.initial_actions(owner, [])?;
+    builder.add_transition(first, StateTreeTransition::on("advance").target(second))?;
+    builder.add_transition(second, StateTreeTransition::on("leave").target(outside))?;
+    builder.add_transition(outside, StateTreeTransition::on("return").target(recent))?;
+
+    builder.build()
+}
 
 fn activity_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("activity");

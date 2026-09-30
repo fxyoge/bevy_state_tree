@@ -119,7 +119,7 @@ fn parser_and_compiler_errors_fail_asset_loading() {
     assert!(
         unsupported_error
             .to_string()
-            .contains("unsupported SCXML feature: history states")
+            .contains("unsupported SCXML feature: deep history states")
     );
 }
 

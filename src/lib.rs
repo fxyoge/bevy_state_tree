@@ -39,9 +39,10 @@ pub mod scxml;
 
 pub use bevy_state_tree_macros::StateTreeEvents;
 pub use definition::{
-    BuildError, StateId, StateTreeAction, StateTreeActivityDefinition, StateTreeArgument,
-    StateTreeBuilder, StateTreeData, StateTreeDefinition, StateTreeEffectArgument,
-    StateTreeLinkError, StateTreeLinkIssue, StateTreeTransition,
+    BuildError, HistoryId, StateId, StateTreeAction, StateTreeActivityDefinition,
+    StateTreeArgument, StateTreeBuilder, StateTreeData, StateTreeDefinition,
+    StateTreeEffectArgument, StateTreeLinkError, StateTreeLinkIssue, StateTreeTarget,
+    StateTreeTransition,
 };
 pub use effect::{
     FromStateTreeValue, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
@@ -62,16 +63,16 @@ pub use plugin::{
     StateTreePlugin, StateTreeSet, StateTreeSettings,
 };
 pub use trace::{
-    NoStateTreeTrace, StateTreeEventLog, StateTreeTrace, StateTreeTraceRecord,
-    StateTreeTraceTrigger,
+    NoStateTreeTrace, StateTreeEventLog, StateTreeHistoryResolution, StateTreeTrace,
+    StateTreeTraceRecord, StateTreeTraceTrigger,
 };
 
 /// Common state-tree imports.
 pub mod prelude {
     pub use crate::{
         BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, DatamodelOperation,
-        EntityStateTreeEvent, EntityStateTreeEventWriter, FromStateTreeValue, InstanceStatus,
-        LuauValue, RuntimeFault, StateId, StateTreeAction, StateTreeActivity,
+        EntityStateTreeEvent, EntityStateTreeEventWriter, FromStateTreeValue, HistoryId,
+        InstanceStatus, LuauValue, RuntimeFault, StateId, StateTreeAction, StateTreeActivity,
         StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityDefinition,
         StateTreeActivityError, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
         StateTreeActivityRequest, StateTreeActivitySink, StateTreeActivityToken, StateTreeAppExt,
@@ -80,9 +81,9 @@ pub mod prelude {
         StateTreeEffectArgs, StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
         StateTreeEffectRequest, StateTreeEffectSink, StateTreeEventDataError, StateTreeEventLog,
         StateTreeEventPayload, StateTreeEvents, StateTreeExecution, StateTreeHeadlessActivityToken,
-        StateTreeInstance, StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue,
-        StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTrace, StateTreeTraceRecord,
-        StateTreeTraceTrigger, StateTreeTransition,
+        StateTreeHistoryResolution, StateTreeInstance, StateTreeLinkError, StateTreeLinkFailure,
+        StateTreeLinkIssue, StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTarget,
+        StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, StateTreeTransition,
     };
 }
 pub use activity::{

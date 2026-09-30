@@ -76,6 +76,32 @@ only its active descendants are exited. Internal transitions with any other
 source-target relationship behave like external transitions. Transition actions
 and descendant exit and entry actions retain their normal execution order.
 
+## Shallow History
+
+`<history>` with omitted `type` or `type="shallow"` is supported under compound
+and parallel states. It requires exactly one transition whose single target is
+an immediate real child of the owner. That transition cannot have an event,
+condition, transition type, or `bst:after`, but it may contain the same supported
+executable content as other transitions.
+
+Immediately active children are recorded before any exit action whenever the
+owner is exited. A compound owner records one child. A parallel owner records
+all of its direct regions; restoring it restarts each region through its normal
+initial descendants. Multiple shallow histories on one owner have independent
+defaults and default actions but observe the same stored configuration.
+
+When no configuration has been recorded, the default transition's content runs
+after the owner's entry and initial-transition actions and before descendant
+entry. If a transition to history leaves the owner active, those owner-entry and
+default-transition actions do not run. Stored restoration suppresses the
+default content in either case. History may be the target of an ordinary
+transition or a compound state's initial transition. It is a pseudo-state and
+never appears in the active configuration.
+
+History stores configuration only. Datamodel values continue normally, while
+timers and activities are cancelled on exit and start fresh on restored entry.
+Deep history remains unsupported and is rejected explicitly.
+
 ## Completion
 
 Entering a final child of a nested compound state raises `done.state.<id>` once

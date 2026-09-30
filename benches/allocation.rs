@@ -111,6 +111,27 @@ fn process_luau(bencher: Bencher<'_, '_>, instances: usize) {
 }
 
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
+fn process_shallow_history(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            let mut benchmark = BenchmarkApp::initialized(
+                support::history_definition(),
+                instances,
+                Executor::SingleThreaded,
+            );
+            benchmark.queue_broadcast();
+            benchmark.run_schedule();
+            benchmark.queue_broadcast();
+            benchmark
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
+}
+
+#[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
 fn process_typed_effect(bencher: Bencher<'_, '_>, instances: usize) {
     profile_effect_processing(bencher, instances);
 }
@@ -164,6 +185,11 @@ fn initialize_luau(bencher: Bencher<'_, '_>, instances: usize) {
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
 fn initialize_parallel(bencher: Bencher<'_, '_>, instances: usize) {
     profile_initialization(bencher, instances, support::parallel_definition);
+}
+
+#[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
+fn initialize_shallow_history(bencher: Bencher<'_, '_>, instances: usize) {
+    profile_initialization(bencher, instances, support::history_definition);
 }
 
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]

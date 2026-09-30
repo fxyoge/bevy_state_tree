@@ -71,6 +71,11 @@ fn broadcast_parallel_two_regions(bencher: Bencher<'_, '_>, instances: usize) {
 }
 
 #[divan::bench(args = [1_000, 100_000], sample_count = 10)]
+fn broadcast_shallow_history(bencher: Bencher<'_, '_>, instances: usize) {
+    process_broadcast(bencher, instances, support::history_definition);
+}
+
+#[divan::bench(args = [1_000, 100_000], sample_count = 10)]
 fn broadcast_typed_effect(bencher: Bencher<'_, '_>, instances: usize) {
     process_effects(bencher, instances);
 }

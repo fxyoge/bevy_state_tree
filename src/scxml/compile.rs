@@ -4,13 +4,13 @@ use thiserror::Error;
 
 use super::{
     Attribute, Content, ContentPart, DataModelChild, Document, ExecutableContent, Extension,
-    ExtensionContent, Final, FinalChild, Initial, OnEntry, OnExit, Parallel, ParallelChild,
-    RootChild, Span, State, StateChild, Transition, TransitionType,
+    ExtensionContent, Final, FinalChild, History, HistoryChild, Initial, OnEntry, OnExit, Parallel,
+    ParallelChild, RootChild, Span, State, StateChild, Transition, TransitionType,
 };
 use crate::{
-    BuildError, StateId, StateTreeAction, StateTreeActivityDefinition, StateTreeArgument,
-    StateTreeBuilder, StateTreeData, StateTreeDefinition, StateTreeEffectArgument,
-    StateTreeTransition,
+    BuildError, HistoryId, StateId, StateTreeAction, StateTreeActivityDefinition,
+    StateTreeArgument, StateTreeBuilder, StateTreeData, StateTreeDefinition,
+    StateTreeEffectArgument, StateTreeTarget, StateTreeTransition,
     definition::{is_activity_id, is_luau_identifier, is_scxml_system_name},
 };
 
@@ -85,11 +85,18 @@ struct Record<'a> {
     parent: StateId,
 }
 
+struct HistoryRecord<'a> {
+    node: &'a History,
+    owner: StateId,
+    runtime: Option<HistoryId>,
+}
+
 struct Compiler<'a> {
     document: &'a Document,
     builder: StateTreeBuilder,
     records: Vec<Record<'a>>,
-    ids: HashMap<&'a str, StateId>,
+    histories: Vec<HistoryRecord<'a>>,
+    ids: HashMap<&'a str, StateTreeTarget>,
     used_names: HashSet<String>,
     root_name: String,
     next_anonymous: usize,
@@ -110,6 +117,7 @@ impl<'a> Compiler<'a> {
                     .unwrap_or(&document.source_name),
             ),
             records: Vec::new(),
+            histories: Vec::new(),
             ids: HashMap::new(),
             used_names,
             root_name,
@@ -130,6 +138,8 @@ impl<'a> Compiler<'a> {
                 _ => {}
             }
         }
+        self.register_histories()?;
+        self.compile_histories()?;
         self.set_initial(
             root,
             self.document.root.span,
@@ -302,7 +312,7 @@ impl<'a> Compiler<'a> {
             self.builder.atomic(name, parent)?
         };
         if let Some(id) = state.id.as_deref() {
-            self.ids.insert(id, runtime);
+            self.ids.insert(id, runtime.into());
         }
         let mut entry_actions = Vec::new();
         let mut exit_actions = Vec::new();
@@ -337,9 +347,11 @@ impl<'a> Compiler<'a> {
                 StateChild::State(child) => self.add_state(child, runtime)?,
                 StateChild::Final(child) => self.add_final(child, runtime)?,
                 StateChild::Parallel(value) => self.add_parallel(value, runtime)?,
-                StateChild::History(value) => {
-                    return self.unsupported(value.span, "history states");
-                }
+                StateChild::History(value) => self.histories.push(HistoryRecord {
+                    node: value,
+                    owner: runtime,
+                    runtime: None,
+                }),
                 StateChild::DataModel(value) => {
                     return self.unsupported(value.span, "datamodels");
                 }
@@ -366,7 +378,7 @@ impl<'a> Compiler<'a> {
         let name = self.node_name(parallel.id.as_deref());
         let runtime = self.builder.parallel(name, parent)?;
         if let Some(id) = parallel.id.as_deref() {
-            self.ids.insert(id, runtime);
+            self.ids.insert(id, runtime.into());
         }
         let mut entry_actions = Vec::new();
         let mut exit_actions = Vec::new();
@@ -400,9 +412,11 @@ impl<'a> Compiler<'a> {
             match child {
                 ParallelChild::State(child) => self.add_state(child, runtime)?,
                 ParallelChild::Parallel(child) => self.add_parallel(child, runtime)?,
-                ParallelChild::History(value) => {
-                    return self.unsupported(value.span, "history states");
-                }
+                ParallelChild::History(value) => self.histories.push(HistoryRecord {
+                    node: value,
+                    owner: runtime,
+                    runtime: None,
+                }),
                 ParallelChild::DataModel(value) => {
                     return self.unsupported(value.span, "datamodels");
                 }
@@ -447,13 +461,112 @@ impl<'a> Compiler<'a> {
             .exit_actions(runtime, exit_actions)
             .map_err(|error| builder_error(source_name, error))?;
         if let Some(id) = state.id.as_deref() {
-            self.ids.insert(id, runtime);
+            self.ids.insert(id, runtime.into());
         }
         self.records.push(Record {
             node: Node::Final,
             runtime,
             parent,
         });
+        Ok(())
+    }
+
+    fn register_histories(&mut self) -> Result<(), CompileError> {
+        for index in 0..self.histories.len() {
+            let history = self.histories[index].node;
+            match history.history_type.as_deref() {
+                None | Some("shallow") => {}
+                Some("deep") => return self.unsupported(history.span, "deep history states"),
+                Some(value) => {
+                    return self
+                        .invalid_document(history.span, format!("invalid history type `{value}`"));
+                }
+            }
+            if has_foreign_attributes(&history.attributes) {
+                return self.unsupported(history.span, "foreign history attributes");
+            }
+            self.reject_unknown_attributes(
+                history.span,
+                "history",
+                &history.attributes,
+                &["id", "type"],
+            )?;
+            if let Some(extension) = history.children.iter().find_map(|child| match child {
+                HistoryChild::Extension(extension) => Some(extension),
+                HistoryChild::Transition(_) => None,
+            }) {
+                return self.unsupported(extension.span, "foreign history extensions");
+            }
+            if history.children.len() != 1 {
+                return self.invalid_document(
+                    history.span,
+                    "history requires exactly one transition child",
+                );
+            }
+
+            let name = self.node_name(history.id.as_deref());
+            let owner = self.histories[index].owner;
+            let runtime = self.builder.shallow_history(name, owner).map_err(|error| {
+                builder_error_at(&self.document.source_name, history.span, error)
+            })?;
+            self.histories[index].runtime = Some(runtime);
+            if let Some(id) = history.id.as_deref() {
+                self.ids.insert(id, runtime.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_histories(&mut self) -> Result<(), CompileError> {
+        for index in 0..self.histories.len() {
+            let history = self.histories[index].node;
+            let runtime = self.histories[index]
+                .runtime
+                .expect("histories are registered before defaults are compiled");
+            let HistoryChild::Transition(transition) = &history.children[0] else {
+                unreachable!("history extensions were rejected during registration")
+            };
+            self.reject_unknown_attributes(
+                transition.span,
+                "transition",
+                &transition.attributes,
+                &["event", "cond", "target", "type"],
+            )?;
+            if transition.event.is_some()
+                || transition.condition.is_some()
+                || transition.transition_type.is_some()
+                || transition.after.is_some()
+            {
+                return self.unsupported(transition.span, "triggered history transitions");
+            }
+            if has_foreign_attributes(&transition.attributes) {
+                return self.unsupported(transition.span, "foreign history transition attributes");
+            }
+            if transition.targets.len() != 1 {
+                return self.invalid_document(
+                    transition.span,
+                    "history transition must have exactly one target",
+                );
+            }
+            let target_name = &transition.targets[0];
+            let StateTreeTarget::State(default) = self.target(target_name, transition.span)? else {
+                return self.invalid_document(
+                    transition.span,
+                    "history default target must be a real state",
+                );
+            };
+            let actions = self.actions(&transition.content, transition.span)?;
+            self.builder
+                .history_default(runtime, default)
+                .map_err(|error| {
+                    builder_error_at(&self.document.source_name, transition.span, error)
+                })?;
+            self.builder
+                .history_actions(runtime, actions)
+                .map_err(|error| {
+                    builder_error_at(&self.document.source_name, transition.span, error)
+                })?;
+        }
         Ok(())
     }
 
@@ -533,9 +646,14 @@ impl<'a> Compiler<'a> {
             else {
                 return Ok(());
             };
-            child
+            child.into()
         };
-        self.builder.initial(state, child)?;
+        let target_span = explicit
+            .and_then(|initial| initial.transition.as_ref())
+            .map_or(span, |transition| transition.span);
+        self.builder
+            .initial(state, child)
+            .map_err(|error| builder_error_at(&self.document.source_name, target_span, error))?;
         Ok(())
     }
 
@@ -899,7 +1017,7 @@ impl<'a> Compiler<'a> {
             .at(extension.span.start))
     }
 
-    fn target(&self, target: &str, span: Span) -> Result<StateId, CompileError> {
+    fn target(&self, target: &str, span: Span) -> Result<StateTreeTarget, CompileError> {
         self.ids
             .get(target)
             .copied()
@@ -1026,6 +1144,17 @@ fn builder_error(source_name: &str, error: BuildError) -> CompileError {
     }
 }
 
+fn builder_error_at(source_name: &str, span: Span, error: BuildError) -> CompileError {
+    match builder_error(source_name, error) {
+        CompileError::Build(error) => CompileError::InvalidDocument {
+            source_name: source_name.to_owned(),
+            span_start: span.start,
+            message: error.to_string(),
+        },
+        error => error,
+    }
+}
+
 fn extension_attribute<'a>(extension: &'a Extension, name: &str) -> Option<&'a str> {
     extension
         .attributes
@@ -1050,6 +1179,11 @@ fn collect_ids(children: &[RootChild], ids: &mut HashSet<String>) {
             match child {
                 ParallelChild::State(child) => collect_state(child, ids),
                 ParallelChild::Parallel(child) => collect_parallel(child, ids),
+                ParallelChild::History(child) => {
+                    if let Some(id) = &child.id {
+                        ids.insert(id.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -1064,6 +1198,11 @@ fn collect_ids(children: &[RootChild], ids: &mut HashSet<String>) {
                 StateChild::State(child) => collect_state(child, ids),
                 StateChild::Parallel(child) => collect_parallel(child, ids),
                 StateChild::Final(child) => {
+                    if let Some(id) = &child.id {
+                        ids.insert(id.clone());
+                    }
+                }
+                StateChild::History(child) => {
                     if let Some(id) = &child.id {
                         ids.insert(id.clone());
                     }
@@ -1190,6 +1329,170 @@ mod tests {
                 .index(),
             second
         );
+    }
+
+    #[test]
+    fn compiles_shallow_history_for_compound_and_parallel_owners() {
+        let document = scxml::parse(
+            "history.scxml",
+            &format!(
+                r#"<scxml xmlns="{NS}" initial="owner">
+                    <state id="owner" initial="recent">
+                        <state id="first"/><state id="second"/>
+                        <history id="recent" type="shallow">
+                            <transition target="first"><raise event="history.default"/></transition>
+                        </history>
+                    </state>
+                    <state id="outside"><transition event="return" target="recent"/></state>
+                    <parallel id="regions">
+                        <state id="left"/><state id="right"/>
+                        <history id="regions-recent"><transition target="left"/></history>
+                    </parallel>
+                </scxml>"#
+            ),
+        )
+        .unwrap();
+
+        let definition = compile(&document).unwrap();
+        let compiled = &definition.compiled;
+        let owner = compiled
+            .states
+            .iter()
+            .position(|state| state.name.as_ref() == "owner")
+            .unwrap();
+        let outside = compiled
+            .states
+            .iter()
+            .position(|state| state.name.as_ref() == "outside")
+            .unwrap();
+
+        assert_eq!(definition.history_count(), 2);
+        assert_eq!(compiled.histories[0].owner.index(), owner);
+        assert_eq!(compiled.histories[0].action_len, 1);
+        let Some(StateTreeTarget::History(recent)) = compiled.states[outside].transitions[0].target
+        else {
+            panic!("return transition did not target history");
+        };
+        assert_eq!(definition.history_name(recent), Some("recent"));
+        assert!(matches!(
+            compiled.states[owner].kind,
+            crate::definition::StateKind::Compound {
+                initial: StateTreeTarget::History(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn anonymous_history_names_avoid_authored_ids() {
+        let document = scxml::parse(
+            "anonymous-history.scxml",
+            &format!(
+                r##"<scxml xmlns="{NS}"><state id="owner"><state id="#anonymous0"/><state/><history><transition target="#anonymous0"/></history></state></scxml>"##
+            ),
+        )
+        .unwrap();
+
+        let definition = compile(&document).unwrap();
+
+        assert_eq!(
+            definition.compiled.histories[0].name.as_ref(),
+            "#anonymous2"
+        );
+    }
+
+    #[test]
+    fn rejects_deep_history_precisely() {
+        let document = scxml::parse(
+            "deep-history.scxml",
+            &format!(
+                r#"<scxml xmlns="{NS}"><state id="owner"><state id="child"/><history type="deep"><transition target="child"/></history></state></scxml>"#
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            compile(&document),
+            Err(CompileError::Unsupported {
+                feature: "deep history states",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_shallow_history_forms() {
+        let namespace = super::super::BEVY_STATE_TREE_NAMESPACE;
+        let cases = [
+            (
+                r#"<state id="owner"><state id="child"/><history/></state>"#,
+                "history requires exactly one transition child",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition target="child"/><transition target="child"/></history></state>"#,
+                "history requires exactly one transition child",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition/></history></state>"#,
+                "history transition must have exactly one target",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition target="child child"/></history></state>"#,
+                "history transition must have exactly one target",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition event="go" target="child"/></history></state>"#,
+                "triggered history transitions",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition cond="true" target="child"/></history></state>"#,
+                "triggered history transitions",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition type="internal" target="child"/></history></state>"#,
+                "triggered history transitions",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition bst:after="1s" target="child"/></history></state>"#,
+                "triggered history transitions",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history other="value"><transition target="child"/></history></state>"#,
+                "unknown attribute `other` on <history>",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history x:other="value"><transition target="child"/></history></state>"#,
+                "foreign history attributes",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><x:other/><transition target="child"/></history></state>"#,
+                "foreign history extensions",
+            ),
+            (
+                r#"<state id="owner"><history><transition target="owner"/></history></state>"#,
+                "is not compound or parallel and cannot own history",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history id="first"><transition target="second"/></history><history id="second"><transition target="child"/></history></state>"#,
+                "history default target must be a real state",
+            ),
+            (
+                r#"<state id="owner"><state id="child"/><history><transition target="outside"/></history></state><state id="outside"/>"#,
+                "is not a direct child",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let source = format!(
+                r#"<scxml xmlns="{NS}" xmlns:bst="{namespace}" xmlns:x="urn:other">{body}</scxml>"#
+            );
+            let document = scxml::parse("invalid-history.scxml", &source).unwrap();
+            let message = compile(&document).unwrap_err().to_string();
+            assert!(
+                message.contains(expected),
+                "{message:?} did not contain {expected:?}"
+            );
+        }
     }
 
     #[test]

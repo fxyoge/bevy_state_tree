@@ -20,8 +20,8 @@ use crate::activity::{
     StateTreeHeadlessActivityToken,
 };
 use crate::definition::{
-    Action, ActivityId, CompiledDefinition, Entry, EventId, EventSet, ExpressionId,
-    LinkedDefinition, StateId, StateKind, TimerId, Transition, TransitionTrigger,
+    Action, ActivityId, CompiledDefinition, Entry, EventId, EventSet, ExpressionId, HistoryIndex,
+    LinkedDefinition, StateId, StateKind, StateTreeTarget, TimerId, Transition, TransitionTrigger,
 };
 use crate::effect::{
     HeadlessEffectSink, RejectEffects, RuntimeEffectSink, StateTreeEffectArgs,
@@ -29,8 +29,8 @@ use crate::effect::{
 };
 use crate::{
     LuauValue, NoStateTreeTrace, StateTreeActivityArgs, StateTreeDefinition, StateTreeDomain,
-    StateTreeEvents, StateTreeLinkError, StateTreeTrace, StateTreeTraceRecord,
-    StateTreeTraceTrigger, luau,
+    StateTreeEvents, StateTreeHistoryResolution, StateTreeLinkError, StateTreeTrace,
+    StateTreeTraceRecord, StateTreeTraceTrigger, luau,
     plugin::{StateTreeEventInbox, StateTreeTimers},
 };
 
@@ -119,6 +119,14 @@ struct ParallelRuntime {
     exited: Vec<StateId>,
     entries: Vec<Entry>,
     completed: Vec<StateId>,
+}
+
+#[derive(Debug)]
+struct HistoryRuntime {
+    values: Box<[Option<StateId>]>,
+    capturing: Box<[bool]>,
+    entries: Vec<Entry>,
+    alternate: Vec<Entry>,
 }
 
 struct ActionContext<'a, E> {
@@ -1141,6 +1149,7 @@ pub struct StateTreeInstance<D: StateTreeDomain> {
     now: Duration,
     timers: Vec<TimerSlot>,
     activities: Option<Box<[ActivitySlot]>>,
+    history: Option<Box<HistoryRuntime>>,
     timer_updates: Vec<TimerUpdate>,
     initial_data: StateTreeDataOverrides,
     data: Vec<LuauValue>,
@@ -1214,6 +1223,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             now: Duration::ZERO,
             timers: Vec::new(),
             activities: None,
+            history: None,
             timer_updates: Vec::new(),
             initial_data,
             data: Vec::new(),
@@ -1400,6 +1410,14 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .resize(compiled.timers.len(), TimerSlot::default());
         self.activities = (!compiled.activities.is_empty())
             .then(|| vec![ActivitySlot::default(); compiled.activities.len()].into_boxed_slice());
+        self.history = (!compiled.history_slots.is_empty()).then(|| {
+            Box::new(HistoryRuntime {
+                values: vec![None; compiled.history_slots.len()].into_boxed_slice(),
+                capturing: vec![false; compiled.history_slots.len()].into_boxed_slice(),
+                entries: Vec::with_capacity(compiled.max_active),
+                alternate: Vec::with_capacity(compiled.max_active),
+            })
+        });
         self.timer_updates.clear();
         self.data.clear();
         self.status = InstanceStatus::Running;
@@ -1408,7 +1426,31 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             self.finish_macrostep(compiled, trace);
             return;
         }
-        for entry in &compiled.initial_entries {
+        let initial_entries = if compiled
+            .initial_entries
+            .iter()
+            .any(|entry| entry.history_default.is_some())
+        {
+            let mut history = self.history.take().expect("history entry requires runtime");
+            materialize_history_entries(
+                compiled,
+                &history.values,
+                &compiled.initial_entries,
+                None,
+                &mut history.entries,
+                &mut history.alternate,
+                trace,
+            );
+            let entries = std::mem::take(&mut history.entries);
+            self.history = Some(history);
+            Some(entries)
+        } else {
+            None
+        };
+        let entries = initial_entries
+            .as_deref()
+            .unwrap_or(&compiled.initial_entries);
+        for entry in entries {
             if let Err(fault) = self.enter_state(
                 compiled,
                 *entry,
@@ -1426,6 +1468,12 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 self.finish_macrostep(compiled, trace);
                 return;
             }
+        }
+        if let Some(entries) = initial_entries {
+            self.history
+                .as_mut()
+                .expect("history runtime restored")
+                .entries = entries;
         }
         self.update_completion(entity, activities, trace);
         if self.status == InstanceStatus::Running {
@@ -2124,6 +2172,13 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 })
         });
 
+        capture_history_values(
+            &compiled,
+            &self.active,
+            &runtime.exited,
+            self.history.as_deref_mut(),
+        );
+
         for state in &runtime.exited {
             trace.record(StateTreeTraceRecord::StateExitStarted {
                 state: &compiled.state(*state).name,
@@ -2161,10 +2216,33 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
 
         runtime.entries.clear();
+        let mut history_runtime = self.history.take();
         for selected in &runtime.selected {
             let start = selected.transition.entry_start as usize;
             let end = start + selected.transition.entry_len as usize;
-            for entry in &compiled.transition_entries[start..end] {
+            let source_entries = &compiled.transition_entries[start..end];
+            let entries = if let Some(history) = history_runtime.as_mut()
+                && (matches!(
+                    selected.transition.target,
+                    Some(StateTreeTarget::History(_))
+                ) || source_entries
+                    .iter()
+                    .any(|entry| entry.history_default.is_some()))
+            {
+                materialize_history_entries(
+                    &compiled,
+                    &history.values,
+                    source_entries,
+                    selected.transition.target,
+                    &mut history.entries,
+                    &mut history.alternate,
+                    trace,
+                );
+                history.entries.as_slice()
+            } else {
+                source_entries
+            };
+            for entry in entries {
                 if self.active.contains(&entry.state) {
                     continue;
                 }
@@ -2179,6 +2257,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 }
             }
         }
+        self.history = history_runtime;
         runtime
             .entries
             .sort_unstable_by_key(|entry| compiled.state(entry.state).document_order);
@@ -2229,6 +2308,12 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             );
         }
         let exit_depth = transition.exit_depth as usize;
+        capture_history_values(
+            &compiled,
+            &self.active,
+            &self.active[exit_depth..],
+            self.history.as_deref_mut(),
+        );
         for index in (exit_depth..self.active.len()).rev() {
             let state = self.active[index];
             trace.record(StateTreeTraceRecord::StateExitStarted {
@@ -2264,8 +2349,36 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
         let start = transition.entry_start as usize;
         let end = start + transition.entry_len as usize;
-        for entry in &compiled.transition_entries[start..end] {
-            self.enter_state(&compiled, *entry, context, effects, activities, trace)?;
+        let source_entries = &compiled.transition_entries[start..end];
+        if self.history.is_some()
+            && (matches!(transition.target, Some(StateTreeTarget::History(_)))
+                || source_entries
+                    .iter()
+                    .any(|entry| entry.history_default.is_some()))
+        {
+            let mut history = self.history.take().expect("checked history runtime");
+            materialize_history_entries(
+                &compiled,
+                &history.values,
+                source_entries,
+                transition.target,
+                &mut history.entries,
+                &mut history.alternate,
+                trace,
+            );
+            let entries = std::mem::take(&mut history.entries);
+            self.history = Some(history);
+            for entry in &entries {
+                self.enter_state(&compiled, *entry, context, effects, activities, trace)?;
+            }
+            self.history
+                .as_mut()
+                .expect("history runtime restored")
+                .entries = entries;
+        } else {
+            for entry in source_entries {
+                self.enter_state(&compiled, *entry, context, effects, activities, trace)?;
+            }
         }
         debug_assert!(
             self.active
@@ -2290,9 +2403,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             source: &compiled.state(selected.source).name,
         });
         if let Some(target) = selected.transition.target {
-            trace.record(StateTreeTraceRecord::TransitionTarget {
-                state: &compiled.state(target).name,
-            });
+            trace_transition_target(compiled, target, trace);
         } else {
             trace.record(StateTreeTraceRecord::TransitionTargetless);
         }
@@ -2320,9 +2431,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                         source: &compiled.state(selected.source).name,
                     });
                     if let Some(target) = selected.transition.target {
-                        trace.record(StateTreeTraceRecord::TransitionTarget {
-                            state: &compiled.state(target).name,
-                        });
+                        trace_transition_target(compiled, target, trace);
                     } else {
                         trace.record(StateTreeTraceRecord::TransitionTargetless);
                     }
@@ -2352,6 +2461,18 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.start_state_activities(compiled, entry.state, context, activities, trace)?;
         if entry.take_initial {
             self.execute_actions(compiled, &state.initial_actions, context, effects, trace)?;
+        }
+        if let Some(history_id) = entry.history_default {
+            let history = compiled.history_by_index(history_id);
+            let start = history.action_start as usize;
+            let end = start + history.action_len as usize;
+            self.execute_actions(
+                compiled,
+                &compiled.transition_actions[start..end],
+                context,
+                effects,
+                trace,
+            )?;
         }
         Ok(())
     }
@@ -2907,7 +3028,176 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 }
 
+fn trace_transition_target<T: StateTreeTrace + ?Sized>(
+    compiled: &CompiledDefinition,
+    target: StateTreeTarget,
+    trace: &mut T,
+) {
+    match target {
+        StateTreeTarget::State(state) => trace.record(StateTreeTraceRecord::TransitionTarget {
+            state: &compiled.state(state).name,
+        }),
+        StateTreeTarget::History(history_id) => {
+            let history = compiled.history(history_id);
+            trace.record(StateTreeTraceRecord::TransitionHistoryTarget {
+                history: &history.name,
+                owner: &compiled.state(history.owner).name,
+            });
+        }
+    }
+}
+
+fn capture_history_values(
+    compiled: &CompiledDefinition,
+    active: &[StateId],
+    exited: &[StateId],
+    runtime: Option<&mut HistoryRuntime>,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    for owner in exited {
+        let Some(slot) = compiled.state(*owner).history_slot else {
+            continue;
+        };
+        match compiled.state(*owner).kind {
+            StateKind::Compound { .. } => {
+                runtime.values[slot.index()] = None;
+                runtime.capturing[slot.index()] = true;
+            }
+            StateKind::Parallel { .. } => runtime.values[slot.index()] = Some(*owner),
+            StateKind::Atomic | StateKind::Final => unreachable!(),
+        }
+    }
+    for state in active {
+        let Some(parent) = compiled.state(*state).parent else {
+            continue;
+        };
+        let Some(slot) = compiled.state(parent).history_slot else {
+            continue;
+        };
+        if runtime.capturing[slot.index()] {
+            runtime.values[slot.index()] = Some(*state);
+            runtime.capturing[slot.index()] = false;
+        }
+    }
+    debug_assert!(runtime.capturing.iter().all(|capturing| !capturing));
+}
+
+fn materialize_history_entries<T: StateTreeTrace + ?Sized>(
+    compiled: &CompiledDefinition,
+    values: &[Option<StateId>],
+    source: &[Entry],
+    explicit_target: Option<StateTreeTarget>,
+    entries: &mut Vec<Entry>,
+    alternate: &mut Vec<Entry>,
+    trace: &mut T,
+) {
+    entries.clear();
+    entries.extend_from_slice(source);
+
+    if let Some(StateTreeTarget::History(history_id)) = explicit_target
+        && !entries
+            .iter()
+            .any(|entry| entry.history_default == Some(HistoryIndex::from_id(history_id)))
+    {
+        replace_history_descendants(
+            compiled,
+            values,
+            HistoryIndex::from_id(history_id),
+            entries,
+            alternate,
+            None,
+            trace,
+        );
+    }
+
+    let mut index = 0;
+    while index < entries.len() {
+        let Some(history_id) = entries[index].history_default else {
+            index += 1;
+            continue;
+        };
+        let stored = values[compiled.history_by_index(history_id).slot.index()].is_some();
+        replace_history_descendants(
+            compiled,
+            values,
+            history_id,
+            entries,
+            alternate,
+            Some(index),
+            trace,
+        );
+        if stored {
+            entries[index].history_default = None;
+        }
+        index += 1;
+    }
+}
+
+fn replace_history_descendants<T: StateTreeTrace + ?Sized>(
+    compiled: &CompiledDefinition,
+    values: &[Option<StateId>],
+    history_id: HistoryIndex,
+    entries: &mut Vec<Entry>,
+    alternate: &mut Vec<Entry>,
+    owner_index: Option<usize>,
+    trace: &mut T,
+) {
+    let history = compiled.history_by_index(history_id);
+    debug_assert_eq!(compiled.state(history.default).parent, Some(history.owner));
+    let stored = values[history.slot.index()];
+    trace.record(StateTreeTraceRecord::HistoryResolved {
+        history: &history.name,
+        resolution: if stored.is_some() {
+            StateTreeHistoryResolution::Stored
+        } else {
+            StateTreeHistoryResolution::Default
+        },
+    });
+
+    let replacement = if let Some(remembered) = stored {
+        if matches!(
+            compiled.state(history.owner).kind,
+            StateKind::Parallel { .. }
+        ) {
+            compiled.history_entries(history.entry_start, history.entry_len)
+        } else {
+            let plans = compiled.history_child_plans(history.slot);
+            let plan = plans
+                .binary_search_by_key(&remembered.index(), |plan| plan.child.index())
+                .map(|index| &plans[index])
+                .expect("captured history child has a compiled entry plan");
+            compiled.history_entries(plan.entry_start, plan.entry_len)
+        }
+    } else {
+        compiled.history_entries(history.entry_start, history.entry_len)
+    };
+
+    let search_start = owner_index.map_or(0, |index| index + 1);
+    let first = entries[search_start..]
+        .iter()
+        .position(|entry| is_descendant(compiled, entry.state, history.owner))
+        .map_or(search_start, |index| search_start + index);
+    let mut end = first;
+    while end < entries.len() && is_descendant(compiled, entries[end].state, history.owner) {
+        end += 1;
+    }
+
+    alternate.clear();
+    alternate.extend_from_slice(&entries[..first]);
+    alternate.extend_from_slice(replacement);
+    alternate.extend_from_slice(&entries[end..]);
+    std::mem::swap(entries, alternate);
+}
+
 fn is_descendant(compiled: &CompiledDefinition, state: StateId, ancestor: StateId) -> bool {
+    if let Some(ends) = &compiled.history_subtree_ends {
+        let state_order = compiled.state(state).document_order;
+        let ancestor_order = compiled.state(ancestor).document_order;
+        return state_order > ancestor_order && state_order < ends[ancestor.index()];
+    }
+
     let mut cursor = compiled.state(state).parent;
     while let Some(current) = cursor {
         if current == ancestor {
@@ -3229,10 +3519,15 @@ mod tests {
         // Builder insertion order need not already be depth-first.
         let left_leaf = builder.atomic("left-leaf", left).unwrap();
         let right_leaf = builder.atomic("right-leaf", right).unwrap();
+        let history = builder.shallow_history("left-history", left).unwrap();
+        builder.history_default(history, left_leaf).unwrap();
         builder.initial(root, parallel).unwrap();
         builder.initial(left, left_leaf).unwrap();
         builder.initial(right, right_leaf).unwrap();
         let definition = builder.build().unwrap();
+
+        assert!(is_descendant(&definition.compiled, left_leaf, left));
+        assert!(!is_descendant(&definition.compiled, right_leaf, left));
 
         let instance = instance(&definition, 64);
 
@@ -3246,6 +3541,508 @@ mod tests {
                 "right",
                 "right-leaf"
             ]
+        );
+    }
+
+    #[test]
+    fn shallow_history_restores_the_last_direct_child() {
+        let mut builder = StateTreeBuilder::new("history");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let second = builder.atomic("second", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, first).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, first).unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("advance").target(second))
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(history))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "owner", "second"]
+        );
+    }
+
+    #[test]
+    fn initial_history_target_uses_default_then_stored_child() {
+        let mut builder = StateTreeBuilder::new("initial-history");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let second = builder.atomic("second", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, first).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, history).unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("advance").target(second))
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(owner))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "owner", "first"]
+        );
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "owner", "second"]
+        );
+    }
+
+    #[test]
+    fn shallow_history_restores_a_nested_child_at_its_initial_leaf() {
+        let mut builder = StateTreeBuilder::new("nested-shallow-history");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let nested = builder.compound("nested", owner).unwrap();
+        let initial_leaf = builder.atomic("initial-leaf", nested).unwrap();
+        let prior_leaf = builder.atomic("prior-leaf", nested).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, nested).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, nested).unwrap();
+        builder.initial(nested, initial_leaf).unwrap();
+        builder
+            .add_transition(
+                initial_leaf,
+                StateTreeTransition::on("advance").target(prior_leaf),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                prior_leaf,
+                StateTreeTransition::on("finish").target(outside),
+            )
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(history))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "owner", "nested", "initial-leaf"]
+        );
+    }
+
+    #[test]
+    fn history_default_actions_follow_owner_initial_actions_and_do_not_run_when_stored() {
+        let mut builder = StateTreeBuilder::new("history-action-order");
+        builder
+            .luau_datamodel([StateTreeData::new("log").with_initializer("''")])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let second = builder.atomic("second", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, first).unwrap();
+        builder
+            .history_actions(
+                history,
+                [StateTreeAction::assign("log", "log .. 'history>'")],
+            )
+            .unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, history).unwrap();
+        builder
+            .entry_actions(owner, [StateTreeAction::assign("log", "log .. 'owner>'")])
+            .unwrap();
+        builder
+            .initial_actions(owner, [StateTreeAction::assign("log", "log .. 'initial>'")])
+            .unwrap();
+        builder
+            .entry_actions(first, [StateTreeAction::assign("log", "log .. 'first>'")])
+            .unwrap();
+        builder
+            .entry_actions(second, [StateTreeAction::assign("log", "log .. 'second>'")])
+            .unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("advance").target(second))
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(history))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        assert_eq!(
+            instance.data("log"),
+            Some(&LuauValue::String("owner>initial>history>first>".into()))
+        );
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.data("log"),
+            Some(&LuauValue::String(
+                "owner>initial>history>first>second>owner>second>".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn repeated_owner_exits_replace_the_shallow_history_child() {
+        let mut builder = StateTreeBuilder::new("history-overwrite");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let second = builder.atomic("second", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, first).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, first).unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("advance").target(second))
+            .unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::on("advance").target(first))
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(history))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        assert_eq!(instance.active_state_names().last(), Some("second"));
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        assert_eq!(instance.active_state_names().last(), Some("first"));
+    }
+
+    #[test]
+    fn internal_history_transition_preserves_owner_for_default_and_stored_resolution() {
+        let mut builder = StateTreeBuilder::new("internal-history");
+        builder
+            .luau_datamodel([
+                StateTreeData::new("owner_entries").with_initializer("0"),
+                StateTreeData::new("owner_exits").with_initializer("0"),
+                StateTreeData::new("history_defaults").with_initializer("0"),
+            ])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let second = builder.atomic("second", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, second).unwrap();
+        builder
+            .history_actions(
+                history,
+                [StateTreeAction::assign(
+                    "history_defaults",
+                    "history_defaults + 1",
+                )],
+            )
+            .unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, first).unwrap();
+        builder
+            .entry_actions(
+                owner,
+                [StateTreeAction::assign(
+                    "owner_entries",
+                    "owner_entries + 1",
+                )],
+            )
+            .unwrap();
+        builder
+            .exit_actions(
+                owner,
+                [StateTreeAction::assign("owner_exits", "owner_exits + 1")],
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                owner,
+                StateTreeTransition::on("finish").target(history).internal(),
+            )
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::on("advance").target(outside))
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(owner))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        assert_eq!(instance.active_state_names().last(), Some("second"));
+        assert_eq!(instance.data("owner_entries"), Some(&LuauValue::Integer(1)));
+        assert_eq!(instance.data("owner_exits"), Some(&LuauValue::Integer(0)));
+        assert_eq!(
+            instance.data("history_defaults"),
+            Some(&LuauValue::Integer(0))
+        );
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        assert_eq!(instance.active_state_names().last(), Some("first"));
+        process_event(&mut instance, &TestEvents::Finish, 64);
+
+        assert_eq!(instance.active_state_names().last(), Some("second"));
+        assert_eq!(instance.data("owner_entries"), Some(&LuauValue::Integer(2)));
+        assert_eq!(instance.data("owner_exits"), Some(&LuauValue::Integer(1)));
+    }
+
+    #[test]
+    fn parallel_shallow_history_restarts_each_regions_initial_descendants() {
+        let mut builder = StateTreeBuilder::new("parallel-history");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.parallel("owner", root).unwrap();
+        let left = builder.compound("left", owner).unwrap();
+        let left_initial = builder.atomic("left-initial", left).unwrap();
+        let left_prior = builder.atomic("left-prior", left).unwrap();
+        let right = builder.compound("right", owner).unwrap();
+        let right_initial = builder.atomic("right-initial", right).unwrap();
+        let right_prior = builder.atomic("right-prior", right).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, left).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(left, left_initial).unwrap();
+        builder.initial(right, right_initial).unwrap();
+        builder
+            .add_transition(
+                left_initial,
+                StateTreeTransition::on("advance").target(left_prior),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                right_initial,
+                StateTreeTransition::on("advance").target(right_prior),
+            )
+            .unwrap();
+        builder
+            .add_transition(owner, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(history))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            [
+                "root",
+                "owner",
+                "left",
+                "left-initial",
+                "right",
+                "right-initial"
+            ]
+        );
+    }
+
+    #[test]
+    fn histories_with_one_owner_have_distinct_defaults_and_share_the_captured_child() {
+        let mut builder = StateTreeBuilder::new("shared-history-slot");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let second = builder.atomic("second", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let first_history = builder.shallow_history("first-history", owner).unwrap();
+        let second_history = builder.shallow_history("second-history", owner).unwrap();
+        builder.history_default(first_history, first).unwrap();
+        builder.history_default(second_history, second).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, first_history).unwrap();
+        builder
+            .add_transition(
+                owner,
+                StateTreeTransition::on("advance")
+                    .target(second_history)
+                    .internal(),
+            )
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        builder
+            .add_transition(
+                outside,
+                StateTreeTransition::on("advance").target(first_history),
+            )
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        assert_eq!(instance.active_state_names().last(), Some("first"));
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        assert_eq!(instance.active_state_names().last(), Some("second"));
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(instance.active_state_names().last(), Some("second"));
+        assert!(
+            !instance
+                .active_state_names()
+                .any(|state| state == "first-history" || state == "second-history")
+        );
+    }
+
+    #[test]
+    fn history_trace_identifies_the_target_and_default_and_stored_resolutions() {
+        let mut builder = StateTreeBuilder::new("history-trace");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let first = builder.atomic("first", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, first).unwrap();
+        builder.initial(root, outside).unwrap();
+        builder.initial(owner, first).unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(history))
+            .unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("finish").target(outside))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut trace = StateTreeEventLog::new();
+        let mut execution = StateTreeExecution::<TestEvents>::new_traced(
+            &definition,
+            NonZeroUsize::new(64).unwrap(),
+            &mut trace,
+        )
+        .unwrap();
+
+        execution.process_event_traced(
+            &TestEvents::Advance,
+            NonZeroUsize::new(64).unwrap(),
+            &mut trace,
+        );
+        execution.process_event_traced(
+            &TestEvents::Finish,
+            NonZeroUsize::new(64).unwrap(),
+            &mut trace,
+        );
+        execution.process_event_traced(
+            &TestEvents::Advance,
+            NonZeroUsize::new(64).unwrap(),
+            &mut trace,
+        );
+
+        assert_eq!(
+            trace
+                .as_str()
+                .matches("target history \"recent\" owner \"owner\"\n")
+                .count(),
+            2
+        );
+        assert_eq!(
+            trace
+                .as_str()
+                .matches("history \"recent\" default\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            trace
+                .as_str()
+                .matches("history \"recent\" stored\n")
+                .count(),
+            1
+        );
+        assert!(
+            !execution
+                .active_state_names()
+                .any(|state| state == "recent")
+        );
+    }
+
+    #[test]
+    fn shallow_history_can_restore_a_final_child_without_completing_the_root() {
+        let mut builder = StateTreeBuilder::new("history-final");
+        let root = builder.compound_root("root").unwrap();
+        let owner = builder.compound("owner", root).unwrap();
+        let running = builder.atomic("running", owner).unwrap();
+        let done = builder.final_state("done", owner).unwrap();
+        let outside = builder.atomic("outside", root).unwrap();
+        let history = builder.shallow_history("recent", owner).unwrap();
+        builder.history_default(history, running).unwrap();
+        builder.initial(root, owner).unwrap();
+        builder.initial(owner, running).unwrap();
+        builder
+            .add_transition(running, StateTreeTransition::on("finish").target(done))
+            .unwrap();
+        builder
+            .add_transition(owner, StateTreeTransition::on("advance").target(outside))
+            .unwrap();
+        builder
+            .add_transition(outside, StateTreeTransition::on("advance").target(history))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Finish, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(instance.status(), &InstanceStatus::Running);
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "owner", "done"]
         );
     }
 

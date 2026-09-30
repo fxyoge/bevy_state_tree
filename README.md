@@ -7,6 +7,7 @@ The crate currently provides the runtime foundation:
 - immutable `StateTreeDefinition` assets;
 - entity-local, domain-typed `StateTreeInstance` components;
 - atomic, compound, parallel, and final states;
+- shallow history for compound and parallel states;
 - hierarchical, eventless, and compound-completion transitions;
 - external and internal transition semantics;
 - static state-scoped `after` transitions with deterministic deadline ordering;
@@ -21,7 +22,7 @@ The crate currently provides the runtime foundation:
 - ordered per-instance entity and broadcast event queues;
 - parallel event processing across independent instances.
 
-Behavior-tree composites and history remain future work. Standard SCXML
+Behavior-tree composites and deep history remain future work. Standard SCXML
 `<invoke>` is intentionally unsupported; long-running Bevy work uses the
 structural `bst:activity` extension instead.
 
@@ -217,6 +218,37 @@ variants. Bevy execution reads `Time`, so `TimePlugin` must be installed before
 therefore wins over an external event delivered in the same schedule run when
 both leave the same active state.
 
+Shallow history records an owner's immediately active children before the owner
+exits. Restoring a compound child follows that child's normal initial
+configuration; it does not restore deeper descendants. Timers and activities
+restart through normal entry semantics rather than preserving elapsed time or
+activity generations. A history target uses its required default child and
+actions until its owner has exited once:
+
+```rust,no_run
+# use bevy_state_tree::prelude::*;
+# fn definition() -> Result<StateTreeDefinition, BuildError> {
+let mut builder = StateTreeBuilder::new("resume");
+let root = builder.compound_root("root")?;
+let movement = builder.compound("movement", root)?;
+let idle = builder.atomic("idle", movement)?;
+let running = builder.atomic("running", movement)?;
+let paused = builder.atomic("paused", root)?;
+let recent = builder.shallow_history("recent-movement", movement)?;
+builder.history_default(recent, idle)?;
+builder.initial(root, movement)?;
+builder.initial(movement, idle)?;
+builder.add_transition(running, StateTreeTransition::on("pause").target(paused))?;
+builder.add_transition(paused, StateTreeTransition::on("resume").target(recent))?;
+# builder.build()
+# }
+```
+
+A compound state's initial target may itself be history, providing an
+encapsulated "resume when re-entered" policy. Multiple shallow histories under
+one owner may have different defaults but share the same stored configuration
+after that owner exits.
+
 Malformed XML and unsupported runtime semantics fail asset loading. Typed event
 descriptors, effects, and activities are domain-specific, so they are linked
 later when an instance initializes. A linking failure leaves the loaded
@@ -328,7 +360,8 @@ Run `just bench` for both throughput and allocation profiles, or use
 cases cover broadcast processing across as many as one million independent
 trees, sparse entity events in a population of 100,000, initialization, activity
 initialization and outcome processing, deep re-entry, transition scanning,
-typed effects, wide parallel configurations, far-future idle timer populations,
+typed effects, shallow-history restoration, wide parallel configurations,
+far-future idle timer populations,
 and dense timer expiry. Parsing, compilation, and spawning remain outside
 steady-state processing timings; event cases queue and process exactly one
 configured event per measured schedule run.
