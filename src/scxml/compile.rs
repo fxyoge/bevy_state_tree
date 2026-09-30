@@ -1915,6 +1915,40 @@ mod tests {
     }
 
     #[test]
+    fn unhandled_activity_outcome_still_stabilizes_eventless_transitions() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+                <state id="active">
+                    <bst:activity id="job" name="work"/>
+                    <transition cond="_event ~= nil and _event.data == 7" target="pass"/>
+                </state>
+                <final id="pass"/>
+            </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let definition =
+            compile(&scxml::parse("activity-eventless.scxml", &source).unwrap()).unwrap();
+        let mut sink = RecordingActivities::default();
+        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
+            &definition,
+            no_events_protocol(),
+            NonZeroUsize::new(1).unwrap(),
+            &mut sink,
+        )
+        .unwrap();
+        let token = sink.starts[0].3;
+
+        assert!(execution.complete_activity(
+            token,
+            Some(LuauValue::Integer(7)),
+            NonZeroUsize::new(1).unwrap(),
+            &mut sink,
+        ));
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
+    }
+
+    #[test]
     fn activity_payload_does_not_leak_to_a_raised_internal_event() {
         let source = format!(
             r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">

@@ -1877,17 +1877,17 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 return true;
             }
         };
+        let context = ActionContext {
+            event_name: compiled.event_name(event),
+            external_event: None,
+            event_data: data.as_ref(),
+            entity,
+        };
         let selected = self.select_step(Trigger::Internal(event, data.as_ref()));
         match selected {
             Ok(Some(selected)) => {
                 let changed = self.selected_step_changes_configuration(selected);
                 self.trace_selected_step(1, selected, trace);
-                let context = ActionContext {
-                    event_name: compiled.event_name(event),
-                    external_event: None,
-                    event_data: data.as_ref(),
-                    entity,
-                };
                 if let Err(fault) =
                     self.take_selected_step(selected, context, effects, activities, trace)
                 {
@@ -1901,7 +1901,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     }
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                self.stabilize(microstep_limit, 0, context, effects, activities, trace);
+            }
             Err(fault) => self.set_fault(fault, entity, activities, trace),
         }
         self.finish_current_macrostep(trace);
