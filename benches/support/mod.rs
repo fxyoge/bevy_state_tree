@@ -6,15 +6,16 @@ use bevy_app::{App, TaskPoolPlugin};
 use bevy_asset::{AssetPlugin, AssetServer, Assets, Handle, LoadState};
 use bevy_ecs::{
     event::{EntityEvent, Event},
-    message::{Message, Messages},
+    message::{Message, MessageReader, Messages},
     prelude::{Entity, Query, ResMut, Resource, With},
     schedule::{IntoScheduleConfigs, ScheduleLabel, SingleThreadedExecutor},
     system::{Res, RunSystemOnce},
 };
 use bevy_state_tree::{
-    BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeAppExt, StateTreeBuilder,
-    StateTreeDefinition, StateTreeEvents, StateTreeInstance, StateTreePlugin, StateTreeSet,
-    StateTreeTransition,
+    BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeActivity,
+    StateTreeActivityDefinition, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
+    StateTreeActivityToken, StateTreeAppExt, StateTreeBuilder, StateTreeDefinition,
+    StateTreeEvents, StateTreeInstance, StateTreePlugin, StateTreeSet, StateTreeTransition,
 };
 use bevy_tasks::{AsyncComputeTaskPool, IoTaskPool, TaskPoolBuilder};
 use bevy_time::{Time, TimePlugin};
@@ -42,6 +43,16 @@ pub struct Ignored;
 
 #[derive(Message)]
 struct BenchmarkEffect;
+
+struct BenchmarkActivity;
+
+impl StateTreeActivity for BenchmarkActivity {
+    type Output = ();
+    type Error = ();
+}
+
+#[derive(Resource, Default)]
+struct BenchmarkActivityTokens(Vec<StateTreeActivityToken<Simulation, BenchmarkActivity>>);
 
 #[derive(StateTreeEvents)]
 #[state_tree(domain = Simulation)]
@@ -156,6 +167,26 @@ impl BenchmarkApp {
             );
     }
 
+    pub fn register_benchmark_activity(&mut self) {
+        self.app
+            .register_state_tree_activity::<Simulation, BenchmarkActivity, _>(
+                "benchmark",
+                |_context, _arguments| Ok(BenchmarkActivity),
+            )
+            .init_resource::<BenchmarkActivityTokens>()
+            .add_systems(
+                AiUpdate,
+                collect_benchmark_activities.in_set(StateTreeSet::HandleActivities),
+            );
+    }
+
+    pub fn queue_activity_outcomes(&mut self) {
+        self.app
+            .world_mut()
+            .run_system_once(complete_benchmark_activities)
+            .expect("benchmark activity outcome system should run");
+    }
+
     pub fn initialized(
         definition: BenchmarkDefinition,
         instances: usize,
@@ -262,6 +293,26 @@ fn clear_benchmark_effects(mut effects: ResMut<Messages<BenchmarkEffect>>) {
     effects.clear();
 }
 
+fn collect_benchmark_activities(
+    mut messages: MessageReader<StateTreeActivityLifecycle<Simulation, BenchmarkActivity>>,
+    mut tokens: ResMut<BenchmarkActivityTokens>,
+) {
+    for message in messages.read() {
+        if let StateTreeActivityLifecycle::Started { token, .. } = message {
+            tokens.0.push(*token);
+        }
+    }
+}
+
+fn complete_benchmark_activities(
+    tokens: Res<BenchmarkActivityTokens>,
+    mut outcomes: StateTreeActivityOutcomeWriter<Simulation, BenchmarkActivity>,
+) {
+    for token in &tokens.0 {
+        assert!(outcomes.complete(*token, ()));
+    }
+}
+
 pub fn toggle_definition() -> BenchmarkDefinition {
     BenchmarkDefinition::Asset(TOGGLE)
 }
@@ -276,6 +327,24 @@ pub fn parallel_definition() -> BenchmarkDefinition {
 
 pub fn effect_definition() -> BenchmarkDefinition {
     BenchmarkDefinition::Asset(EFFECT)
+}
+
+pub fn activity_definition() -> BenchmarkDefinition {
+    let mut builder = StateTreeBuilder::new("activity");
+    let root = builder.compound_root("root").unwrap();
+    let active = builder.atomic("active", root).unwrap();
+    let done = builder.atomic("done", root).unwrap();
+    builder.initial(root, active).unwrap();
+    builder
+        .add_activity(active, StateTreeActivityDefinition::new("job", "benchmark"))
+        .unwrap();
+    builder
+        .add_transition(
+            active,
+            StateTreeTransition::on("done.activity.job").target(done),
+        )
+        .unwrap();
+    BenchmarkDefinition::Generated(builder.build().unwrap())
 }
 
 pub fn entity_toggle_definition() -> BenchmarkDefinition {

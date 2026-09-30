@@ -29,6 +29,7 @@ pub enum StateTreeTraceTrigger<'a> {
     Initialization,
     ExternalEvent(&'a str),
     Timer,
+    ActivityOutcome(&'a str),
 }
 
 /// One semantic operation in a state-tree execution.
@@ -39,21 +40,61 @@ pub enum StateTreeTraceTrigger<'a> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum StateTreeTraceRecord<'a> {
-    MacrostepStarted { trigger: StateTreeTraceTrigger<'a> },
-    MicrostepStarted { index: usize },
-    TransitionSelected { source: &'a str },
-    TransitionTarget { state: &'a str },
+    MacrostepStarted {
+        trigger: StateTreeTraceTrigger<'a>,
+    },
+    MicrostepStarted {
+        index: usize,
+    },
+    TransitionSelected {
+        source: &'a str,
+    },
+    TransitionTarget {
+        state: &'a str,
+    },
     TransitionTargetless,
-    StateExitStarted { state: &'a str },
-    StateExited { state: &'a str },
-    StateEntered { state: &'a str },
-    InternalEventRaised { event: &'a str },
-    InternalEventConsumed { event: &'a str },
-    DataAssigned { data: &'a str, value: &'a LuauValue },
-    EffectEmitted { effect: &'a str },
+    StateExitStarted {
+        state: &'a str,
+    },
+    StateExited {
+        state: &'a str,
+    },
+    StateEntered {
+        state: &'a str,
+    },
+    InternalEventRaised {
+        event: &'a str,
+    },
+    InternalEventConsumed {
+        event: &'a str,
+    },
+    DataAssigned {
+        data: &'a str,
+        value: &'a LuauValue,
+    },
+    EffectEmitted {
+        effect: &'a str,
+    },
+    ActivityStarted {
+        activity: &'a str,
+        generation: u64,
+    },
+    ActivityCancelled {
+        activity: &'a str,
+        generation: u64,
+    },
+    ActivityOutcome {
+        activity: &'a str,
+        success: bool,
+        generation: u64,
+    },
     ConfigurationStarted,
-    ActiveState { state: &'a str },
-    Status { status: &'a InstanceStatus },
+    ActiveState {
+        state: &'a str,
+    },
+    Status {
+        status: &'a InstanceStatus,
+    },
     MacrostepEnded,
 }
 
@@ -107,6 +148,9 @@ impl StateTreeTrace for StateTreeEventLog {
             StateTreeTraceRecord::MacrostepStarted {
                 trigger: StateTreeTraceTrigger::Timer,
             } => self.output.push_str("macrostep timer\n"),
+            StateTreeTraceRecord::MacrostepStarted {
+                trigger: StateTreeTraceTrigger::ActivityOutcome(activity),
+            } => writeln!(self.output, "macrostep activity {activity:?}").unwrap(),
             StateTreeTraceRecord::MicrostepStarted { index } => {
                 writeln!(self.output, "microstep {index}").unwrap();
             }
@@ -142,6 +186,23 @@ impl StateTreeTrace for StateTreeEventLog {
             StateTreeTraceRecord::EffectEmitted { effect } => {
                 writeln!(self.output, "effect {effect:?}").unwrap();
             }
+            StateTreeTraceRecord::ActivityStarted {
+                activity,
+                generation,
+            } => writeln!(self.output, "activity start {activity:?} {generation}").unwrap(),
+            StateTreeTraceRecord::ActivityCancelled {
+                activity,
+                generation,
+            } => writeln!(self.output, "activity cancel {activity:?} {generation}").unwrap(),
+            StateTreeTraceRecord::ActivityOutcome {
+                activity,
+                success,
+                generation,
+            } => writeln!(
+                self.output,
+                "activity outcome {activity:?} {success} {generation}"
+            )
+            .unwrap(),
             StateTreeTraceRecord::ConfigurationStarted => {
                 self.output.push_str("configuration\n");
             }
@@ -180,6 +241,10 @@ fn write_fault(output: &mut String, fault: &RuntimeFault) {
         }
         RuntimeFault::EventDataProjection { event, .. } => {
             write!(output, "event-data {event:?}").unwrap();
+        }
+        RuntimeFault::Activity { activity, .. } => write!(output, "activity {activity:?}").unwrap(),
+        RuntimeFault::ActivityDataProjection { activity, .. } => {
+            write!(output, "activity-data {activity:?}").unwrap()
         }
     }
 }

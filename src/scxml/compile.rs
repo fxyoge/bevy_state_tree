@@ -8,9 +8,10 @@ use super::{
     RootChild, Span, State, StateChild, Transition, TransitionType,
 };
 use crate::{
-    BuildError, StateId, StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeDefinition,
-    StateTreeEffectArgument, StateTreeTransition,
-    definition::{is_luau_identifier, is_scxml_system_name},
+    BuildError, StateId, StateTreeAction, StateTreeActivityDefinition, StateTreeArgument,
+    StateTreeBuilder, StateTreeData, StateTreeDefinition, StateTreeEffectArgument,
+    StateTreeTransition,
+    definition::{is_activity_id, is_luau_identifier, is_scxml_system_name},
 };
 
 /// Compiles the supported SCXML subset into the production state-tree runtime format.
@@ -57,6 +58,12 @@ pub enum CompileError {
     },
     #[error("{source_name}@{span_start}: invalid typed effect: {message}")]
     InvalidEffect {
+        source_name: String,
+        span_start: usize,
+        message: String,
+    },
+    #[error("{source_name}@{span_start}: invalid activity: {message}")]
+    InvalidActivity {
         source_name: String,
         span_start: usize,
         message: String,
@@ -303,6 +310,13 @@ impl<'a> Compiler<'a> {
             match child {
                 StateChild::OnEntry(value) => entry_actions.extend(self.entry_actions(value)?),
                 StateChild::OnExit(value) => exit_actions.extend(self.exit_actions(value)?),
+                StateChild::Extension(value) if is_activity(value) => {
+                    let activity = self.activity(value)?;
+                    let source_name = &self.document.source_name;
+                    self.builder
+                        .add_activity(runtime, activity)
+                        .map_err(|error| builder_error(source_name, error))?;
+                }
                 _ => {}
             }
         }
@@ -329,9 +343,10 @@ impl<'a> Compiler<'a> {
                 StateChild::DataModel(value) => {
                     return self.unsupported(value.span, "datamodels");
                 }
-                StateChild::Extension(value) => {
+                StateChild::Extension(value) if !is_activity(value) => {
                     return self.unsupported(value.span, "foreign extensions");
                 }
+                StateChild::Extension(_) => {}
                 StateChild::OnEntry(_) | StateChild::OnExit(_) => {}
                 StateChild::Initial(_) | StateChild::Transition(_) => {}
             }
@@ -359,6 +374,13 @@ impl<'a> Compiler<'a> {
             match child {
                 ParallelChild::OnEntry(value) => entry_actions.extend(self.entry_actions(value)?),
                 ParallelChild::OnExit(value) => exit_actions.extend(self.exit_actions(value)?),
+                ParallelChild::Extension(value) if is_activity(value) => {
+                    let activity = self.activity(value)?;
+                    let source_name = &self.document.source_name;
+                    self.builder
+                        .add_activity(runtime, activity)
+                        .map_err(|error| builder_error(source_name, error))?;
+                }
                 _ => {}
             }
         }
@@ -384,9 +406,10 @@ impl<'a> Compiler<'a> {
                 ParallelChild::DataModel(value) => {
                     return self.unsupported(value.span, "datamodels");
                 }
-                ParallelChild::Extension(value) => {
+                ParallelChild::Extension(value) if !is_activity(value) => {
                     return self.unsupported(value.span, "foreign extensions");
                 }
+                ParallelChild::Extension(_) => {}
                 ParallelChild::OnEntry(_)
                 | ParallelChild::OnExit(_)
                 | ParallelChild::Transition(_) => {}
@@ -777,6 +800,105 @@ impl<'a> Compiler<'a> {
         ))
     }
 
+    fn activity(
+        &mut self,
+        extension: &Extension,
+    ) -> Result<StateTreeActivityDefinition, CompileError> {
+        let id = extension_attribute(extension, "id").ok_or_else(|| {
+            self.activity_error(extension.span, "activity requires a non-empty id")
+        })?;
+        if id.is_empty() {
+            return Err(self.activity_error(extension.span, "activity requires a non-empty id"));
+        }
+        if !is_activity_id(id) {
+            return Err(self.activity_error(
+                extension.span,
+                format!(
+                    "activity id `{id}` must be one event-name segment containing only ASCII letters, digits, `_`, or `-`"
+                ),
+            ));
+        }
+        let name = extension_attribute(extension, "name")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                self.activity_error(extension.span, "activity requires a non-empty name")
+            })?;
+        if extension.attributes.iter().any(|attribute| {
+            attribute.namespace.is_some() || !matches!(attribute.local_name.as_str(), "id" | "name")
+        }) {
+            return Err(self.activity_error(extension.span, "activity has unsupported attributes"));
+        }
+        let mut arguments = Vec::new();
+        let mut names = HashSet::new();
+        for content in &extension.content {
+            let ExtensionContent::Element(argument) = content else {
+                let ExtensionContent::Text(text) = content else {
+                    unreachable!()
+                };
+                if !text.trim().is_empty() {
+                    return Err(self.activity_error(extension.span, "activity contains text"));
+                }
+                continue;
+            };
+            if argument.namespace.as_deref() != Some(super::BEVY_STATE_TREE_NAMESPACE)
+                || argument.local_name != "arg"
+            {
+                return Err(
+                    self.activity_error(argument.span, "activity contains an unsupported child")
+                );
+            }
+            if argument.content.iter().any(|content| match content {
+                ExtensionContent::Text(text) => !text.trim().is_empty(),
+                ExtensionContent::Element(_) => true,
+            }) {
+                return Err(
+                    self.activity_error(argument.span, "activity argument cannot have content")
+                );
+            }
+            if argument.attributes.iter().any(|attribute| {
+                attribute.namespace.is_some()
+                    || !matches!(attribute.local_name.as_str(), "name" | "expr")
+            }) {
+                return Err(self.activity_error(
+                    argument.span,
+                    "activity argument has unsupported attributes",
+                ));
+            }
+            let argument_name = extension_attribute(argument, "name")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    self.activity_error(
+                        argument.span,
+                        "activity argument requires a non-empty name",
+                    )
+                })?;
+            if !names.insert(argument_name) {
+                return Err(
+                    self.activity_error(argument.span, "activity argument name is duplicated")
+                );
+            }
+            let expression = extension_attribute(argument, "expr")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    self.activity_error(argument.span, "activity argument requires an expression")
+                })?;
+            if self.document.root.datamodel.as_deref() != Some("luau") {
+                return Err(self.activity_error(
+                    argument.span,
+                    "activity arguments require datamodel=\"luau\"",
+                ));
+            }
+            arguments.push(StateTreeArgument::at(
+                argument_name,
+                expression,
+                argument.span.start,
+            ));
+        }
+        Ok(StateTreeActivityDefinition::new(id, name)
+            .arguments(arguments)
+            .at(extension.span.start))
+    }
+
     fn target(&self, target: &str, span: Span) -> Result<StateId, CompileError> {
         self.ids
             .get(target)
@@ -870,6 +992,19 @@ impl<'a> Compiler<'a> {
             message: message.into(),
         }
     }
+
+    fn activity_error(&self, span: Span, message: impl Into<String>) -> CompileError {
+        CompileError::InvalidActivity {
+            source_name: self.document.source_name.clone(),
+            span_start: span.start,
+            message: message.into(),
+        }
+    }
+}
+
+fn is_activity(extension: &Extension) -> bool {
+    extension.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
+        && extension.local_name == "activity"
 }
 
 fn builder_error(source_name: &str, error: BuildError) -> CompileError {
@@ -1000,8 +1135,9 @@ mod tests {
     use super::*;
     use crate::scxml;
     use crate::{
-        DatamodelOperation, InstanceStatus, LuauValue, RuntimeFault, StateTreeEffectError,
-        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEvents, StateTreeExecution,
+        DatamodelOperation, InstanceStatus, LuauValue, RuntimeFault, StateTreeActivityRequest,
+        StateTreeActivitySink, StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
+        StateTreeEvents, StateTreeExecution, StateTreeHeadlessActivityToken,
     };
 
     const NS: &str = super::super::SCXML_NAMESPACE;
@@ -1281,6 +1417,409 @@ mod tests {
 
         assert_eq!(execution.status(), &InstanceStatus::Running);
         assert_eq!(effects.0, [("record".to_owned(), 5)]);
+    }
+
+    #[derive(Default)]
+    struct RecordingActivities {
+        starts: Vec<(
+            String,
+            String,
+            LuauValue,
+            StateTreeHeadlessActivityToken,
+            Option<LuauValue>,
+        )>,
+        cancellations: Vec<StateTreeHeadlessActivityToken>,
+    }
+
+    impl<E: StateTreeEvents> StateTreeActivitySink<E> for RecordingActivities {
+        fn start(
+            &mut self,
+            mut request: StateTreeActivityRequest<'_, E>,
+        ) -> Result<(), StateTreeEffectError> {
+            let value = request
+                .arguments()
+                .iter()
+                .next()
+                .map(|(_, value)| value.clone())
+                .unwrap_or(LuauValue::Nil);
+            self.starts.push((
+                request.id().to_owned(),
+                request.name().to_owned(),
+                value,
+                request.token(),
+                request.data("target").cloned(),
+            ));
+            Ok(())
+        }
+
+        fn cancel(&mut self, token: StateTreeHeadlessActivityToken) {
+            self.cancellations.push(token);
+        }
+    }
+
+    #[test]
+    fn activity_syntax_requires_ids_names_and_valid_unique_arguments() {
+        let namespace = super::super::BEVY_STATE_TREE_NAMESPACE;
+        let cases = [
+            (r#"<bst:activity name="work"/>"#, "non-empty id"),
+            (r#"<bst:activity id="job"/>"#, "non-empty name"),
+            (
+                r#"<bst:activity id="job" name="work"><bst:arg name="x"/></bst:activity>"#,
+                "requires an expression",
+            ),
+            (
+                r#"<bst:activity id="job" name="work"><bst:arg name="x" expr="1"/><bst:arg name="x" expr="2"/></bst:activity>"#,
+                "duplicated",
+            ),
+            (
+                r#"<bst:activity id="job.child" name="work"/>"#,
+                "event-name segment",
+            ),
+            (
+                r#"<bst:activity id="*" name="work"/>"#,
+                "event-name segment",
+            ),
+            (
+                r#"<bst:activity id="job child" name="work"/>"#,
+                "event-name segment",
+            ),
+        ];
+        for (activity, expected) in cases {
+            let source = format!(
+                r#"<scxml xmlns="{NS}" xmlns:bst="{namespace}" datamodel="luau"><state>{activity}</state></scxml>"#
+            );
+            let document = scxml::parse("activity-invalid.scxml", &source).unwrap();
+            assert!(
+                compile(&document)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn activity_ids_accept_safe_event_name_segments() {
+        let namespace = super::super::BEVY_STATE_TREE_NAMESPACE;
+        for id in ["job", "job-child", "job_child"] {
+            let source = format!(
+                r#"<scxml xmlns="{NS}" xmlns:bst="{namespace}"><state><bst:activity id="{id}" name="work"/></state></scxml>"#
+            );
+            let document = scxml::parse("activity-valid.scxml", &source).unwrap();
+            compile(&document).unwrap();
+        }
+    }
+
+    #[test]
+    fn valid_activity_ids_have_distinct_done_and_error_events() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}">
+                <state>
+                    <bst:activity id="job" name="work"/>
+                    <bst:activity id="job-child" name="work"/>
+                </state>
+            </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let definition = compile(&scxml::parse("activity-prefix.scxml", &source).unwrap()).unwrap();
+        let events = definition
+            .compiled
+            .activities
+            .iter()
+            .flat_map(|activity| [activity.done, activity.error])
+            .map(|event| definition.compiled.event_name(event).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            [
+                "done.activity.job",
+                "error.activity.job",
+                "done.activity.job-child",
+                "error.activity.job-child",
+            ]
+        );
+    }
+
+    #[test]
+    fn headless_activity_completion_carries_data_and_is_accepted_once() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+                <datamodel><data id="target" expr="'north'"/><data id="result"/></datamodel>
+                <state id="active">
+                    <onentry><assign location="target" expr="'south'"/></onentry>
+                    <bst:activity id="path" name="find_path"><bst:arg name="destination" expr="target"/></bst:activity>
+                    <transition event="done.activity.path" cond="_event.data.ok"><assign location="result" expr="_event.data.route"/></transition>
+                </state>
+            </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let definition = compile(&scxml::parse("activity.scxml", &source).unwrap()).unwrap();
+        let mut sink = RecordingActivities::default();
+        let mut execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.starts[0].0, "path");
+        assert_eq!(sink.starts[0].1, "find_path");
+        assert_eq!(sink.starts[0].2, LuauValue::String("south".into()));
+        assert_eq!(sink.starts[0].4, Some(LuauValue::String("south".into())));
+        let token = sink.starts[0].3;
+        let data = LuauValue::Record(
+            [
+                (Box::from("ok"), LuauValue::Boolean(true)),
+                (Box::from("route"), LuauValue::String("n1".into())),
+            ]
+            .into(),
+        );
+
+        assert!(execution.complete_activity(
+            token,
+            Some(data),
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink
+        ));
+        assert_eq!(
+            execution.data("result"),
+            Some(&LuauValue::String("n1".into()))
+        );
+        assert_eq!(execution.active_state_names().last(), Some("active"));
+        assert!(!execution.complete_activity(
+            token,
+            None,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink
+        ));
+        assert!(sink.cancellations.is_empty());
+    }
+
+    #[test]
+    fn activity_payload_does_not_leak_to_a_raised_internal_event() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+                <datamodel><data id="leaked" expr="true"/></datamodel>
+                <state id="active">
+                    <bst:activity id="job" name="work"/>
+                    <transition event="done.activity.job" target="checking"><raise event="check"/></transition>
+                </state>
+                <state id="checking">
+                    <transition event="check" cond="_event.data == nil" target="pass"/>
+                    <transition event="check" target="fail"/>
+                </state>
+                <final id="pass"/><final id="fail"/>
+            </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let definition = compile(&scxml::parse("payload-scope.scxml", &source).unwrap()).unwrap();
+        let mut sink = RecordingActivities::default();
+        let mut execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink,
+        )
+        .unwrap();
+        let token = sink.starts[0].3;
+
+        assert!(execution.complete_activity(
+            token,
+            Some(LuauValue::Integer(7)),
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink,
+        ));
+        assert_eq!(execution.active_state_names().last(), Some("pass"));
+    }
+
+    #[test]
+    fn headless_dual_sinks_support_mixed_activity_macrosteps() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+                <state id="active">
+                    <bst:activity id="finished" name="work"/>
+                    <bst:activity id="cancelled" name="work"/>
+                    <transition event="done.activity.finished" target="next">
+                        <bst:effect name="record"><bst:arg name="value" expr="9"/></bst:effect>
+                    </transition>
+                </state>
+                <state id="next"><bst:activity id="started" name="work"/></state>
+            </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let definition = compile(&scxml::parse("mixed-sinks.scxml", &source).unwrap()).unwrap();
+        let mut effects = RecordingEffects::default();
+        let mut activities = RecordingActivities::default();
+        let mut execution = StateTreeExecution::<NoEvents>::new_with_sinks(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+            &mut effects,
+            &mut activities,
+        )
+        .unwrap();
+        let completed = activities.starts[0].3;
+        let cancelled = activities.starts[1].3;
+
+        assert!(execution.complete_activity_with_sinks(
+            completed,
+            None,
+            NonZeroUsize::new(8).unwrap(),
+            &mut effects,
+            &mut activities,
+        ));
+        assert_eq!(effects.0, [("record".to_owned(), 9)]);
+        assert_eq!(activities.cancellations, [cancelled]);
+        assert_eq!(
+            activities
+                .starts
+                .iter()
+                .map(|start| start.0.as_str())
+                .collect::<Vec<_>>(),
+            ["finished", "cancelled", "started"]
+        );
+        assert_eq!(execution.active_state_names().last(), Some("next"));
+    }
+
+    enum ReenterEvent {
+        Reenter,
+    }
+    impl StateTreeEvents for ReenterEvent {
+        const AUTHORED_NAMES: &'static [&'static str] = &["reenter"];
+        fn event_index(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn reentry_uses_a_new_generation_and_stale_outcomes_are_ignored() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}">
+            <state id="active"><bst:activity id="job" name="work"/><transition event="reenter" target="active"/><transition event="done.activity.job"/></state>
+        </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE
+        );
+        let definition = compile(&scxml::parse("reentry.scxml", &source).unwrap()).unwrap();
+        let mut sink = RecordingActivities::default();
+        let mut execution = StateTreeExecution::<ReenterEvent>::new_with_activity_sink(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink,
+        )
+        .unwrap();
+        let first = sink.starts[0].3;
+        assert!(execution.process_event_with_activity_sink(
+            &ReenterEvent::Reenter,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink
+        ));
+        let second = sink.starts[1].3;
+        assert_ne!(first, second);
+        assert_eq!(sink.cancellations, [first]);
+        assert!(!execution.complete_activity(
+            first,
+            None,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink
+        ));
+        assert!(execution.complete_activity(
+            second,
+            None,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink
+        ));
+    }
+
+    #[test]
+    fn root_completion_cancels_still_running_activities() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}" initial="done">
+            <bst:activity id="root-job" name="work"/><final id="done"/>
+        </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE
+        );
+        let document = scxml::parse("root-activity.scxml", &source).unwrap();
+        // Activities are structural children of authored state/parallel nodes, not the synthetic document root.
+        assert!(matches!(
+            compile(&document),
+            Err(CompileError::Unsupported { .. })
+        ));
+
+        let mut builder = StateTreeBuilder::new("root-complete");
+        let root = builder.compound_root("root").unwrap();
+        let done = builder.final_state("done", root).unwrap();
+        builder.initial(root, done).unwrap();
+        builder
+            .add_activity(root, StateTreeActivityDefinition::new("root-job", "work"))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut sink = RecordingActivities::default();
+        let execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert_eq!(sink.starts.len(), 1);
+        assert_eq!(sink.cancellations, [sink.starts[0].3]);
+    }
+
+    #[test]
+    fn parallel_activity_starts_follow_entry_document_order() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}">
+            <parallel id="p">
+                <bst:activity id="outer" name="work"/>
+                <state id="left"><bst:activity id="left-job" name="work"/></state>
+                <state id="right"><bst:activity id="right-job" name="work"/></state>
+            </parallel>
+        </scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE
+        );
+        let definition =
+            compile(&scxml::parse("parallel-activity.scxml", &source).unwrap()).unwrap();
+        let mut sink = RecordingActivities::default();
+        let execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+            &definition,
+            NonZeroUsize::new(8).unwrap(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(execution.status(), &InstanceStatus::Running);
+        assert_eq!(
+            sink.starts
+                .iter()
+                .map(|start| start.0.as_str())
+                .collect::<Vec<_>>(),
+            ["outer", "left-job", "right-job"]
+        );
+    }
+
+    #[test]
+    fn stabilization_fault_cancels_the_current_activity_run() {
+        let mut builder = StateTreeBuilder::new("activity-fault");
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        builder.initial(root, active).unwrap();
+        builder
+            .add_activity(active, StateTreeActivityDefinition::new("job", "work"))
+            .unwrap();
+        builder
+            .add_transition(active, StateTreeTransition::eventless().target(active))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut sink = RecordingActivities::default();
+        let execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+            &definition,
+            NonZeroUsize::new(1).unwrap(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(matches!(
+            execution.status(),
+            InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { .. })
+        ));
+        assert_eq!(sink.starts.len(), 2);
+        assert_eq!(sink.cancellations, [sink.starts[0].3, sink.starts[1].3]);
     }
 
     struct PayloadEvent {

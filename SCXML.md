@@ -24,8 +24,8 @@ column; compiler diagnostics retain the asset path and byte position.
 
 Asset loading is domain-independent. It validates authored SCXML and produces
 the same immutable runtime representation as `StateTreeBuilder::build`, but it
-does not resolve external events or typed effects. Those checks depend on a
-domain's `StateTreeEvents` protocol and effect registry and therefore occur when
+does not resolve external events, typed effects, or typed activities. Those
+checks depend on a domain's `StateTreeEvents` protocol and registries and occur when
 a `StateTreeInstance` initializes. A source can load successfully and still
 leave an instance pending with `StateTreeLinkFailure<D>` for a particular
 domain.
@@ -149,7 +149,10 @@ fresh authored environment for each evaluation; scripts cannot access Bevy's
 
 `_event.name` exposes the currently processed typed event's authored name.
 `_event.data` exposes the opt-in portable projection of the current external
-event. It is absent for internal events and unprojected variants. Other SCXML
+event or accepted activity outcome. Activity data remains available through
+eventless follow-up for that outcome, then is cleared before any raised or
+completion internal event is consumed. It is absent for other internal events
+and unprojected variants. Other SCXML
 system variables are reserved but not yet implemented. Datamodel errors fault
 the instance rather than raising SCXML `error.execution` events. ECMAScript is
 not a planned built-in datamodel.
@@ -181,8 +184,47 @@ processed instances is unordered. A constructor, argument conversion, or
 unregistered-effect error faults the affected instance; actions already run in
 that macrostep are not rolled back. Headless execution can provide a
 `StateTreeEffectSink`; without one, encountering an effect faults the execution.
+Definitions containing both effects and activities use the explicit headless
+`*_with_sinks` methods so initialization, events, timers, and activity outcomes
+receive both sinks.
 
 SCXML `<send>` remains unsupported and is not an alias for typed effects.
+
+## Activities And Invoke
+
+Standard SCXML `<invoke>` is explicitly unsupported. Its processor types,
+sessions, autoforwarding, finalize content, and cancellation model are not
+reinterpreted as Bevy work. The parser rejects `<invoke>` as unknown SCXML.
+
+Long-running work uses a structural Bevy extension:
+
+```xml
+<bst:activity id="path" name="find_path">
+  <bst:arg name="destination" expr="target"/>
+</bst:activity>
+```
+
+`bst:activity` may occur directly under `<state>` or `<parallel>`. It is not
+executable content and cannot occur in entry, exit, or transition actions. Its
+globally unique `id` and registered `name` are required. The activity `id` must
+be exactly one event-name segment: non-empty ASCII letters, digits, `_`, or `-`
+only. Arguments follow effect rules: unique non-empty names, non-empty Luau
+expressions, no content, and a
+Luau datamodel when arguments are present. Builder definitions use
+`StateTreeActivityDefinition` and `StateTreeBuilder::add_activity`.
+
+Owner entry actions run before starts. A committed exit cancels live activities
+after exit actions; fault, root completion, and component removal/replacement
+cancel all live runs. Typed lifecycle messages carry an entity-routing token
+containing runtime id, dense activity id, and generation.
+
+Success and failure produce exact internal events `done.activity.<id>` and
+`error.activity.<id>`. An accepted outcome deactivates the slot without exiting
+its owner; only re-entry restarts it. Duplicate, stale-generation, and replaced
+instance outcomes are ignored. Output and error independently project portable
+Luau `_event.data`; projection failure faults the instance. Every accepted
+outcome is a separate macrostep. Per-instance writer order is retained while
+concurrent writer order is unspecified, like entity event ingress.
 
 ## Semantic Traces
 

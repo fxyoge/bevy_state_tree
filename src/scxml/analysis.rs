@@ -320,6 +320,11 @@ impl<'a> CapabilityAnalyzer<'a> {
         {
             self.add(Capability::TypedEffect);
             return;
+        } else if extension.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
+            && extension.local_name == "activity"
+        {
+            self.add(Capability::Activity);
+            return;
         } else {
             self.add(Capability::ForeignExtension);
         }

@@ -37,6 +37,24 @@ fn process_effects(bencher: Bencher<'_, '_>, instances: usize) {
         .bench_local(|| benchmark.borrow_mut().run_schedule());
 }
 
+fn process_activity_outcomes(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            let mut benchmark =
+                BenchmarkApp::empty(support::activity_definition(), Executor::Parallel);
+            benchmark.register_benchmark_activity();
+            benchmark.spawn_instances(instances);
+            benchmark.run_schedule();
+            benchmark.queue_activity_outcomes();
+            benchmark
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
+}
+
 #[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 20)]
 fn broadcast_toggle(bencher: Bencher<'_, '_>, instances: usize) {
     process_broadcast(bencher, instances, support::toggle_definition);
@@ -55,6 +73,11 @@ fn broadcast_parallel_two_regions(bencher: Bencher<'_, '_>, instances: usize) {
 #[divan::bench(args = [1_000, 100_000], sample_count = 10)]
 fn broadcast_typed_effect(bencher: Bencher<'_, '_>, instances: usize) {
     process_effects(bencher, instances);
+}
+
+#[divan::bench(args = [1_000, 100_000], sample_count = 10)]
+fn dense_activity_outcomes(bencher: Bencher<'_, '_>, instances: usize) {
+    process_activity_outcomes(bencher, instances);
 }
 
 #[divan::bench(args = [4, 16, 64, 128], sample_count = 10)]
@@ -124,6 +147,23 @@ fn initialize_toggle(bencher: Bencher<'_, '_>, instances: usize) {
         .counter(ItemsCount::new(instances))
         .with_inputs(|| {
             BenchmarkApp::pending(support::toggle_definition(), instances, Executor::Parallel)
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
+}
+
+#[divan::bench(args = [1_000, 10_000], sample_count = 5)]
+fn initialize_dense_activities(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            let mut benchmark =
+                BenchmarkApp::empty(support::activity_definition(), Executor::Parallel);
+            benchmark.register_benchmark_activity();
+            benchmark.spawn_instances(instances);
+            benchmark
         })
         .bench_local_values(|mut benchmark| {
             benchmark.run_schedule();

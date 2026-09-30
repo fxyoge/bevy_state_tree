@@ -11,6 +11,7 @@ use bevy_asset::Asset;
 use bevy_reflect::TypePath;
 use thiserror::Error;
 
+use crate::activity::{RegisteredActivity, StateTreeActivityRegistry};
 use crate::effect::{RegisteredEffect, StateTreeEffectRegistry};
 use crate::{
     StateTreeDomain, StateTreeEvents,
@@ -77,6 +78,15 @@ impl EffectId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ActivityId(pub(crate) u32);
+
+impl ActivityId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
     Raise(EventId),
@@ -93,7 +103,7 @@ pub(crate) enum Action {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct EffectArgument {
+pub(crate) struct NamedArgument {
     pub name: Arc<str>,
     pub expression: ExpressionId,
 }
@@ -155,7 +165,21 @@ pub(crate) struct StateNode {
     pub entry_actions: Box<[Action]>,
     pub exit_actions: Box<[Action]>,
     pub initial_actions: Box<[Action]>,
+    pub activity_start: u32,
+    pub activity_len: u32,
     pub transitions: Box<[Transition]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActivityDefinition {
+    pub id: Box<str>,
+    pub name: Box<str>,
+    pub owner: StateId,
+    pub argument_start: u32,
+    pub argument_len: u32,
+    pub done: EventId,
+    pub error: EventId,
+    pub span_start: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,7 +230,8 @@ pub(crate) struct CompiledDefinition {
     pub children: Box<[StateId]>,
     pub transition_entries: Box<[Entry]>,
     pub transition_actions: Box<[Action]>,
-    pub effect_arguments: Box<[EffectArgument]>,
+    pub named_arguments: Box<[NamedArgument]>,
+    pub activities: Box<[ActivityDefinition]>,
     pub initial_entries: Box<[Entry]>,
     pub max_depth: usize,
     pub max_active: usize,
@@ -258,6 +283,7 @@ pub(crate) struct LinkedDefinition<D: StateTreeDomain> {
     pub compiled: Arc<CompiledDefinition>,
     external_events: Box<[EventSet]>,
     effects: Box<[Option<Arc<dyn RegisteredEffect<D>>>]>,
+    activities: Box<[Option<Arc<dyn RegisteredActivity<D>>>]>,
 }
 
 impl<D: StateTreeDomain> std::fmt::Debug for LinkedDefinition<D> {
@@ -273,6 +299,7 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
     pub fn new(
         compiled: Arc<CompiledDefinition>,
         effects: Option<&StateTreeEffectRegistry<D>>,
+        activities: Option<&StateTreeActivityRegistry<D>>,
     ) -> Result<Self, StateTreeLinkError> {
         let mut issues = Vec::new();
         for requirement in &compiled.event_requirements {
@@ -309,6 +336,16 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
                 }
             }
         }
+        if let Some(registry) = activities {
+            for activity in &compiled.activities {
+                if registry.get(&activity.name).is_none() {
+                    issues.push(StateTreeLinkIssue::MissingActivity {
+                        activity: activity.name.clone(),
+                        span_start: Some(activity.span_start as usize),
+                    });
+                }
+            }
+        }
         if !issues.is_empty() {
             return Err(StateTreeLinkError {
                 definition: compiled.name.clone(),
@@ -323,10 +360,16 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
             .effect_names()
             .map(|name| effects.and_then(|effects| effects.get(name)))
             .collect();
+        let linked_activities = compiled
+            .activities
+            .iter()
+            .map(|activity| activities.and_then(|registry| registry.get(&activity.name)))
+            .collect();
         Ok(Self {
             compiled,
             external_events,
             effects: linked_effects,
+            activities: linked_activities,
         })
     }
 
@@ -336,6 +379,12 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
 
     pub fn effect(&self, effect: EffectId) -> Option<&Arc<dyn RegisteredEffect<D>>> {
         self.effects.get(effect.index()).and_then(Option::as_ref)
+    }
+
+    pub fn activity(&self, activity: ActivityId) -> Option<&Arc<dyn RegisteredActivity<D>>> {
+        self.activities
+            .get(activity.index())
+            .and_then(Option::as_ref)
     }
 }
 
@@ -393,6 +442,11 @@ pub enum StateTreeLinkIssue {
     #[error("effect `{effect}` is not registered for this domain")]
     MissingEffect {
         effect: Box<str>,
+        span_start: Option<usize>,
+    },
+    #[error("activity `{activity}` is not registered for this domain")]
+    MissingActivity {
+        activity: Box<str>,
         span_start: Option<usize>,
     },
 }
@@ -463,6 +517,15 @@ struct DraftState {
     exit_actions_set: bool,
     initial_actions_set: bool,
     transitions: Vec<DraftTransition>,
+    activities: Vec<DraftActivity>,
+}
+
+#[derive(Clone, Debug)]
+struct DraftActivity {
+    id: Box<str>,
+    name: Box<str>,
+    arguments: Vec<(Box<str>, ExpressionId)>,
+    span_start: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -562,14 +625,14 @@ impl StateTreeData {
     }
 }
 
-/// One named Luau argument supplied to a typed effect.
+/// One named Luau argument supplied to a typed effect or activity.
 #[derive(Clone, Debug)]
-pub struct StateTreeEffectArgument {
+pub struct StateTreeArgument {
     name: Box<str>,
     expression: AuthoredExpression,
 }
 
-impl StateTreeEffectArgument {
+impl StateTreeArgument {
     pub fn new(name: impl Into<Box<str>>, expression: impl Into<Box<str>>) -> Self {
         Self {
             name: name.into(),
@@ -592,6 +655,46 @@ impl StateTreeEffectArgument {
                 span_start,
             },
         }
+    }
+}
+
+pub type StateTreeEffectArgument = StateTreeArgument;
+
+/// One structural activity attached to a state or parallel node.
+#[derive(Clone, Debug)]
+pub struct StateTreeActivityDefinition {
+    id: Box<str>,
+    name: Box<str>,
+    arguments: Vec<StateTreeArgument>,
+    span_start: usize,
+}
+
+impl StateTreeActivityDefinition {
+    pub fn new(id: impl Into<Box<str>>, name: impl Into<Box<str>>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments: Vec::new(),
+            span_start: 0,
+        }
+    }
+
+    pub fn arguments(mut self, arguments: impl IntoIterator<Item = StateTreeArgument>) -> Self {
+        self.arguments = arguments.into_iter().collect();
+        self
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn at(mut self, span_start: usize) -> Self {
+        self.span_start = span_start;
+        self
     }
 }
 
@@ -996,8 +1099,9 @@ impl StateTreeBuilder {
                         source,
                         DraftTransitionTrigger::Event(EventPattern::Descriptor(event)),
                         condition,
-                        transition.target,
-                        transition.internal,
+                        transition
+                            .target
+                            .map(|target| (target, transition.internal)),
                         actions.clone(),
                         span_start,
                     )?;
@@ -1008,8 +1112,9 @@ impl StateTreeBuilder {
                     source,
                     DraftTransitionTrigger::Eventless,
                     condition,
-                    transition.target,
-                    transition.internal,
+                    transition
+                        .target
+                        .map(|target| (target, transition.internal)),
                     actions,
                     span_start,
                 )?;
@@ -1019,8 +1124,9 @@ impl StateTreeBuilder {
                     source,
                     DraftTransitionTrigger::After(duration),
                     condition,
-                    transition.target,
-                    transition.internal,
+                    transition
+                        .target
+                        .map(|target| (target, transition.internal)),
                     actions,
                     span_start,
                 )?;
@@ -1107,6 +1213,65 @@ impl StateTreeBuilder {
         };
         self.states[state.index()].initial_actions = actions;
         self.states[state.index()].initial_actions_set = true;
+        Ok(self)
+    }
+
+    /// Adds a structural activity started whenever `owner` is entered.
+    pub fn add_activity(
+        &mut self,
+        owner: StateId,
+        activity: StateTreeActivityDefinition,
+    ) -> Result<&mut Self, BuildError> {
+        self.require_state(owner)?;
+        if matches!(self.states[owner.index()].kind, DraftKind::Final) {
+            return Err(BuildError::ActivityOnFinal(owner));
+        }
+        if activity.id.is_empty() {
+            return Err(BuildError::EmptyActivityId);
+        }
+        if !is_activity_id(&activity.id) {
+            return Err(BuildError::InvalidActivityId(activity.id));
+        }
+        if activity.name.trim().is_empty() {
+            return Err(BuildError::EmptyActivityName);
+        }
+        if self
+            .states
+            .iter()
+            .flat_map(|state| &state.activities)
+            .any(|candidate| candidate.id == activity.id)
+        {
+            return Err(BuildError::DuplicateActivityId(activity.id));
+        }
+        if !activity.arguments.is_empty() && self.datamodel.is_none() {
+            return Err(BuildError::MissingDataModel);
+        }
+        let checkpoint = self.expression_count();
+        let mut seen = HashSet::with_capacity(activity.arguments.len());
+        let mut arguments = Vec::with_capacity(activity.arguments.len());
+        for argument in activity.arguments {
+            if argument.name.trim().is_empty() {
+                self.truncate_expressions(checkpoint);
+                return Err(BuildError::EmptyActivityArgumentName);
+            }
+            if !seen.insert(argument.name.clone()) {
+                self.truncate_expressions(checkpoint);
+                return Err(BuildError::DuplicateActivityArgument(argument.name));
+            }
+            match self.register_expression(argument.expression, false) {
+                Ok(expression) => arguments.push((argument.name, expression)),
+                Err(error) => {
+                    self.truncate_expressions(checkpoint);
+                    return Err(error);
+                }
+            }
+        }
+        self.states[owner.index()].activities.push(DraftActivity {
+            id: activity.id,
+            name: activity.name,
+            arguments,
+            span_start: activity.span_start,
+        });
         Ok(self)
     }
 
@@ -1279,6 +1444,7 @@ impl StateTreeBuilder {
         let mut effects = Vec::<Box<str>>::new();
         let mut effect_ids = HashMap::<Box<str>, EffectId>::new();
         let mut effect_arguments = Vec::new();
+        let mut activities = Vec::new();
         let mut children_by_state = vec![Vec::new(); self.states.len()];
         for (index, draft) in self.states.iter().enumerate() {
             if let Some(parent) = draft.parent {
@@ -1450,6 +1616,48 @@ impl StateTreeBuilder {
                     &mut effect_ids,
                     &mut effect_arguments,
                 )?,
+                activity_start: u32::try_from(activities.len())
+                    .map_err(|_| BuildError::TooManyActivities)?,
+                activity_len: {
+                    for draft_activity in &draft.activities {
+                        let argument_start = u32::try_from(effect_arguments.len())
+                            .map_err(|_| BuildError::TooManyEffectArguments)?;
+                        effect_arguments.extend(draft_activity.arguments.iter().map(
+                            |(name, expression)| NamedArgument {
+                                name: Arc::from(name.as_ref()),
+                                expression: *expression,
+                            },
+                        ));
+                        let done = intern_event(
+                            &mut events,
+                            &mut event_ids,
+                            EventPattern::Exact(
+                                format!("done.activity.{}", draft_activity.id).into(),
+                            ),
+                        )?;
+                        let error = intern_event(
+                            &mut events,
+                            &mut event_ids,
+                            EventPattern::Exact(
+                                format!("error.activity.{}", draft_activity.id).into(),
+                            ),
+                        )?;
+                        activities.push(ActivityDefinition {
+                            id: draft_activity.id.clone(),
+                            name: draft_activity.name.clone(),
+                            owner: state_id,
+                            argument_start,
+                            argument_len: u32::try_from(draft_activity.arguments.len())
+                                .map_err(|_| BuildError::TooManyEffectArguments)?,
+                            done,
+                            error,
+                            span_start: u32::try_from(draft_activity.span_start)
+                                .unwrap_or(u32::MAX),
+                        });
+                    }
+                    u32::try_from(draft.activities.len())
+                        .map_err(|_| BuildError::TooManyActivities)?
+                },
                 transitions: transitions.into_boxed_slice(),
             });
         }
@@ -1539,6 +1747,10 @@ impl StateTreeBuilder {
                 internal_events.push(*event);
             }
         }
+        for activity in &activities {
+            internal_events.push(activity.done);
+            internal_events.push(activity.error);
+        }
 
         Ok(StateTreeDefinition {
             compiled: Arc::new(CompiledDefinition {
@@ -1549,7 +1761,8 @@ impl StateTreeBuilder {
                 children: children.into_boxed_slice(),
                 transition_entries: transition_entries.into_boxed_slice(),
                 transition_actions: transition_actions.into_boxed_slice(),
-                effect_arguments: effect_arguments.into_boxed_slice(),
+                named_arguments: effect_arguments.into_boxed_slice(),
+                activities: activities.into_boxed_slice(),
                 initial_entries: initial_entries.into_boxed_slice(),
                 max_depth,
                 max_active: max_configurations[root.index()],
@@ -1612,6 +1825,7 @@ impl StateTreeBuilder {
             exit_actions_set: false,
             initial_actions_set: false,
             transitions: Vec::new(),
+            activities: Vec::new(),
         });
         self.names.insert(name, id);
         Ok(id)
@@ -1622,14 +1836,15 @@ impl StateTreeBuilder {
         source: StateId,
         trigger: DraftTransitionTrigger,
         condition: Option<ExpressionId>,
-        target: Option<StateId>,
-        internal: bool,
+        target: Option<(StateId, bool)>,
         actions: Vec<DraftAction>,
         span_start: Option<u32>,
     ) -> Result<&mut Self, BuildError> {
-        if let Some(target) = target {
+        if let Some((target, _)) = target {
             self.require_state(target)?;
         }
+        let (target, internal) =
+            target.map_or((None, false), |(target, internal)| (Some(target), internal));
         let state = self.require_state_mut(source)?;
         if matches!(state.kind, DraftKind::Final) {
             return Err(BuildError::FinalHasTransition(source));
@@ -1684,7 +1899,7 @@ fn compile_actions(
     event_ids: &mut HashMap<EventPattern, EventId>,
     effects: &mut Vec<Box<str>>,
     effect_ids: &mut HashMap<Box<str>, EffectId>,
-    effect_arguments: &mut Vec<EffectArgument>,
+    effect_arguments: &mut Vec<NamedArgument>,
 ) -> Result<Box<[Action]>, BuildError> {
     actions
         .iter()
@@ -1707,7 +1922,7 @@ fn append_actions(
     event_ids: &mut HashMap<EventPattern, EventId>,
     effects: &mut Vec<Box<str>>,
     effect_ids: &mut HashMap<Box<str>, EffectId>,
-    effect_arguments: &mut Vec<EffectArgument>,
+    effect_arguments: &mut Vec<NamedArgument>,
     compiled: &mut Vec<Action>,
 ) -> Result<u32, BuildError> {
     let start = compiled.len();
@@ -1730,7 +1945,7 @@ fn compile_action(
     event_ids: &mut HashMap<EventPattern, EventId>,
     effects: &mut Vec<Box<str>>,
     effect_ids: &mut HashMap<Box<str>, EffectId>,
-    effect_arguments: &mut Vec<EffectArgument>,
+    effect_arguments: &mut Vec<NamedArgument>,
 ) -> Result<Action, BuildError> {
     match action {
         DraftAction::Raise(event) => {
@@ -1756,7 +1971,7 @@ fn compile_action(
             };
             let argument_start = u32::try_from(effect_arguments.len())
                 .map_err(|_| BuildError::TooManyEffectArguments)?;
-            effect_arguments.extend(arguments.iter().map(|(name, expression)| EffectArgument {
+            effect_arguments.extend(arguments.iter().map(|(name, expression)| NamedArgument {
                 name: Arc::from(name.as_ref()),
                 expression: *expression,
             }));
@@ -1959,6 +2174,13 @@ pub(crate) fn is_scxml_system_name(value: &str) -> bool {
     )
 }
 
+pub(crate) fn is_activity_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 /// A state-tree definition validation error.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum BuildError {
@@ -2048,6 +2270,24 @@ pub enum BuildError {
     TooManyEffectArguments,
     #[error("a definition cannot contain more than u32::MAX timers")]
     TooManyTimers,
+    #[error("an activity id cannot be empty")]
+    EmptyActivityId,
+    #[error(
+        "activity id `{0}` must be one event-name segment containing only ASCII letters, digits, `_`, or `-`"
+    )]
+    InvalidActivityId(Box<str>),
+    #[error("activity id `{0}` is duplicated")]
+    DuplicateActivityId(Box<str>),
+    #[error("an activity name cannot be empty")]
+    EmptyActivityName,
+    #[error("an activity argument name cannot be empty")]
+    EmptyActivityArgumentName,
+    #[error("activity argument `{0}` is duplicated")]
+    DuplicateActivityArgument(Box<str>),
+    #[error("final state {0:?} cannot own an activity")]
+    ActivityOnFinal(StateId),
+    #[error("a definition cannot contain more than u32::MAX activities")]
+    TooManyActivities,
 }
 
 #[cfg(test)]
@@ -2061,7 +2301,8 @@ struct DefinitionSemantics {
     children: Vec<u32>,
     transition_entries: Vec<EntrySemantics>,
     transition_actions: Vec<ActionSemantics>,
-    effect_arguments: Vec<(Arc<str>, ExpressionId)>,
+    named_arguments: Vec<(Arc<str>, ExpressionId)>,
+    activities: Vec<ActivitySemantics>,
     initial_entries: Vec<EntrySemantics>,
     max_depth: usize,
     max_active: usize,
@@ -2072,6 +2313,18 @@ struct DefinitionSemantics {
     event_requirements: Vec<EventId>,
     internal_events: Vec<EventId>,
     effects: Vec<Box<str>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct ActivitySemantics {
+    id: Box<str>,
+    name: Box<str>,
+    owner: u32,
+    argument_start: u32,
+    argument_len: u32,
+    done: EventId,
+    error: EventId,
 }
 
 #[cfg(test)]
@@ -2087,6 +2340,8 @@ struct StateSemantics {
     entry_actions: Vec<ActionSemantics>,
     exit_actions: Vec<ActionSemantics>,
     initial_actions: Vec<ActionSemantics>,
+    activity_start: u32,
+    activity_len: u32,
     transitions: Vec<TransitionSemantics>,
 }
 
@@ -2191,6 +2446,8 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                 entry_actions: state.entry_actions.iter().map(action_semantics).collect(),
                 exit_actions: state.exit_actions.iter().map(action_semantics).collect(),
                 initial_actions: state.initial_actions.iter().map(action_semantics).collect(),
+                activity_start: state.activity_start,
+                activity_len: state.activity_len,
                 transitions: state
                     .transitions
                     .iter()
@@ -2219,10 +2476,23 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
             .iter()
             .map(action_semantics)
             .collect(),
-        effect_arguments: compiled
-            .effect_arguments
+        named_arguments: compiled
+            .named_arguments
             .iter()
             .map(|argument| (Arc::clone(&argument.name), argument.expression))
+            .collect(),
+        activities: compiled
+            .activities
+            .iter()
+            .map(|activity| ActivitySemantics {
+                id: activity.id.clone(),
+                name: activity.name.clone(),
+                owner: activity.owner.index,
+                argument_start: activity.argument_start,
+                argument_len: activity.argument_len,
+                done: activity.done,
+                error: activity.error,
+            })
             .collect(),
         initial_entries: compiled
             .initial_entries
@@ -2438,6 +2708,32 @@ mod tests {
                 .unwrap_err(),
             BuildError::InvalidEventDescriptor("advance fast".into())
         );
+    }
+
+    #[test]
+    fn activity_ids_are_single_safe_event_name_segments() {
+        for id in ["job", "job-child", "job_child"] {
+            let mut builder = StateTreeBuilder::new("activity-id");
+            let root = builder.compound_root("root").unwrap();
+            let active = builder.atomic("active", root).unwrap();
+            builder.initial(root, active).unwrap();
+            builder
+                .add_activity(active, StateTreeActivityDefinition::new(id, "work"))
+                .unwrap();
+        }
+
+        for id in ["job.child", "*", "job child"] {
+            let mut builder = StateTreeBuilder::new("invalid-activity-id");
+            let root = builder.compound_root("root").unwrap();
+            let active = builder.atomic("active", root).unwrap();
+            builder.initial(root, active).unwrap();
+            assert_eq!(
+                builder
+                    .add_activity(active, StateTreeActivityDefinition::new(id, "work"))
+                    .unwrap_err(),
+                BuildError::InvalidActivityId(id.into())
+            );
+        }
     }
 
     #[test]

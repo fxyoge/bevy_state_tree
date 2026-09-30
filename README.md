@@ -14,14 +14,16 @@ The crate currently provides the runtime foundation:
 - ordered SCXML `raise` and Luau `assign` actions on entry, exit, initial, and
   regular transitions;
 - typed effects that construct and publish concrete Bevy messages;
+- state-scoped typed activities with generation-safe completion and failure;
 - opt-in typed event payload projection through Luau `_event.data`;
 - bounded iterative macrostep stabilization;
 - deterministic transition sets across orthogonal regions;
 - ordered per-instance entity and broadcast event queues;
 - parallel event processing across independent instances.
 
-Activities, behavior-tree composites, history, and invocation are planned on
-top of this foundation.
+Behavior-tree composites and history remain future work. Standard SCXML
+`<invoke>` is intentionally unsupported; long-running Bevy work uses the
+structural `bst:activity` extension instead.
 
 The `scxml` module provides a namespace-aware authored-syntax parser that keeps
 SCXML structure, document order, source spans, raw expressions, and foreign
@@ -181,23 +183,31 @@ Headless execution advances its explicit clock with
 `StateTreeExecution::advance_time` and the corresponding traced or effect-sink
 variants. Bevy execution reads `Time`, so `TimePlugin` must be installed before
 `StateTreePlugin`. Due timeouts run in `StateTreeSet::ProcessTimers`, before
-`QueueEvents` and `ProcessEvents`; a timeout therefore wins over an external
-event delivered in the same schedule run when both leave the same active state.
+`QueueEvents`, `ProcessActivityOutcomes`, and `ProcessEvents`; a timeout
+therefore wins over an external event delivered in the same schedule run when
+both leave the same active state.
 
 Malformed XML and unsupported runtime semantics fail asset loading. Typed event
-descriptors and effects are domain-specific, so they are linked later when an
-instance initializes. A linking failure leaves the loaded definition intact and
-adds `StateTreeLinkFailure<D>` to the pending instance.
+descriptors, effects, and activities are domain-specific, so they are linked
+later when an instance initializes. A linking failure leaves the loaded
+definition intact and adds `StateTreeLinkFailure<D>` to the pending instance.
 
 Asset replacement is not currently applied to running instances. They retain
 the definition against which they initialized; new and pending instances use
 the replacement asset.
 
-Definitions are linked against each domain's typed event protocol and effect
-registry before initialization. An unmatched event descriptor or unregistered
-effect leaves the instance pending and adds a queryable
-`StateTreeLinkFailure<D>` component. Replacing the asset or registering the
-missing effect retries linking without changing successfully running instances.
+Definitions are linked against each domain's typed event protocol, effect
+registry, and activity registry before initialization. An unmatched event
+descriptor or unregistered effect or activity leaves the instance pending and
+adds a queryable `StateTreeLinkFailure<D>` component. Replacing the asset or
+registering a missing effect or activity retries linking without changing
+successfully running instances.
+
+The complete domain schedule order is `ProcessTimers`, `QueueEvents`,
+`ProcessActivityOutcomes`, `Initialize`, `ProcessEvents`, `HandleActivities`,
+then `HandleEffects`. Statechart actions can construct effect messages before
+they generate activity lifecycle messages, but consumers always observe the
+fixed `HandleActivities`-before-`HandleEffects` phase order.
 
 Entering a final child of the document root sets the instance status to
 `Complete` and retains the root and reached final state for inspection. This is
@@ -231,6 +241,46 @@ errors fault only the affected instance. Headless callers use
 Headless constructors return `Result` because the definition must still link to
 the execution's typed event protocol.
 
+## Typed Activities
+
+Activities are structural children of a `<state>` or `<parallel>`, not actions:
+
+```xml
+<state id="moving">
+  <bst:activity id="path" name="find_path">
+    <bst:arg name="destination" expr="target"/>
+  </bst:activity>
+  <transition event="done.activity.path" target="arrived"/>
+  <transition event="error.activity.path" target="blocked"/>
+</state>
+```
+
+The globally unique `id` and registered `name` are required. An activity `id`
+must be exactly one event-name segment: non-empty ASCII letters, digits, `_`,
+or `-` only. Arguments use the same Luau evaluation and named conversion rules
+as effects. The constructor
+returns `A`; systems in `HandleActivities` receive
+`StateTreeActivityLifecycle<D, A>::Started { token, activity }` or
+`Cancelled { token }`.
+
+Activities start after owner entry actions and cancel after a committed exit.
+Fault, root completion, and instance removal/replacement cancel every live run.
+A terminal outcome leaves the owner active but deactivates the slot until
+re-entry. `StateTreeActivityOutcomeWriter<D, A>` routes typed output/error values
+using entity, runtime, activity, and generation tokens, so stale and duplicate
+outcomes are ignored.
+
+Output and error independently project portable Luau `_event.data`; projection
+errors fault the target instance. The generated `done.activity.*` and
+`error.activity.*` events are internal events: they remain inside the instance,
+but can be handled with normal authored event descriptors. Headless execution uses
+`StateTreeActivitySink`, `new_with_activity_sink`,
+`process_event_with_activity_sink`, and manual `complete_activity` /
+`fail_activity` methods. Charts containing both effects and activities should
+use the explicit `*_with_sinks` constructor, event, timer, and outcome methods
+to supply both sinks for every macrostep. The crate does not prescribe futures
+or tasks.
+
 ## Semantic Tests
 
 Each case named in `tests/scxml/manifest.txt` has a project-owned `.scxml`
@@ -242,21 +292,23 @@ case-specific Rust assertions.
 ## Benchmarks
 
 Run `just bench` for both throughput and allocation profiles, or use
-`just _bench-execution` and `just _bench-allocation` separately. Throughput cases
-cover broadcast processing across as many as one million independent trees,
-sparse entity events in a population of 100,000, initialization, deep re-entry,
-transition scanning, typed effects, wide parallel configurations, far-future
-idle timer populations, and dense timer expiry. Parsing, compilation, and
-spawning remain outside steady-state processing timings; event cases queue and
-process exactly one configured event per measured schedule run.
+`just _bench-execution` and `just _bench-allocation` separately. Throughput
+cases cover broadcast processing across as many as one million independent
+trees, sparse entity events in a population of 100,000, initialization, activity
+initialization and outcome processing, deep re-entry, transition scanning,
+typed effects, wide parallel configurations, far-future idle timer populations,
+and dense timer expiry. Parsing, compilation, and spawning remain outside
+steady-state processing timings; event cases queue and process exactly one
+configured event per measured schedule run.
 
 The allocation suite uses Divan's global allocator profiler and a single-threaded
 Bevy schedule, so Bevy-owned worker threads cannot hide allocations.
-Initialization cases measure the full pending-to-running lifecycle, while
-spawn-and-initialize cases additionally include ECS component storage after
-warming the empty schedule. Timer cases separately measure initialization and
-arming plus steady-state dense expiry. Divan's `max alloc` column is peak net requested
-memory attributed to the measured interval, not process RSS or total live heap;
-setup-owned deallocations may reduce it in processing cases. Allocation
-profiling affects timing, so compare its allocation columns rather than its
-timings with the parallel throughput suite.
+Initialization and activity initialization cases measure the full
+pending-to-running lifecycle; activity outcome cases measure terminal outcome
+processing. Spawn-and-initialize cases additionally include ECS component
+storage after warming the empty schedule. Timer cases separately measure
+initialization and arming plus steady-state dense expiry. Divan's `max alloc`
+column is peak net requested memory attributed to the measured interval, not
+process RSS or total live heap; setup-owned deallocations may reduce it in
+processing cases. Allocation profiling affects timing, so compare its allocation
+columns rather than its timings with the parallel throughput suite.

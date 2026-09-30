@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::definition::assert_definition_semantics_eq;
 use crate::{
-    BuildError, StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeDefinition,
-    StateTreeEffectArgument, StateTreeTransition,
+    BuildError, StateTreeAction, StateTreeActivityDefinition, StateTreeArgument, StateTreeBuilder,
+    StateTreeData, StateTreeDefinition, StateTreeEffectArgument, StateTreeTransition,
 };
 
 macro_rules! definition_parity_test {
@@ -31,6 +31,23 @@ definition_parity_test!(action_parity, "actions", action_definition);
 definition_parity_test!(minimal_luau_parity, "minimal_luau", minimal_luau_definition);
 definition_parity_test!(after_transition_parity, "after", after_definition);
 definition_parity_test!(internal_transition_parity, "internal", internal_definition);
+definition_parity_test!(activity_parity, "activity", activity_definition);
+
+fn activity_definition() -> Result<StateTreeDefinition, BuildError> {
+    let mut builder = StateTreeBuilder::new("activity");
+    builder.luau_datamodel([StateTreeData::new("target").with_initializer("'north'")])?;
+    let root = builder.compound_root("#document")?;
+    let active = builder.atomic("active", root)?;
+    builder.initial(root, active)?;
+    builder.add_activity(
+        active,
+        StateTreeActivityDefinition::new("path", "find_path")
+            .arguments([StateTreeArgument::new("destination", "target")]),
+    )?;
+    builder.add_transition(active, StateTreeTransition::on("done.activity.path"))?;
+    builder.add_transition(active, StateTreeTransition::on("error.activity.path"))?;
+    builder.build()
+}
 
 fn hierarchy_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("hierarchy");

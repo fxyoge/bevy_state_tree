@@ -78,6 +78,8 @@ pub enum Capability {
     ForeignExtension,
     /// A Bevy state-tree typed effect is present.
     TypedEffect,
+    /// A Bevy state-tree structural activity is present.
+    Activity,
 }
 
 /// The document element (`scxml`).

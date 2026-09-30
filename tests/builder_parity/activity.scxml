@@ -1,0 +1,11 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree" datamodel="luau" name="activity">
+  <datamodel><data id="target" expr="'north'"/></datamodel>
+  <state id="active">
+    <bst:activity id="path" name="find_path">
+      <bst:arg name="destination" expr="target"/>
+    </bst:activity>
+    <transition event="done.activity.path"/>
+    <transition event="error.activity.path"/>
+  </state>
+</scxml>

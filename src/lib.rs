@@ -26,6 +26,7 @@
 
 extern crate self as bevy_state_tree;
 
+mod activity;
 mod definition;
 mod effect;
 mod event;
@@ -38,11 +39,13 @@ pub mod scxml;
 
 pub use bevy_state_tree_macros::StateTreeEvents;
 pub use definition::{
-    BuildError, StateId, StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeDefinition,
-    StateTreeEffectArgument, StateTreeLinkError, StateTreeLinkIssue, StateTreeTransition,
+    BuildError, StateId, StateTreeAction, StateTreeActivityDefinition, StateTreeArgument,
+    StateTreeBuilder, StateTreeData, StateTreeDefinition, StateTreeEffectArgument,
+    StateTreeLinkError, StateTreeLinkIssue, StateTreeTransition,
 };
 pub use effect::{
-    FromStateTreeValue, StateTreeAppExt, StateTreeEffectArgs, StateTreeEffectContext,
+    FromStateTreeValue, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
+    StateTreeAppExt, StateTreeArgs, StateTreeContext, StateTreeEffectArgs, StateTreeEffectContext,
     StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
 };
 pub use event::{
@@ -67,13 +70,21 @@ pub mod prelude {
     pub use crate::{
         BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, BuildError, DatamodelOperation,
         EntityStateTreeEvent, EntityStateTreeEventWriter, FromStateTreeValue, InstanceStatus,
-        LuauValue, RuntimeFault, StateId, StateTreeAction, StateTreeAppExt, StateTreeBuilder,
-        StateTreeData, StateTreeDefinition, StateTreeDomain, StateTreeEffectArgs,
-        StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
-        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEventDataError, StateTreeEventLog,
-        StateTreeEventPayload, StateTreeEvents, StateTreeExecution, StateTreeInstance,
-        StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin,
-        StateTreeSet, StateTreeSettings, StateTreeTrace, StateTreeTraceRecord,
-        StateTreeTraceTrigger, StateTreeTransition,
+        LuauValue, RuntimeFault, StateId, StateTreeAction, StateTreeActivity,
+        StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityDefinition,
+        StateTreeActivityError, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
+        StateTreeActivityRequest, StateTreeActivitySink, StateTreeActivityToken, StateTreeAppExt,
+        StateTreeArgs, StateTreeArgument, StateTreeBuilder, StateTreeContext, StateTreeData,
+        StateTreeDefinition, StateTreeDomain, StateTreeEffectArgs, StateTreeEffectArgument,
+        StateTreeEffectContext, StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
+        StateTreeEventDataError, StateTreeEventLog, StateTreeEventPayload, StateTreeEvents,
+        StateTreeExecution, StateTreeHeadlessActivityToken, StateTreeInstance, StateTreeLinkError,
+        StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin, StateTreeSet, StateTreeSettings,
+        StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, StateTreeTransition,
     };
 }
+pub use activity::{
+    StateTreeActivity, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
+    StateTreeActivityRequest, StateTreeActivitySink, StateTreeActivityToken,
+    StateTreeHeadlessActivityToken,
+};

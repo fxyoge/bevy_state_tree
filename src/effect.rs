@@ -38,8 +38,8 @@ impl StateTreeEffectError {
     }
 }
 
-/// Immutable execution context supplied to one effect constructor.
-pub struct StateTreeEffectContext<'a, D: StateTreeDomain> {
+/// Immutable execution context supplied to a typed state-tree constructor.
+pub struct StateTreeContext<'a, D: StateTreeDomain> {
     pub(crate) entity: Option<Entity>,
     pub(crate) event_name: Option<&'a str>,
     pub(crate) external_event: Option<&'a D::Event>,
@@ -47,7 +47,7 @@ pub struct StateTreeEffectContext<'a, D: StateTreeDomain> {
     pub(crate) data: &'a [LuauValue],
 }
 
-impl<'a, D: StateTreeDomain> StateTreeEffectContext<'a, D> {
+impl<'a, D: StateTreeDomain> StateTreeContext<'a, D> {
     /// Returns the Bevy entity running the tree, or `None` for headless execution.
     pub fn entity(&self) -> Option<Entity> {
         self.entity
@@ -72,13 +72,18 @@ impl<'a, D: StateTreeDomain> StateTreeEffectContext<'a, D> {
     }
 }
 
-/// Evaluated named arguments supplied to one effect constructor.
+/// Effect-specific alias for the shared immutable constructor context.
+pub type StateTreeEffectContext<'a, D> = StateTreeContext<'a, D>;
+/// Activity-specific alias for the shared immutable constructor context.
+pub type StateTreeActivityContext<'a, D> = StateTreeContext<'a, D>;
+
+/// Evaluated named arguments supplied to one typed state-tree constructor.
 #[derive(Debug, Default)]
-pub struct StateTreeEffectArgs {
+pub struct StateTreeArgs {
     values: Vec<(Arc<str>, LuauValue)>,
 }
 
-impl StateTreeEffectArgs {
+impl StateTreeArgs {
     pub(crate) fn new(values: Vec<(Arc<str>, LuauValue)>) -> Self {
         Self { values }
     }
@@ -92,7 +97,7 @@ impl StateTreeEffectArgs {
         else {
             return Err(StateTreeEffectError::argument(
                 name,
-                "required effect argument is missing",
+                "required state-tree argument is missing",
             ));
         };
         let (_, value) = self.values.remove(index);
@@ -121,7 +126,7 @@ impl StateTreeEffectArgs {
         if let Some((name, _)) = self.values.first() {
             return Err(StateTreeEffectError::argument(
                 Box::<str>::from(name.as_ref()),
-                "effect argument was not consumed by its constructor",
+                "state-tree argument was not consumed by its constructor",
             ));
         }
         Ok(())
@@ -134,6 +139,13 @@ impl StateTreeEffectArgs {
             .map(|(name, value)| (name.as_ref(), value))
     }
 }
+
+/// Effect-specific name for [`StateTreeArgs`].
+pub type StateTreeEffectArgs = StateTreeArgs;
+/// Activity-specific name for [`StateTreeArgs`].
+pub type StateTreeActivityArgs = StateTreeArgs;
+/// Activity constructors use the shared effect-construction error type.
+pub type StateTreeActivityError = StateTreeEffectError;
 
 /// One portable effect request emitted by headless execution.
 pub struct StateTreeEffectRequest<'a, E: StateTreeEvents> {
@@ -412,6 +424,22 @@ pub trait StateTreeAppExt {
             + Send
             + Sync
             + 'static;
+
+    fn register_state_tree_activity<D, A, F>(
+        &mut self,
+        name: impl Into<Box<str>>,
+        constructor: F,
+    ) -> &mut Self
+    where
+        D: StateTreeDomain,
+        A: crate::StateTreeActivity,
+        F: Fn(
+                StateTreeActivityContext<'_, D>,
+                &mut StateTreeActivityArgs,
+            ) -> Result<A, StateTreeActivityError>
+            + Send
+            + Sync
+            + 'static;
 }
 
 impl StateTreeAppExt for App {
@@ -451,6 +479,26 @@ impl StateTreeAppExt for App {
             "state-tree effect `{name}` was registered more than once"
         );
         registry.revision = registry.revision.wrapping_add(1);
+        self
+    }
+
+    fn register_state_tree_activity<D, A, F>(
+        &mut self,
+        name: impl Into<Box<str>>,
+        constructor: F,
+    ) -> &mut Self
+    where
+        D: StateTreeDomain,
+        A: crate::StateTreeActivity,
+        F: Fn(
+                StateTreeActivityContext<'_, D>,
+                &mut StateTreeActivityArgs,
+            ) -> Result<A, StateTreeActivityError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        crate::activity::register_activity::<D, A, F>(self, name.into(), constructor);
         self
     }
 }

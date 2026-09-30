@@ -27,6 +27,10 @@ use bevy_utils::Parallel;
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
     StateTreeDomain, StateTreeInstance, StateTreeLinkError,
+    activity::{
+        BevyActivitySink, StateTreeActivityInbox, StateTreeActivityIngress,
+        StateTreeActivityRegistry,
+    },
     definition::{CompiledDefinition, LinkedDefinition},
     effect::{BevyEffectSink, StateTreeEffectRegistry},
     instance::{PendingStateTree, TimerToken, TimerUpdate},
@@ -40,10 +44,14 @@ pub enum StateTreeSet {
     ProcessTimers,
     /// Produces state-tree events that must be delivered in this schedule run.
     QueueEvents,
+    /// Processes terminal activity outcomes as independent macrosteps.
+    ProcessActivityOutcomes,
     /// Initializes instances whose definition assets are available.
     Initialize,
     /// Delivers queued events and runs macrosteps to stability.
     ProcessEvents,
+    /// Handles typed activity lifecycle messages.
+    HandleActivities,
     /// Consumes typed effect messages emitted by state-tree actions.
     HandleEffects,
 }
@@ -131,14 +139,18 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             .init_resource::<StateTreeTimers<D>>()
             .init_resource::<LinkedStateTreeDefinitions<D>>()
             .init_resource::<StateTreeEffectRegistry<D>>()
+            .init_resource::<StateTreeActivityRegistry<D>>()
+            .init_resource::<StateTreeActivityIngress<D>>()
             .init_resource::<StateTreeSettings<D>>()
             .configure_sets(
                 self.schedule,
                 (
                     StateTreeSet::ProcessTimers,
                     StateTreeSet::QueueEvents,
+                    StateTreeSet::ProcessActivityOutcomes,
                     StateTreeSet::Initialize,
                     StateTreeSet::ProcessEvents,
+                    StateTreeSet::HandleActivities,
                     StateTreeSet::HandleEffects,
                 )
                     .chain(),
@@ -147,6 +159,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
                 self.schedule,
                 (
                     process_timers::<D>.in_set(StateTreeSet::ProcessTimers),
+                    process_activity_outcomes::<D>.in_set(StateTreeSet::ProcessActivityOutcomes),
                     initialize_pending::<D>.in_set(StateTreeSet::Initialize),
                     process_events::<D>.in_set(StateTreeSet::ProcessEvents),
                 ),
@@ -159,7 +172,7 @@ struct StateTreeAssetsInstalled;
 
 #[derive(Resource)]
 struct LinkedStateTreeDefinitions<D: StateTreeDomain> {
-    definitions: HashMap<(u64, u64), CachedLinkedDefinition<D>>,
+    definitions: HashMap<(u64, u64, u64), CachedLinkedDefinition<D>>,
     marker: PhantomData<fn() -> D>,
 }
 
@@ -182,12 +195,13 @@ impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
         &mut self,
         compiled: Arc<CompiledDefinition>,
         effects: &StateTreeEffectRegistry<D>,
+        activities: &StateTreeActivityRegistry<D>,
     ) -> Result<Arc<LinkedDefinition<D>>, Arc<StateTreeLinkError>> {
         self.definitions.retain(|_, cached| match cached {
             CachedLinkedDefinition::Linked(linked) => linked.strong_count() > 0,
             CachedLinkedDefinition::Failed(error) => error.strong_count() > 0,
         });
-        let key = (compiled.identity, effects.revision());
+        let key = (compiled.identity, effects.revision(), activities.revision());
         if let Some(cached) = self.definitions.get(&key) {
             match cached {
                 CachedLinkedDefinition::Linked(linked) => {
@@ -202,7 +216,7 @@ impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
                 }
             }
         }
-        match LinkedDefinition::new(compiled, Some(effects)) {
+        match LinkedDefinition::new(compiled, Some(effects), Some(activities)) {
             Ok(linked) => {
                 let linked = Arc::new(linked);
                 self.definitions
@@ -494,7 +508,10 @@ fn initialize_pending<D: StateTreeDomain>(
     definitions: Res<Assets<StateTreeDefinition>>,
     mut linked_definitions: ResMut<LinkedStateTreeDefinitions<D>>,
     timer_runtime: (Res<Time>, ResMut<StateTreeTimers<D>>),
-    effects: Res<StateTreeEffectRegistry<D>>,
+    registries: (
+        Res<StateTreeEffectRegistry<D>>,
+        Res<StateTreeActivityRegistry<D>>,
+    ),
     settings: Res<StateTreeSettings<D>>,
     mut instances: PendingStateTrees<'_, '_, D>,
 ) {
@@ -508,7 +525,11 @@ fn initialize_pending<D: StateTreeDomain>(
             }
             continue;
         };
-        let linked = match linked_definitions.get_or_insert(definition.compiled.clone(), &effects) {
+        let linked = match linked_definitions.get_or_insert(
+            definition.compiled.clone(),
+            &registries.0,
+            &registries.1,
+        ) {
             Ok(linked) => linked,
             Err(error) => {
                 if previous_failure.is_none_or(|previous| !Arc::ptr_eq(&previous.error, &error)) {
@@ -523,6 +544,7 @@ fn initialize_pending<D: StateTreeDomain>(
             }
         };
         instance.set_time(time.elapsed());
+        let has_activities = !linked.compiled.activities.is_empty();
         instance.initialize(
             linked,
             settings.max_microsteps.get(),
@@ -530,14 +552,19 @@ fn initialize_pending<D: StateTreeDomain>(
             &mut BevyEffectSink {
                 commands: &commands,
             },
+            &mut BevyActivitySink {
+                commands: &commands,
+            },
         );
         for update in instance.drain_timer_updates() {
             timers.apply(entity, update);
         }
         commands.command_scope(|mut commands| {
-            commands
-                .entity(entity)
-                .remove::<(PendingStateTree<D>, StateTreeLinkFailure<D>)>();
+            let mut entity_commands = commands.entity(entity);
+            if has_activities {
+                entity_commands.insert_if_new(StateTreeActivityInbox::<D>::default());
+            }
+            entity_commands.remove::<(PendingStateTree<D>, StateTreeLinkFailure<D>)>();
         });
     }
 }
@@ -637,6 +664,9 @@ fn process_timers<D: StateTreeDomain>(
                             &mut BevyEffectSink {
                                 commands: &commands,
                             },
+                            &mut BevyActivitySink {
+                                commands: &commands,
+                            },
                         )
                     };
                     stage_timer_updates(instance.bypass_change_detection(), entity, staged);
@@ -660,6 +690,79 @@ fn process_timers<D: StateTreeDomain>(
                 }
             }
             start = end;
+        }
+    }
+    timers.apply_staged();
+}
+
+fn process_activity_outcomes<D: StateTreeDomain>(
+    commands: ParallelCommands,
+    ingress: Res<StateTreeActivityIngress<D>>,
+    time: Res<Time>,
+    mut timers: ResMut<StateTreeTimers<D>>,
+    settings: Res<StateTreeSettings<D>>,
+    mut instances: Query<(
+        Entity,
+        &mut StateTreeInstance<D>,
+        &StateTreeActivityInbox<D>,
+    )>,
+) {
+    if !ingress
+        .dirty_hint
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let entities = {
+        let mut dirty = ingress
+            .dirty
+            .lock()
+            .expect("state-tree activity dirty set poisoned");
+        std::mem::take(&mut *dirty)
+    };
+    if entities.is_empty() {
+        return;
+    }
+    let now = time.elapsed();
+    {
+        let staged = &timers.staged;
+        let process = |(entity, mut instance, inbox): (
+            Entity,
+            Mut<'_, StateTreeInstance<D>>,
+            &StateTreeActivityInbox<D>,
+        )| {
+            let mut changed = false;
+            instance.bypass_change_detection().set_time(now);
+            let mut outcomes = inbox
+                .outcomes
+                .lock()
+                .expect("state-tree activity inbox poisoned");
+            for outcome in outcomes.drain(..) {
+                changed |= instance.bypass_change_detection().process_activity_outcome(
+                    outcome,
+                    settings.max_microsteps.get(),
+                    Some(entity),
+                    &mut BevyEffectSink {
+                        commands: &commands,
+                    },
+                    &mut BevyActivitySink {
+                        commands: &commands,
+                    },
+                );
+            }
+            stage_timer_updates(instance.bypass_change_detection(), entity, staged);
+            if changed {
+                instance.set_changed();
+            }
+        };
+        if ComputeTaskPool::try_get().is_some() {
+            instances
+                .par_iter_many_unique_mut(&entities)
+                .for_each(&process);
+        } else {
+            for instance in instances.iter_many_unique_mut(&entities) {
+                process(instance);
+            }
         }
     }
     timers.apply_staged();
@@ -773,6 +876,7 @@ fn process_external_event<D: StateTreeDomain>(
         microstep_limit,
         Some(entity),
         &mut BevyEffectSink { commands },
+        &mut BevyActivitySink { commands },
     );
     if changed {
         instance.set_changed();
@@ -794,11 +898,211 @@ mod tests {
 
     use super::*;
     use crate::{
-        InstanceStatus, StateTreeAppExt, StateTreeBuilder, StateTreeEffectError,
+        InstanceStatus, StateTreeActivity, StateTreeActivityDefinition, StateTreeActivityLifecycle,
+        StateTreeActivityOutcomeWriter, StateTreeAppExt, StateTreeBuilder, StateTreeEffectError,
         StateTreeEventPayload, StateTreeEvents, StateTreeTransition,
     };
 
     struct Simulation;
+
+    struct SecondarySimulation;
+
+    impl StateTreeDomain for SecondarySimulation {
+        type Event = SimulationEvents;
+    }
+
+    struct FindPath;
+
+    impl StateTreeActivity for FindPath {
+        type Output = i64;
+        type Error = String;
+
+        fn output_data(
+            output: &Self::Output,
+        ) -> Result<Option<crate::LuauValue>, crate::StateTreeEventDataError> {
+            if *output == -1 {
+                return Err(crate::StateTreeEventDataError::new(
+                    "path projection failed",
+                ));
+            }
+            Ok(Some(crate::LuauValue::Integer(*output)))
+        }
+
+        fn error_data(
+            error: &Self::Error,
+        ) -> Result<Option<crate::LuauValue>, crate::StateTreeEventDataError> {
+            Ok(Some(crate::LuauValue::String(error.clone().into())))
+        }
+    }
+
+    #[derive(Resource, Default)]
+    struct ActivityMessages {
+        started: Vec<crate::StateTreeActivityToken<Simulation, FindPath>>,
+        cancelled: Vec<crate::StateTreeActivityToken<Simulation, FindPath>>,
+    }
+
+    #[derive(Resource, Default)]
+    struct SecondaryActivityMessages {
+        started: Vec<crate::StateTreeActivityToken<SecondarySimulation, FindPath>>,
+    }
+
+    fn collect_activities(
+        mut messages: MessageReader<StateTreeActivityLifecycle<Simulation, FindPath>>,
+        mut recorded: ResMut<ActivityMessages>,
+    ) {
+        for message in messages.read() {
+            match message {
+                StateTreeActivityLifecycle::Started { token, .. } => recorded.started.push(*token),
+                StateTreeActivityLifecycle::Cancelled { token } => recorded.cancelled.push(*token),
+            }
+        }
+    }
+
+    fn finish_path(
+        In(token): In<crate::StateTreeActivityToken<Simulation, FindPath>>,
+        mut writer: StateTreeActivityOutcomeWriter<Simulation, FindPath>,
+    ) -> bool {
+        writer.complete(token, 7)
+    }
+
+    fn collect_secondary_activities(
+        mut messages: MessageReader<StateTreeActivityLifecycle<SecondarySimulation, FindPath>>,
+        mut recorded: ResMut<SecondaryActivityMessages>,
+    ) {
+        for message in messages.read() {
+            if let StateTreeActivityLifecycle::Started { token, .. } = message {
+                recorded.started.push(*token);
+            }
+        }
+    }
+
+    fn finish_secondary_path(
+        In(token): In<crate::StateTreeActivityToken<SecondarySimulation, FindPath>>,
+        mut writer: StateTreeActivityOutcomeWriter<SecondarySimulation, FindPath>,
+    ) -> bool {
+        writer.complete(token, 7)
+    }
+
+    fn fail_path(
+        In(token): In<crate::StateTreeActivityToken<Simulation, FindPath>>,
+        mut writer: StateTreeActivityOutcomeWriter<Simulation, FindPath>,
+    ) -> bool {
+        writer.fail(token, "blocked".to_owned())
+    }
+
+    fn break_path_projection(
+        In(token): In<crate::StateTreeActivityToken<Simulation, FindPath>>,
+        mut writer: StateTreeActivityOutcomeWriter<Simulation, FindPath>,
+    ) -> bool {
+        writer.complete(token, -1)
+    }
+
+    fn activity_definition() -> StateTreeDefinition {
+        let mut builder = StateTreeBuilder::new("activity");
+        builder
+            .luau_datamodel([crate::StateTreeData::new("result")])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        let done = builder.final_state("done", root).unwrap();
+        builder.initial(root, active).unwrap();
+        builder
+            .add_activity(
+                active,
+                StateTreeActivityDefinition::new("path", "find_path"),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                active,
+                StateTreeTransition::on("done.activity.path")
+                    .condition("_event.data == 7")
+                    .target(done),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn activity_precedence_definition() -> StateTreeDefinition {
+        let mut builder = StateTreeBuilder::new("activity-precedence");
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        let activity_won = builder.final_state("activity-won", root).unwrap();
+        let event_won = builder.final_state("event-won", root).unwrap();
+        builder.initial(root, active).unwrap();
+        builder
+            .add_activity(
+                active,
+                StateTreeActivityDefinition::new("path", "find_path"),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                active,
+                StateTreeTransition::on("done.activity.path").target(activity_won),
+            )
+            .unwrap();
+        builder
+            .add_transition(active, StateTreeTransition::on("advance").target(event_won))
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn failing_activity_definition() -> StateTreeDefinition {
+        let mut builder = StateTreeBuilder::new("activity-failure");
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        let failed = builder.final_state("failed", root).unwrap();
+        builder.initial(root, active).unwrap();
+        builder
+            .add_activity(
+                active,
+                StateTreeActivityDefinition::new("path", "find_path"),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                active,
+                StateTreeTransition::on("error.activity.path").target(failed),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn timed_activity_definition() -> StateTreeDefinition {
+        let mut builder = StateTreeBuilder::new("timed-activity");
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        let timed = builder.atomic("timed", root).unwrap();
+        let elapsed = builder.atomic("elapsed", root).unwrap();
+        let wrong = builder.atomic("wrong", root).unwrap();
+        builder.initial(root, active).unwrap();
+        builder
+            .add_activity(
+                active,
+                StateTreeActivityDefinition::new("path", "find_path"),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                active,
+                StateTreeTransition::after(Duration::from_secs(10)).target(wrong),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                active,
+                StateTreeTransition::on("done.activity.path").target(timed),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                timed,
+                StateTreeTransition::after(Duration::from_secs(1)).target(elapsed),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    }
 
     #[derive(EntityEvent)]
     struct Advance {
@@ -911,6 +1215,421 @@ mod tests {
             StateTreePlugin::<Simulation>::new(Update),
         ));
         app
+    }
+
+    fn activity_app() -> App {
+        let mut app = app();
+        app.register_state_tree_activity::<Simulation, FindPath, _>(
+            "find_path",
+            |_context, _arguments| Ok(FindPath),
+        )
+        .init_resource::<ActivityMessages>()
+        .add_systems(
+            Update,
+            collect_activities.in_set(StateTreeSet::HandleActivities),
+        );
+        app
+    }
+
+    fn multi_domain_activity_app(reverse_plugin_order: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            TimePlugin,
+            AssetPlugin {
+                file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets").into(),
+                watch_for_changes_override: Some(false),
+                use_asset_processor_override: Some(false),
+                ..Default::default()
+            },
+        ));
+        if reverse_plugin_order {
+            app.add_plugins(StateTreePlugin::<SecondarySimulation>::new(Update));
+            app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
+        } else {
+            app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
+            app.add_plugins(StateTreePlugin::<SecondarySimulation>::new(Update));
+        }
+        app.register_state_tree_activity::<Simulation, FindPath, _>(
+            "find_path",
+            |_context, _arguments| Ok(FindPath),
+        )
+        .register_state_tree_activity::<SecondarySimulation, FindPath, _>(
+            "find_path",
+            |_context, _arguments| Ok(FindPath),
+        )
+        .init_resource::<ActivityMessages>()
+        .init_resource::<SecondaryActivityMessages>()
+        .add_systems(
+            Update,
+            (
+                collect_activities.in_set(StateTreeSet::HandleActivities),
+                collect_secondary_activities.in_set(StateTreeSet::HandleActivities),
+            ),
+        );
+        app
+    }
+
+    #[test]
+    fn typed_activities_start_complete_and_ignore_duplicate_outcomes() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(activity_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        let token = app.world().resource::<ActivityMessages>().started[0];
+        assert_eq!(token.entity(), entity);
+        assert!(
+            app.world_mut()
+                .run_system_once_with(finish_path, token)
+                .unwrap()
+        );
+        assert!(
+            !app.world_mut()
+                .run_system_once_with(finish_path, token)
+                .unwrap()
+        );
+        app.update();
+        assert_eq!(active_leaf(&app, entity), "done");
+        assert!(
+            !app.world_mut()
+                .run_system_once_with(finish_path, token)
+                .unwrap()
+        );
+        app.update();
+        assert_eq!(active_leaf(&app, entity), "done");
+    }
+
+    #[test]
+    fn activity_outcomes_are_isolated_between_domains_on_one_entity() {
+        for reverse_plugin_order in [false, true] {
+            let mut app = multi_domain_activity_app(reverse_plugin_order);
+            let handle = app
+                .world_mut()
+                .resource_mut::<Assets<StateTreeDefinition>>()
+                .add(activity_definition());
+            let entity = app
+                .world_mut()
+                .spawn((
+                    StateTreeInstance::<Simulation>::new(handle.clone()),
+                    StateTreeInstance::<SecondarySimulation>::new(handle),
+                ))
+                .id();
+            app.update();
+
+            let simulation_token = app.world().resource::<ActivityMessages>().started[0];
+            let secondary_token = app.world().resource::<SecondaryActivityMessages>().started[0];
+            assert!(
+                app.world_mut()
+                    .run_system_once_with(finish_path, simulation_token)
+                    .unwrap()
+            );
+            assert!(
+                app.world_mut()
+                    .run_system_once_with(finish_secondary_path, secondary_token)
+                    .unwrap()
+            );
+
+            app.update();
+            assert_eq!(
+                app.world()
+                    .get::<StateTreeInstance<Simulation>>(entity)
+                    .unwrap()
+                    .active_state_names()
+                    .last(),
+                Some("done")
+            );
+            assert_eq!(
+                app.world()
+                    .get::<StateTreeInstance<SecondarySimulation>>(entity)
+                    .unwrap()
+                    .active_state_names()
+                    .last(),
+                Some("done")
+            );
+        }
+    }
+
+    #[test]
+    fn activity_outcome_applies_timer_cancellations_and_arms_from_current_time() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(timed_activity_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        advance_clock(&mut app, Duration::from_secs(5));
+        let token = app.world().resource::<ActivityMessages>().started[0];
+        assert!(
+            app.world_mut()
+                .run_system_once_with(finish_path, token)
+                .unwrap()
+        );
+        app.update();
+
+        assert_eq!(active_leaf(&app, entity), "timed");
+        assert_eq!(
+            app.world()
+                .resource::<StateTreeTimers<Simulation>>()
+                .active
+                .len(),
+            1
+        );
+        advance_clock(&mut app, Duration::from_millis(999));
+        assert_eq!(active_leaf(&app, entity), "timed");
+        advance_clock(&mut app, Duration::from_millis(1));
+        assert_eq!(active_leaf(&app, entity), "elapsed");
+    }
+
+    #[test]
+    fn activity_outcomes_precede_external_events_in_the_same_schedule() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(activity_precedence_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        let token = app.world().resource::<ActivityMessages>().started[0];
+        assert!(
+            app.world_mut()
+                .run_system_once_with(finish_path, token)
+                .unwrap()
+        );
+        queue_advance(&mut app, entity);
+        app.update();
+        assert_eq!(active_leaf(&app, entity), "activity-won");
+    }
+
+    #[test]
+    fn activity_failure_uses_its_separate_error_event() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(failing_activity_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        let token = app.world().resource::<ActivityMessages>().started[0];
+        assert!(
+            app.world_mut()
+                .run_system_once_with(fail_path, token)
+                .unwrap()
+        );
+        app.update();
+        assert_eq!(active_leaf(&app, entity), "failed");
+    }
+
+    #[test]
+    fn activity_projection_errors_fault_only_the_target_instance() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(activity_definition());
+        let faulted = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .id();
+        let running = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        let token = app
+            .world()
+            .resource::<ActivityMessages>()
+            .started
+            .iter()
+            .copied()
+            .find(|token| token.entity() == faulted)
+            .unwrap();
+        assert!(
+            app.world_mut()
+                .run_system_once_with(break_path_projection, token)
+                .unwrap()
+        );
+        app.update();
+        assert!(matches!(
+            app.world()
+                .get::<StateTreeInstance<Simulation>>(faulted)
+                .unwrap()
+                .status(),
+            InstanceStatus::Faulted(crate::RuntimeFault::ActivityDataProjection { .. })
+        ));
+        assert_eq!(
+            app.world()
+                .get::<StateTreeInstance<Simulation>>(running)
+                .unwrap()
+                .status(),
+            &InstanceStatus::Running
+        );
+    }
+
+    #[test]
+    fn removing_or_replacing_an_instance_cancels_and_invalidates_activity_generations() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(activity_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .id();
+        app.update();
+        let token = app.world().resource::<ActivityMessages>().started[0];
+        app.world_mut()
+            .entity_mut(entity)
+            .remove::<StateTreeInstance<Simulation>>();
+        app.update();
+        assert_eq!(
+            app.world().resource::<ActivityMessages>().cancelled,
+            [token]
+        );
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(StateTreeInstance::<Simulation>::new(handle));
+        app.update();
+        let replacement = *app
+            .world()
+            .resource::<ActivityMessages>()
+            .started
+            .last()
+            .unwrap();
+        assert_ne!(token, replacement);
+        assert!(
+            !app.world_mut()
+                .run_system_once_with(finish_path, token)
+                .unwrap()
+        );
+        app.update();
+        assert_eq!(active_leaf(&app, entity), "active");
+    }
+
+    #[test]
+    fn taking_and_reinserting_the_same_instance_invalidates_old_activity_tokens() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(activity_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        let token = app.world().resource::<ActivityMessages>().started[0];
+
+        let instance = app
+            .world_mut()
+            .entity_mut(entity)
+            .take::<StateTreeInstance<Simulation>>()
+            .unwrap();
+        app.world_mut().entity_mut(entity).insert(instance);
+
+        assert!(
+            !app.world_mut()
+                .run_system_once_with(break_path_projection, token)
+                .unwrap()
+        );
+        app.update();
+        assert_eq!(active_leaf(&app, entity), "active");
+    }
+
+    #[test]
+    fn removing_an_instance_clears_queued_activity_outcomes_and_dirty_ingress() {
+        let mut app = activity_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(activity_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        let token = app.world().resource::<ActivityMessages>().started[0];
+        assert!(
+            app.world_mut()
+                .run_system_once_with(finish_path, token)
+                .unwrap()
+        );
+
+        let instance = app
+            .world_mut()
+            .entity_mut(entity)
+            .take::<StateTreeInstance<Simulation>>()
+            .unwrap();
+        assert!(
+            app.world()
+                .get::<StateTreeActivityInbox<Simulation>>(entity)
+                .unwrap()
+                .outcomes
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !app.world()
+                .resource::<StateTreeActivityIngress<Simulation>>()
+                .dirty
+                .lock()
+                .unwrap()
+                .contains(&entity)
+        );
+        app.world_mut().entity_mut(entity).insert(instance);
+        app.update();
+        assert_eq!(active_leaf(&app, entity), "active");
+    }
+
+    #[test]
+    fn missing_activity_registration_retries_after_registry_revision_changes() {
+        let mut app = app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(activity_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+        assert!(matches!(
+            app.world()
+                .get::<StateTreeLinkFailure<Simulation>>(entity)
+                .unwrap()
+                .error()
+                .issues()[0],
+            crate::StateTreeLinkIssue::MissingActivity { .. }
+        ));
+        app.register_state_tree_activity::<Simulation, FindPath, _>(
+            "find_path",
+            |_context, _arguments| Ok(FindPath),
+        );
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<StateTreeInstance<Simulation>>(entity)
+                .unwrap()
+                .status(),
+            &InstanceStatus::Running
+        );
     }
 
     fn update_until(app: &mut App, expectation: &str, predicate: impl Fn(&App) -> bool) {

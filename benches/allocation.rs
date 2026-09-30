@@ -49,6 +49,24 @@ fn profile_effect_processing(bencher: Bencher<'_, '_>, instances: usize) {
         });
 }
 
+fn profile_activity_outcomes(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            let mut benchmark =
+                BenchmarkApp::empty(support::activity_definition(), Executor::SingleThreaded);
+            benchmark.register_benchmark_activity();
+            benchmark.spawn_instances(instances);
+            benchmark.run_schedule();
+            benchmark.queue_activity_outcomes();
+            benchmark
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
+}
+
 fn profile_initialization(
     bencher: Bencher<'_, '_>,
     instances: usize,
@@ -95,6 +113,11 @@ fn process_luau(bencher: Bencher<'_, '_>, instances: usize) {
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
 fn process_typed_effect(bencher: Bencher<'_, '_>, instances: usize) {
     profile_effect_processing(bencher, instances);
+}
+
+#[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
+fn process_dense_activity_outcomes(bencher: Bencher<'_, '_>, instances: usize) {
+    profile_activity_outcomes(bencher, instances);
 }
 
 #[divan::bench(args = [2, 8, 32], sample_count = 5)]
@@ -148,6 +171,23 @@ fn initialize_and_arm_timer(bencher: Bencher<'_, '_>, instances: usize) {
     profile_initialization(bencher, instances, || {
         support::timer_definition(Duration::from_secs(1))
     });
+}
+
+#[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
+fn initialize_dense_activities(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            let mut benchmark =
+                BenchmarkApp::empty(support::activity_definition(), Executor::SingleThreaded);
+            benchmark.register_benchmark_activity();
+            benchmark.spawn_instances(instances);
+            benchmark
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
 }
 
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
