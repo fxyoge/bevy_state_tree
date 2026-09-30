@@ -17,10 +17,9 @@ pub(crate) use loader::ScxmlLoader;
 pub use ast::{
     Assign, Attribute, Cancel, Capability, Content, ContentPart, Data, DataModel, DataModelChild,
     Diagnostic, Document, DoneData, DoneDataChild, Else, ElseIf, ExecutableContent, Extension,
-    ExtensionContent, Final, FinalChild, Finalize, Foreach, History, HistoryChild, If, IfChild,
-    Initial, Invoke, InvokeChild, Log, OnEntry, OnExit, Parallel, ParallelChild, Param,
-    PayloadElement, PayloadPart, Raise, RootChild, Script, Scxml, Send, SendChild, Span, State,
-    StateChild, Transition, TransitionType,
+    ExtensionContent, Final, FinalChild, Foreach, History, HistoryChild, If, IfChild, Initial, Log,
+    OnEntry, OnExit, Parallel, ParallelChild, Param, PayloadElement, PayloadPart, Raise, RootChild,
+    Script, Scxml, Send, SendChild, Span, State, StateChild, Transition, TransitionType,
 };
 pub use compile::{CompileError, compile};
 pub use parse::{SCXML_NAMESPACE, parse};

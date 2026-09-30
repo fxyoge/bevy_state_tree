@@ -523,7 +523,6 @@ fn decode_state(element: &Element, source_name: &str, source: &str) -> Result<St
             "final" => StateChild::Final(decode_final(child, source_name, source)?),
             "history" => StateChild::History(decode_history(child, source_name, source)?),
             "transition" => StateChild::Transition(decode_transition(child, source_name, source)?),
-            "invoke" => StateChild::Invoke(decode_invoke(child, source_name, source)?),
             "datamodel" => StateChild::DataModel(decode_datamodel(child, source_name, source)?),
             _ => return Err(unsupported_scxml(source_name, source, child, "state")),
         };
@@ -559,7 +558,6 @@ fn decode_parallel(
             "transition" => {
                 ParallelChild::Transition(decode_transition(child, source_name, source)?)
             }
-            "invoke" => ParallelChild::Invoke(decode_invoke(child, source_name, source)?),
             "datamodel" => ParallelChild::DataModel(decode_datamodel(child, source_name, source)?),
             _ => return Err(unsupported_scxml(source_name, source, child, "parallel")),
         };
@@ -753,43 +751,6 @@ fn decode_transition(
     })
 }
 
-fn decode_invoke(element: &Element, source_name: &str, source: &str) -> Result<Invoke, Diagnostic> {
-    let mut children = Vec::new();
-    for child in &element.children {
-        if !is_scxml(child) {
-            children.push(InvokeChild::Extension(extension_from_element(child)));
-            continue;
-        }
-        match child.local_name.as_str() {
-            "param" => children.push(InvokeChild::Param(decode_param(
-                child,
-                source_name,
-                source,
-            )?)),
-            "content" => children.push(InvokeChild::Content(decode_content(child))),
-            "finalize" => children.push(InvokeChild::Finalize(decode_finalize(
-                child,
-                source_name,
-                source,
-            )?)),
-            _ => return Err(unsupported_scxml(source_name, source, child, "invoke")),
-        }
-    }
-    Ok(Invoke {
-        span: element.span,
-        id: attribute(element, "id").map(str::to_owned),
-        invoke_type: attribute(element, "type").map(str::to_owned),
-        type_expression: attribute(element, "typeexpr").map(str::to_owned),
-        source: attribute(element, "src").map(str::to_owned),
-        source_expression: attribute(element, "srcexpr").map(str::to_owned),
-        id_location: attribute(element, "idlocation").map(str::to_owned),
-        namelist: attribute(element, "namelist").map(str::to_owned),
-        autoforward: attribute(element, "autoforward").map(str::to_owned),
-        attributes: element.attributes.clone(),
-        children,
-    })
-}
-
 fn decode_content(element: &Element) -> Content {
     decode_content_with_expression(
         element,
@@ -863,18 +824,6 @@ fn decode_param(element: &Element, source_name: &str, source: &str) -> Result<Pa
         location: attribute(element, "location").map(str::to_owned),
         attributes: element.attributes.clone(),
         extensions,
-    })
-}
-
-fn decode_finalize(
-    element: &Element,
-    source_name: &str,
-    source: &str,
-) -> Result<Finalize, Diagnostic> {
-    Ok(Finalize {
-        span: element.span,
-        attributes: element.attributes.clone(),
-        content: decode_executable_children(element, source_name, source)?,
     })
 }
 
@@ -1227,9 +1176,7 @@ fn validate_known_scxml_names(
                 | "final"
                 | "history"
                 | "transition"
-                | "invoke"
                 | "param"
-                | "finalize"
                 | "donedata"
                 | "content"
                 | "raise"
@@ -1445,6 +1392,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_state_invoke_with_the_generic_unknown_element_diagnostic() {
+        let unknown = parse(
+            "unknown.scxml",
+            &format!("<scxml xmlns=\"{NS}\"><state><mystery/></state></scxml>"),
+        )
+        .expect_err("unknown SCXML must fail");
+        let invoke = parse(
+            "invoke.scxml",
+            &format!("<scxml xmlns=\"{NS}\"><state><invoke/></state></scxml>"),
+        )
+        .expect_err("invoke must be treated as unknown SCXML");
+
+        assert_eq!(invoke.line, unknown.line);
+        assert_eq!(invoke.column, unknown.column);
+        assert_eq!(
+            invoke.message.replace("<invoke>", "<mystery>"),
+            unknown.message
+        );
+    }
+
+    #[test]
     fn rejects_non_scxml_root_even_when_the_local_name_matches() {
         let source = "<scxml xmlns=\"urn:not-scxml\"/>";
         let error = parse("wrong-root.scxml", source).expect_err("namespace is required");
@@ -1542,9 +1510,9 @@ mod tests {
     }
 
     #[test]
-    fn decodes_parallel_history_initial_final_and_invoke_nodes() {
+    fn decodes_parallel_history_initial_and_final_nodes() {
         let source = format!(
-            r#"<scxml xmlns="{NS}"><parallel id="regions"><state id="region"><history id="remember" type="deep"><transition target="region"/></history><initial><transition target="region"/></initial><invoke id="service" type="example.service"><param name="value" expr="ctx.value"/><finalize><assign location="ctx.done" expr="true"/></finalize></invoke><final id="finished"><onexit><log expr="done"/></onexit></final></state></parallel></scxml>"#
+            r#"<scxml xmlns="{NS}"><parallel id="regions"><state id="region"><history id="remember" type="deep"><transition target="region"/></history><initial><transition target="region"/></initial><final id="finished"><onexit><log expr="done"/></onexit></final></state></parallel></scxml>"#
         );
         let document = parse("nodes.scxml", &source).expect("all authored node forms");
         let parallel = match &document.root.children[0] {
@@ -1557,19 +1525,13 @@ mod tests {
         };
         assert!(matches!(state.children[0], StateChild::History(_)));
         assert!(matches!(state.children[1], StateChild::Initial(_)));
-        let invoke = match &state.children[2] {
-            StateChild::Invoke(value) => value,
-            _ => panic!("invoke"),
-        };
-        assert!(matches!(invoke.children[0], InvokeChild::Param(_)));
-        assert!(matches!(invoke.children[1], InvokeChild::Finalize(_)));
-        assert!(matches!(state.children[3], StateChild::Final(_)));
+        assert!(matches!(state.children[2], StateChild::Final(_)));
     }
 
     #[test]
     fn parses_optional_ids_payload_nodes_local_datamodel_and_sequence_conditionals() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:x="urn:payload"><script>root script</script><state><datamodel><data expr="raw"/></datamodel><onentry><if cond="first"><raise event="first"/><elseif cond="second"/><log expr="second"/><else/><script>fallback</script></if><send event="message"><param name="one"/><content>body<x:value/></content></send></onentry><invoke><param name="argument"/><content><x:request/></content></invoke><final><donedata><param name="result"/><content>done</content></donedata></final></state></scxml>"#
+            r#"<scxml xmlns="{NS}" xmlns:x="urn:payload"><script>root script</script><state><datamodel><data expr="raw"/></datamodel><onentry><if cond="first"><raise event="first"/><elseif cond="second"/><log expr="second"/><else/><script>fallback</script></if><send event="message"><param name="one"/><content>body<x:value/></content></send></onentry><final><donedata><param name="result"/><content>done</content></donedata></final></state></scxml>"#
         );
         let document = parse("standard-forms.scxml", &source).expect("valid authored SCXML");
         let root_script = match &document.root.children[0] {
@@ -1621,13 +1583,7 @@ mod tests {
                 .iter()
                 .any(|part| matches!(part, ContentPart::Element(_)))
         );
-        let invoke = match &state.children[2] {
-            StateChild::Invoke(value) => value,
-            _ => panic!("invoke"),
-        };
-        assert!(matches!(invoke.children[0], InvokeChild::Param(_)));
-        assert!(matches!(invoke.children[1], InvokeChild::Content(_)));
-        let final_state = match &state.children[3] {
+        let final_state = match &state.children[2] {
             StateChild::Final(value) => value,
             _ => panic!("final"),
         };
@@ -1649,7 +1605,6 @@ mod tests {
                   <state id="left" initial="a b">
                     <initial><transition target="a b"/></initial>
                     <onentry><send event="payload" type="bevy.test"><content><x:message/></content></send></onentry>
-                    <invoke x:idlocation="foreign" x:namelist="foreign"/>
                     <state id="a"/><state id="b"/>
                   </state>
                   <state id="right"/>
@@ -1694,13 +1649,6 @@ mod tests {
             _ => panic!("send"),
         };
         assert_eq!(send.send_type.as_deref(), Some("bevy.test"));
-        let invoke = match &state.children[2] {
-            StateChild::Invoke(invoke) => invoke,
-            _ => panic!("invoke"),
-        };
-        assert_eq!(invoke.id_location, None);
-        assert_eq!(invoke.namelist, None);
-        assert_eq!(invoke.attributes.len(), 2);
         let capabilities = document.capabilities();
         assert!(capabilities.contains(&Capability::PayloadContent));
         assert!(capabilities.contains(&Capability::Content));
@@ -1770,7 +1718,6 @@ mod tests {
                       <else><cancel sendid="timer"/><script>value++;</script></else>
                     </if>
                   </onentry>
-                  <invoke id="service"><finalize><assign location="done" expr="true"/></finalize><x:invoke/></invoke>
                 </state>
               </state>
               <parallel id="regions"><state id="left"/><state id="right"/></parallel>
@@ -1805,8 +1752,6 @@ mod tests {
             Capability::Script,
             Capability::DataModel,
             Capability::Data,
-            Capability::Invoke,
-            Capability::Finalize,
             Capability::ForeignExtension,
         ]
         .into_iter()

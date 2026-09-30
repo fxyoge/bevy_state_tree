@@ -326,9 +326,6 @@ impl<'a> Compiler<'a> {
                 StateChild::History(value) => {
                     return self.unsupported(value.span, "history states");
                 }
-                StateChild::Invoke(value) => {
-                    return self.unsupported(value.span, "invocation");
-                }
                 StateChild::DataModel(value) => {
                     return self.unsupported(value.span, "datamodels");
                 }
@@ -383,9 +380,6 @@ impl<'a> Compiler<'a> {
                 ParallelChild::Parallel(child) => self.add_parallel(child, runtime)?,
                 ParallelChild::History(value) => {
                     return self.unsupported(value.span, "history states");
-                }
-                ParallelChild::Invoke(value) => {
-                    return self.unsupported(value.span, "invocation");
                 }
                 ParallelChild::DataModel(value) => {
                     return self.unsupported(value.span, "datamodels");

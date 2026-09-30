@@ -97,7 +97,6 @@ impl<'a> CapabilityAnalyzer<'a> {
                 ParallelChild::Parallel(value) => self.visit_parallel(value),
                 ParallelChild::History(value) => self.visit_history(value),
                 ParallelChild::Transition(value) => self.visit_transition(value),
-                ParallelChild::Invoke(value) => self.visit_invoke(value),
                 ParallelChild::DataModel(value) => self.visit_datamodel(value),
                 ParallelChild::Extension(value) => self.visit_extension(value),
             }
@@ -115,7 +114,6 @@ impl<'a> CapabilityAnalyzer<'a> {
                 StateChild::Final(value) => self.visit_final(value),
                 StateChild::History(value) => self.visit_history(value),
                 StateChild::Transition(value) => self.visit_transition(value),
-                StateChild::Invoke(value) => self.visit_invoke(value),
                 StateChild::DataModel(value) => self.visit_datamodel(value),
                 StateChild::Extension(value) => self.visit_extension(value),
             }
@@ -210,24 +208,6 @@ impl<'a> CapabilityAnalyzer<'a> {
         self.add(Capability::Data);
         if let Some(content) = &data.content {
             self.visit_payload_content(content);
-        }
-    }
-
-    fn visit_invoke(&mut self, invoke: &Invoke) {
-        self.add(Capability::Invoke);
-        for child in &invoke.children {
-            match child {
-                InvokeChild::Param(value) => {
-                    self.add(Capability::Param);
-                    self.visit_extensions(&value.extensions);
-                }
-                InvokeChild::Content(value) => self.visit_content_node(value),
-                InvokeChild::Finalize(value) => {
-                    self.add(Capability::Finalize);
-                    self.visit_content(&value.content);
-                }
-                InvokeChild::Extension(value) => self.visit_extension(value),
-            }
         }
     }
 

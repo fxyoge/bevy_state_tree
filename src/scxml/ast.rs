@@ -68,10 +68,6 @@ pub enum Capability {
     DataModel,
     /// A `<data>` item is present.
     Data,
-    /// An invocation is present.
-    Invoke,
-    /// An invocation finalizer is present.
-    Finalize,
     /// A standard parameter payload is present.
     Param,
     /// A standard message or done-event content payload is present.
@@ -140,7 +136,6 @@ pub enum ParallelChild {
     Parallel(Parallel),
     History(History),
     Transition(Transition),
-    Invoke(Invoke),
     DataModel(DataModel),
     Extension(Extension),
 }
@@ -198,7 +193,6 @@ pub enum StateChild {
     Final(Final),
     History(History),
     Transition(Transition),
-    Invoke(Invoke),
     DataModel(DataModel),
     Extension(Extension),
 }
@@ -265,30 +259,6 @@ pub struct Data {
     pub attributes: Vec<Attribute>,
 }
 
-/// An invoked service/activity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Invoke {
-    pub span: Span,
-    pub id: Option<String>,
-    pub invoke_type: Option<String>,
-    pub type_expression: Option<String>,
-    pub source: Option<String>,
-    pub source_expression: Option<String>,
-    pub id_location: Option<String>,
-    pub namelist: Option<String>,
-    pub autoforward: Option<String>,
-    pub attributes: Vec<Attribute>,
-    pub children: Vec<InvokeChild>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InvokeChild {
-    Param(Param),
-    Content(Content),
-    Finalize(Finalize),
-    Extension(Extension),
-}
-
 /// Standard message or done-event payload content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Content {
@@ -348,13 +318,6 @@ pub struct Param {
     pub location: Option<String>,
     pub attributes: Vec<Attribute>,
     pub extensions: Vec<Extension>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Finalize {
-    pub span: Span,
-    pub attributes: Vec<Attribute>,
-    pub content: Vec<ExecutableContent>,
 }
 
 /// Executable content is retained in authored order.
