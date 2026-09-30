@@ -49,7 +49,9 @@ fn queue_set_delivers_on_a_single_threaded_schedule_without_task_pool_plugin() {
     let idle = builder.atomic("idle", root).unwrap();
     let active = builder.atomic("active", root).unwrap();
     builder.initial(root, idle).unwrap();
-    builder.transition(idle, "advance", active).unwrap();
+    builder
+        .add_transition(idle, StateTreeTransition::on("advance").target(active))
+        .unwrap();
     let handle = app
         .world_mut()
         .resource_mut::<Assets<StateTreeDefinition>>()

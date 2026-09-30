@@ -137,9 +137,11 @@ fn add_generated_definition(
 }
 ```
 
-The public builder can represent every semantic construct accepted by the
-SCXML compiler. Declarative specifications preserve datamodel, transition, and
-action order while the builder compiles them into the same dense runtime form:
+The public builder is a low-level compilation target for programmatically
+generated definitions. It represents every semantic construct accepted by the
+SCXML compiler without providing alternate runtime semantics. Declarative
+specifications preserve datamodel, transition, and action order while the
+builder compiles them into the same dense runtime form:
 
 ```rust,no_run
 # use bevy_state_tree::prelude::*;

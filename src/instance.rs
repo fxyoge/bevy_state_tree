@@ -567,65 +567,6 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         true
     }
 
-    #[cfg(test)]
-    fn process_authored_event(&mut self, name: &str, microstep_limit: usize) -> bool {
-        if self.status != InstanceStatus::Running {
-            return false;
-        }
-        let Some(event) = self
-            .linked
-            .as_ref()
-            .and_then(|linked| linked.compiled.event(name))
-        else {
-            return false;
-        };
-        let transition = match self.select_step(Trigger::Internal(event)) {
-            Ok(Some(transition)) => transition,
-            Ok(None) => return false,
-            Err(fault) => {
-                self.status = InstanceStatus::Faulted(fault);
-                return true;
-            }
-        };
-        let name = self
-            .linked
-            .as_ref()
-            .and_then(|linked| linked.compiled.event_name(event))
-            .map(str::to_owned);
-        let configuration_changed = self.selected_step_changes_configuration(transition);
-        self.trace_selected_step(1, transition, &mut NoStateTreeTrace);
-        if let Err(fault) = self.take_selected_step(
-            transition,
-            ActionContext {
-                event_name: name.as_deref(),
-                external_event: None,
-                entity: None,
-            },
-            &mut RejectEffects,
-            &mut NoStateTreeTrace,
-        ) {
-            self.status = InstanceStatus::Faulted(fault);
-            return true;
-        }
-        if configuration_changed {
-            self.update_completion(&mut NoStateTreeTrace);
-        }
-        if self.status == InstanceStatus::Running {
-            self.stabilize(
-                microstep_limit,
-                1,
-                ActionContext {
-                    event_name: name.as_deref(),
-                    external_event: None,
-                    entity: None,
-                },
-                &mut RejectEffects,
-                &mut NoStateTreeTrace,
-            );
-        }
-        true
-    }
-
     fn stabilize<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         limit: usize,
@@ -1486,13 +1427,19 @@ mod tests {
 
     struct TestDomain;
 
-    struct TestEvents;
+    enum TestEvents {
+        Advance,
+        Finish,
+    }
 
     impl crate::StateTreeEvents for TestEvents {
         const AUTHORED_NAMES: &'static [&'static str] = &["advance", "finish"];
 
         fn event_index(&self) -> usize {
-            unreachable!()
+            match self {
+                Self::Advance => 0,
+                Self::Finish => 1,
+            }
         }
     }
 
@@ -1512,6 +1459,14 @@ mod tests {
             &mut RejectEffects,
         );
         instance
+    }
+
+    fn process_event(
+        instance: &mut StateTreeInstance<TestDomain>,
+        event: &TestEvents,
+        limit: usize,
+    ) -> bool {
+        instance.process_event(event, limit, None, &mut RejectEffects)
     }
 
     enum DescriptorEvents {
@@ -1535,7 +1490,9 @@ mod tests {
         let waiting = builder.atomic("waiting", root).unwrap();
         let done = builder.final_state("done", root).unwrap();
         builder.initial(root, waiting).unwrap();
-        builder.event_descriptor(waiting, "combat", done).unwrap();
+        builder
+            .add_transition(waiting, StateTreeTransition::on("combat").target(done))
+            .unwrap();
         let definition = builder.build().unwrap();
         let mut execution =
             StateTreeExecution::<DescriptorEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
@@ -1604,12 +1561,19 @@ mod tests {
         let leaf_target = builder.atomic("leaf-target", root).unwrap();
         builder.initial(root, parent).unwrap();
         builder.initial(parent, leaf).unwrap();
-        builder.transition(root, "advance", parent_target).unwrap();
-        builder.transition(leaf, "advance", leaf_target).unwrap();
+        builder
+            .add_transition(
+                root,
+                StateTreeTransition::on("advance").target(parent_target),
+            )
+            .unwrap();
+        builder
+            .add_transition(leaf, StateTreeTransition::on("advance").target(leaf_target))
+            .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_authored_event("advance", 64);
+        process_event(&mut instance, &TestEvents::Advance, 64);
 
         assert_eq!(
             instance.active_state_names().collect::<Vec<_>>(),
@@ -1626,13 +1590,19 @@ mod tests {
         let second = builder.atomic("second", root).unwrap();
         let stable = builder.atomic("stable", root).unwrap();
         builder.initial(root, idle).unwrap();
-        builder.transition(idle, "advance", first).unwrap();
-        builder.eventless(first, second).unwrap();
-        builder.eventless(second, stable).unwrap();
+        builder
+            .add_transition(idle, StateTreeTransition::on("advance").target(first))
+            .unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::eventless().target(second))
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::eventless().target(stable))
+            .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 3);
 
-        instance.process_authored_event("advance", 3);
+        process_event(&mut instance, &TestEvents::Advance, 3);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(
@@ -1649,12 +1619,16 @@ mod tests {
         let first = builder.atomic("first", root).unwrap();
         let stable = builder.atomic("stable", root).unwrap();
         builder.initial(root, idle).unwrap();
-        builder.transition(idle, "advance", first).unwrap();
-        builder.eventless(first, stable).unwrap();
+        builder
+            .add_transition(idle, StateTreeTransition::on("advance").target(first))
+            .unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::eventless().target(stable))
+            .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 1);
 
-        instance.process_authored_event("advance", 1);
+        process_event(&mut instance, &TestEvents::Advance, 1);
 
         assert_eq!(
             instance.status(),
@@ -1673,11 +1647,13 @@ mod tests {
         let idle = builder.atomic("idle", root).unwrap();
         let stable = builder.atomic("stable", root).unwrap();
         builder.initial(root, idle).unwrap();
-        builder.transition(idle, "advance", stable).unwrap();
+        builder
+            .add_transition(idle, StateTreeTransition::on("advance").target(stable))
+            .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 1);
 
-        instance.process_authored_event("advance", 1);
+        process_event(&mut instance, &TestEvents::Advance, 1);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(
@@ -1693,7 +1669,9 @@ mod tests {
         let first = builder.atomic("first", root).unwrap();
         let stable = builder.atomic("stable", root).unwrap();
         builder.initial(root, first).unwrap();
-        builder.eventless(first, stable).unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::eventless().target(stable))
+            .unwrap();
         let definition = builder.build().unwrap();
 
         let instance = instance(&definition, 1);
@@ -1712,8 +1690,12 @@ mod tests {
         let first = builder.atomic("first", root).unwrap();
         let second = builder.atomic("second", root).unwrap();
         builder.initial(root, first).unwrap();
-        builder.eventless(first, second).unwrap();
-        builder.eventless(second, first).unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::eventless().target(second))
+            .unwrap();
+        builder
+            .add_transition(second, StateTreeTransition::eventless().target(first))
+            .unwrap();
         let definition = builder.build().unwrap();
 
         let instance = instance(&definition, 3);
@@ -1735,11 +1717,13 @@ mod tests {
         let running = builder.atomic("running", root).unwrap();
         let done = builder.final_state("done", root).unwrap();
         builder.initial(root, running).unwrap();
-        builder.transition(running, "finish", done).unwrap();
+        builder
+            .add_transition(running, StateTreeTransition::on("finish").target(done))
+            .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_authored_event("finish", 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
 
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(
@@ -1757,11 +1741,13 @@ mod tests {
         let done = builder.final_state("done", nested).unwrap();
         builder.initial(root, nested).unwrap();
         builder.initial(nested, running).unwrap();
-        builder.transition(running, "finish", done).unwrap();
+        builder
+            .add_transition(running, StateTreeTransition::on("finish").target(done))
+            .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_authored_event("finish", 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(
@@ -1780,14 +1766,22 @@ mod tests {
         let complete = builder.final_state("complete", root).unwrap();
         builder.initial(root, nested).unwrap();
         builder.initial(nested, running).unwrap();
-        builder.transition(running, "finish", nested_done).unwrap();
         builder
-            .transition(nested, "done.state.nested", complete)
+            .add_transition(
+                running,
+                StateTreeTransition::on("finish").target(nested_done),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                nested,
+                StateTreeTransition::on("done.state.nested").target(complete),
+            )
             .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 64);
 
-        instance.process_authored_event("finish", 64);
+        process_event(&mut instance, &TestEvents::Finish, 64);
 
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(
@@ -1806,7 +1800,10 @@ mod tests {
         builder.initial(root, nested).unwrap();
         builder.initial(nested, nested_done).unwrap();
         builder
-            .transition(nested, "done.state.nested", stable)
+            .add_transition(
+                nested,
+                StateTreeTransition::on("done.state.nested").target(stable),
+            )
             .unwrap();
         let definition = builder.build().unwrap();
 
@@ -1828,14 +1825,16 @@ mod tests {
         let done = builder.final_state("done", nested).unwrap();
         builder.initial(root, nested).unwrap();
         builder.initial(nested, running).unwrap();
-        builder.transition(running, "finish", done).unwrap();
+        builder
+            .add_transition(running, StateTreeTransition::on("finish").target(done))
+            .unwrap();
         builder
             .add_transition(nested, StateTreeTransition::on("done.state.nested"))
             .unwrap();
         let definition = builder.build().unwrap();
         let mut instance = instance(&definition, 3);
 
-        instance.process_authored_event("finish", 3);
+        process_event(&mut instance, &TestEvents::Finish, 3);
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
         assert_eq!(

@@ -568,7 +568,7 @@ mod tests {
     use super::*;
     use crate::{
         InstanceStatus, StateTreeAppExt, StateTreeBuilder, StateTreeEffectError,
-        StateTreeEventPayload, StateTreeEvents,
+        StateTreeEventPayload, StateTreeEvents, StateTreeTransition,
     };
 
     struct Simulation;
@@ -646,8 +646,12 @@ mod tests {
         let idle = builder.atomic("idle", root).unwrap();
         let active = builder.atomic("active", root).unwrap();
         builder.initial(root, idle).unwrap();
-        builder.transition(idle, "advance", active).unwrap();
-        builder.transition(active, "reset", idle).unwrap();
+        builder
+            .add_transition(idle, StateTreeTransition::on("advance").target(active))
+            .unwrap();
+        builder
+            .add_transition(active, StateTreeTransition::on("reset").target(idle))
+            .unwrap();
         builder.build().unwrap()
     }
 
@@ -713,7 +717,9 @@ mod tests {
         let idle = builder.atomic("idle", root).unwrap();
         let done = builder.atomic("done", root).unwrap();
         builder.initial(root, idle).unwrap();
-        builder.transition(idle, "adavnce", done).unwrap();
+        builder
+            .add_transition(idle, StateTreeTransition::on("adavnce").target(done))
+            .unwrap();
         let mut app = app();
         let handle = app
             .world_mut()

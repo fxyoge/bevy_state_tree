@@ -12,6 +12,7 @@ use bevy_ecs::{
 use bevy_state_tree::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeAppExt, StateTreeBuilder,
     StateTreeDefinition, StateTreeEvents, StateTreeInstance, StateTreePlugin, StateTreeSet,
+    StateTreeTransition,
 };
 
 const TOGGLE: &str = "tests/scxml/benchmark_toggle.scxml";
@@ -271,8 +272,12 @@ pub fn deep_definition(depth: usize) -> BenchmarkDefinition {
     let left = add_branch(&mut builder, root, "left", depth);
     let right = add_branch(&mut builder, root, "right", depth);
     builder.initial(root, left.0).unwrap();
-    builder.transition(left.1, "tick", right.1).unwrap();
-    builder.transition(right.1, "tick", left.1).unwrap();
+    builder
+        .add_transition(left.1, StateTreeTransition::on("tick").target(right.1))
+        .unwrap();
+    builder
+        .add_transition(right.1, StateTreeTransition::on("tick").target(left.1))
+        .unwrap();
     BenchmarkDefinition::Generated(builder.build().unwrap())
 }
 
@@ -293,8 +298,12 @@ pub fn wide_parallel_definition(regions: usize) -> BenchmarkDefinition {
             .atomic(format!("region-{region_index}-right"), region)
             .unwrap();
         builder.initial(region, left).unwrap();
-        builder.transition(left, "tick", right).unwrap();
-        builder.transition(right, "tick", left).unwrap();
+        builder
+            .add_transition(left, StateTreeTransition::on("tick").target(right))
+            .unwrap();
+        builder
+            .add_transition(right, StateTreeTransition::on("tick").target(left))
+            .unwrap();
     }
     BenchmarkDefinition::Generated(builder.build().unwrap())
 }
@@ -306,11 +315,19 @@ pub fn transition_scan_definition(candidates: usize) -> BenchmarkDefinition {
     let right = builder.atomic("right", root).unwrap();
     builder.initial(root, left).unwrap();
     for _ in 0..candidates {
-        builder.transition(left, "ignored", right).unwrap();
-        builder.transition(right, "ignored", left).unwrap();
+        builder
+            .add_transition(left, StateTreeTransition::on("ignored").target(right))
+            .unwrap();
+        builder
+            .add_transition(right, StateTreeTransition::on("ignored").target(left))
+            .unwrap();
     }
-    builder.transition(left, "tick", right).unwrap();
-    builder.transition(right, "tick", left).unwrap();
+    builder
+        .add_transition(left, StateTreeTransition::on("tick").target(right))
+        .unwrap();
+    builder
+        .add_transition(right, StateTreeTransition::on("tick").target(left))
+        .unwrap();
     BenchmarkDefinition::Generated(builder.build().unwrap())
 }
 
@@ -320,8 +337,12 @@ fn toggle_builder(name: &str, event: &str) -> StateTreeDefinition {
     let left = builder.atomic("left", root).unwrap();
     let right = builder.atomic("right", root).unwrap();
     builder.initial(root, left).unwrap();
-    builder.transition(left, event, right).unwrap();
-    builder.transition(right, event, left).unwrap();
+    builder
+        .add_transition(left, StateTreeTransition::on(event).target(right))
+        .unwrap();
+    builder
+        .add_transition(right, StateTreeTransition::on(event).target(left))
+        .unwrap();
     builder.build().unwrap()
 }
 

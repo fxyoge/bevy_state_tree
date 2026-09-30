@@ -202,17 +202,6 @@ pub(crate) struct CompiledDefinition {
 }
 
 impl CompiledDefinition {
-    #[cfg(test)]
-    pub fn event(&self, name: &str) -> Option<EventId> {
-        self.events
-            .iter()
-            .position(
-                |pattern| matches!(pattern, EventPattern::Exact(value) if value.as_ref() == name),
-            )
-            .and_then(|index| u32::try_from(index).ok())
-            .map(EventId)
-    }
-
     pub fn state(&self, id: StateId) -> &StateNode {
         debug_assert_eq!(id.definition, self.identity);
         &self.states[id.index()]
@@ -740,10 +729,11 @@ impl StateTreeTransition {
     }
 }
 
-/// Builds and validates a [`StateTreeDefinition`].
+/// Programmatically constructs the compiler-supported SCXML semantic subset.
 ///
-/// Parsers such as an SCXML loader should target this builder rather than
-/// constructing runtime state directly.
+/// This is a low-level compilation target for generated definitions. Parsers
+/// such as an SCXML loader should use it instead of constructing runtime state
+/// directly.
 #[derive(Debug)]
 pub struct StateTreeBuilder {
     identity: u64,
@@ -755,7 +745,7 @@ pub struct StateTreeBuilder {
 }
 
 impl StateTreeBuilder {
-    /// Starts a definition with an authored diagnostic name.
+    /// Starts a generated definition with an authored diagnostic name.
     pub fn new(name: impl Into<Box<str>>) -> Self {
         Self {
             identity: NEXT_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
@@ -829,44 +819,11 @@ impl StateTreeBuilder {
         let DraftKind::Compound { initial } = &mut state.kind else {
             return Err(BuildError::InitialOnNonCompound(compound));
         };
+        if initial.is_some() {
+            return Err(BuildError::InitialAlreadySet(compound));
+        }
         *initial = Some(child);
         Ok(self)
-    }
-
-    /// Adds an external transition selected by an authored event name.
-    pub fn transition(
-        &mut self,
-        source: StateId,
-        event: impl Into<Box<str>>,
-        target: StateId,
-    ) -> Result<&mut Self, BuildError> {
-        let event = event.into();
-        if event.trim().is_empty() {
-            return Err(BuildError::EmptyEventName);
-        }
-        self.push_transition(
-            source,
-            Some(EventPattern::Exact(event)),
-            None,
-            Some(target),
-            Vec::new(),
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn event_descriptor(
-        &mut self,
-        source: StateId,
-        descriptor: impl Into<Box<str>>,
-        target: StateId,
-    ) -> Result<&mut Self, BuildError> {
-        self.add_transition(source, StateTreeTransition::on(descriptor).target(target))
-    }
-
-    /// Adds an eventless external transition.
-    pub fn eventless(&mut self, source: StateId, target: StateId) -> Result<&mut Self, BuildError> {
-        self.push_transition(source, None, None, Some(target), Vec::new(), None)
     }
 
     /// Declares the complete ordered root Luau datamodel.
@@ -1909,6 +1866,8 @@ pub enum BuildError {
     InitialOnNonCompound(StateId),
     #[error("state {child:?} is not a direct child of {compound:?}")]
     InitialNotDirectChild { compound: StateId, child: StateId },
+    #[error("compound state {0:?} already has an initial child")]
+    InitialAlreadySet(StateId),
     #[error("compound state {0:?} has no initial child")]
     MissingInitial(StateId),
     #[error("parallel state {0:?} has no regions")]
@@ -2233,8 +2192,12 @@ mod tests {
         let first = builder.atomic("first", root).unwrap();
         let second = builder.atomic("second", root).unwrap();
         builder.initial(root, first).unwrap();
-        builder.transition(first, "advance", second).unwrap();
-        builder.transition(first, "advance", first).unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("advance").target(second))
+            .unwrap();
+        builder
+            .add_transition(first, StateTreeTransition::on("advance").target(first))
+            .unwrap();
 
         let definition = builder.build().unwrap();
         assert_eq!(
@@ -2244,6 +2207,20 @@ mod tests {
         assert_eq!(
             definition.compiled.state(first).transitions[1].target,
             Some(first)
+        );
+    }
+
+    #[test]
+    fn rejects_replacing_an_initial_child() {
+        let mut builder = StateTreeBuilder::new("duplicate-initial");
+        let root = builder.compound_root("root").unwrap();
+        let first = builder.atomic("first", root).unwrap();
+        let second = builder.atomic("second", root).unwrap();
+
+        builder.initial(root, first).unwrap();
+        assert_eq!(
+            builder.initial(root, second).unwrap_err(),
+            BuildError::InitialAlreadySet(root)
         );
     }
 
@@ -2289,15 +2266,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_whitespace_only_event_names() {
+    fn rejects_invalid_event_descriptors() {
         let mut builder = StateTreeBuilder::new("invalid-event");
         let root = builder.compound_root("root").unwrap();
         let source = builder.atomic("source", root).unwrap();
         let target = builder.atomic("target", root).unwrap();
 
         assert_eq!(
-            builder.transition(source, "  ", target).unwrap_err(),
-            BuildError::EmptyEventName
+            builder
+                .add_transition(source, StateTreeTransition::on("").target(target))
+                .unwrap_err(),
+            BuildError::EmptyEventName,
         );
         assert_eq!(
             builder
