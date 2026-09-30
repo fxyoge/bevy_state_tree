@@ -36,6 +36,10 @@ harness = false
 name = "allocation"
 harness = false
 
+[[bench]]
+name = "event_storage"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 
