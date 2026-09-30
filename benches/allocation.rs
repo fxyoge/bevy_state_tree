@@ -141,7 +141,7 @@ fn process_dense_activity_outcomes(bencher: Bencher<'_, '_>, instances: usize) {
     profile_activity_outcomes(bencher, instances);
 }
 
-#[divan::bench(args = [2, 8, 32], sample_count = 5)]
+#[divan::bench(args = [2, 8, 32, 64], sample_count = 5)]
 fn process_parallel_width(bencher: Bencher<'_, '_>, regions: usize) {
     profile_processing(bencher, 1_000, || {
         support::wide_parallel_definition(regions)

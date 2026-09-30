@@ -118,12 +118,39 @@ enum SelectedStep {
     Parallel,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ParallelRuntime {
     selected: Vec<SelectedTransition>,
     exited: Vec<StateId>,
     entries: Vec<Entry>,
     completed: Vec<StateId>,
+    selected_sources: Box<[bool]>,
+    selected_domains: Box<[bool]>,
+    selected_domain_descendants: Box<[u32]>,
+    selected_targetful: usize,
+    selected_root_domain: bool,
+    exited_states: Box<[bool]>,
+    entry_indices: Box<[u32]>,
+    completed_states: Box<[bool]>,
+}
+
+impl ParallelRuntime {
+    fn new(state_count: usize, max_active: usize) -> Self {
+        Self {
+            selected: Vec::with_capacity(max_active),
+            exited: Vec::with_capacity(max_active),
+            entries: Vec::with_capacity(max_active),
+            completed: Vec::with_capacity(max_active),
+            selected_sources: vec![false; state_count].into_boxed_slice(),
+            selected_domains: vec![false; state_count].into_boxed_slice(),
+            selected_domain_descendants: vec![0; state_count].into_boxed_slice(),
+            selected_targetful: 0,
+            selected_root_domain: false,
+            exited_states: vec![false; state_count].into_boxed_slice(),
+            entry_indices: vec![u32::MAX; state_count].into_boxed_slice(),
+            completed_states: vec![false; state_count].into_boxed_slice(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1217,6 +1244,7 @@ pub struct StateTreeInstance<D: StateTreeDomain> {
     definition: Handle<StateTreeDefinition>,
     linked: Option<Arc<LinkedDefinition<D>>>,
     active: Vec<StateId>,
+    active_states: Option<Box<[bool]>>,
     parallel: Option<Box<ParallelRuntime>>,
     internal_events: VecDeque<EventId>,
     now: Duration,
@@ -1291,6 +1319,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             definition,
             linked: None,
             active: Vec::new(),
+            active_states: None,
             parallel: None,
             internal_events: VecDeque::new(),
             now: Duration::ZERO,
@@ -1416,6 +1445,13 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         })
     }
 
+    fn is_state_active(&self, state: StateId) -> bool {
+        self.active_states.as_deref().map_or_else(
+            || self.active.contains(&state),
+            |states| states[state.index()],
+        )
+    }
+
     /// Returns one instance-local Luau datamodel value by authored id.
     pub fn data(&self, name: &str) -> Option<&LuauValue> {
         let datamodel = self.linked.as_ref()?.compiled.datamodel.as_ref()?;
@@ -1467,13 +1503,14 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.linked = Some(Arc::clone(&linked));
         self.active.clear();
         self.active.reserve(compiled.max_active);
+        self.active_states = compiled
+            .has_parallel
+            .then(|| vec![false; compiled.states.len()].into_boxed_slice());
         self.parallel = compiled.has_parallel.then(|| {
-            let mut runtime = Box::<ParallelRuntime>::default();
-            runtime.selected.reserve(compiled.max_active);
-            runtime.exited.reserve(compiled.max_active);
-            runtime.entries.reserve(compiled.max_active);
-            runtime.completed.reserve(compiled.max_active);
-            runtime
+            Box::new(ParallelRuntime::new(
+                compiled.states.len(),
+                compiled.max_active,
+            ))
         });
         self.internal_events.clear();
         self.internal_events
@@ -1844,7 +1881,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 .compiled,
         );
         let definition = &compiled.activities[outcome.token.activity.index()];
-        if !self.active.contains(&definition.owner) {
+        if !self.is_state_active(definition.owner) {
             return false;
         }
         let success = matches!(outcome.kind, crate::activity::ActivityOutcomeKind::Complete);
@@ -2058,7 +2095,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
 
         let mut runtime = self.parallel.take().expect("parallel runtime exists");
-        let result = self.select_parallel_transition_set(&trigger, &mut runtime.selected);
+        let result = self.select_parallel_transition_set(&trigger, &mut runtime);
         let selected =
             result.map(|()| (!runtime.selected.is_empty()).then_some(SelectedStep::Parallel));
         self.parallel = Some(runtime);
@@ -2081,9 +2118,14 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     fn select_parallel_transition_set(
         &self,
         trigger: &Trigger<'_, D>,
-        selected: &mut Vec<SelectedTransition>,
+        runtime: &mut ParallelRuntime,
     ) -> Result<(), RuntimeFault> {
-        selected.clear();
+        runtime.selected.clear();
+        runtime.selected_sources.fill(false);
+        runtime.selected_domains.fill(false);
+        runtime.selected_domain_descendants.fill(0);
+        runtime.selected_targetful = 0;
+        runtime.selected_root_domain = false;
         let compiled = &self
             .linked
             .as_ref()
@@ -2143,31 +2185,39 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let Some(candidate) = candidate else {
                 continue;
             };
-            if selected.iter().any(|existing| {
-                existing.source == candidate.source && existing.index == candidate.index
-            }) {
+            if runtime.selected_sources[candidate.source.index()]
+                && runtime.selected.iter().any(|selected| {
+                    selected.source == candidate.source && selected.index == candidate.index
+                })
+            {
                 continue;
             }
 
             let mut accepted = true;
-            let mut index = 0;
-            while index < selected.len() {
-                if !transitions_conflict(compiled, selected[index], candidate) {
-                    index += 1;
-                    continue;
-                }
-                if is_descendant(compiled, candidate.source, selected[index].source) {
-                    selected.remove(index);
-                } else {
-                    accepted = false;
-                    break;
+            if parallel_candidate_may_conflict(compiled, runtime, candidate) {
+                let mut index = 0;
+                while index < runtime.selected.len() {
+                    if !transitions_conflict(compiled, runtime.selected[index], candidate) {
+                        index += 1;
+                        continue;
+                    }
+                    if is_descendant(compiled, candidate.source, runtime.selected[index].source) {
+                        let removed = runtime.selected.remove(index);
+                        unmark_selected_transition(compiled, runtime, removed);
+                    } else {
+                        accepted = false;
+                        break;
+                    }
                 }
             }
             if accepted {
-                selected.push(candidate);
+                mark_selected_transition(compiled, runtime, candidate);
+                runtime.selected.push(candidate);
             }
         }
-        selected.sort_unstable_by_key(|candidate| compiled.state(candidate.source).document_order);
+        runtime
+            .selected
+            .sort_unstable_by_key(|candidate| compiled.state(candidate.source).document_order);
         Ok(())
     }
 
@@ -2222,14 +2272,25 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 .compiled,
         );
         runtime.exited.clear();
-        for selected in &runtime.selected {
-            if selected.transition.target.is_none() {
-                continue;
-            }
+        runtime.exited_states.fill(false);
+        if runtime.selected_targetful != 0 {
             for state in &self.active {
-                if exits_domain(&compiled, *state, selected.transition.domain)
-                    && !runtime.exited.contains(state)
-                {
+                let exits = if runtime.selected_root_domain {
+                    true
+                } else {
+                    let mut cursor = compiled.state(*state).parent;
+                    let mut exits = false;
+                    while let Some(ancestor) = cursor {
+                        if runtime.selected_domains[ancestor.index()] {
+                            exits = true;
+                            break;
+                        }
+                        cursor = compiled.state(ancestor).parent;
+                    }
+                    exits
+                };
+                if exits {
+                    runtime.exited_states[state.index()] = true;
                     runtime.exited.push(*state);
                 }
             }
@@ -2273,10 +2334,17 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             self.cancel_state_timers(&compiled, *state);
             self.cancel_state_activities(*state, context.entity, activities, trace);
         }
-        self.active.retain(|state| !runtime.exited.contains(state));
+        for state in &runtime.exited {
+            self.active_states
+                .as_mut()
+                .expect("parallel definitions track active states")[state.index()] = false;
+            runtime.completed_states[state.index()] = false;
+        }
+        self.active
+            .retain(|state| !runtime.exited_states[state.index()]);
         runtime
             .completed
-            .retain(|state| !runtime.exited.contains(state));
+            .retain(|state| !runtime.exited_states[state.index()]);
 
         for selected in &runtime.selected {
             let start = selected.transition.action_start as usize;
@@ -2291,6 +2359,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
 
         runtime.entries.clear();
+        runtime.entry_indices.fill(u32::MAX);
         let mut history_runtime = self.history.take();
         for selected in &runtime.selected {
             let start = selected.transition.entry_start as usize;
@@ -2318,16 +2387,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 source_entries
             };
             for entry in entries {
-                if self.active.contains(&entry.state) {
+                if self.is_state_active(entry.state) {
                     continue;
                 }
-                if let Some(existing) = runtime
-                    .entries
-                    .iter_mut()
-                    .find(|existing| existing.state == entry.state)
-                {
-                    existing.take_initial |= entry.take_initial;
+                let index = runtime.entry_indices[entry.state.index()];
+                if index != u32::MAX {
+                    runtime.entries[index as usize].take_initial |= entry.take_initial;
                 } else {
+                    runtime.entry_indices[entry.state.index()] =
+                        u32::try_from(runtime.entries.len())
+                            .expect("compiled state count fits u32");
                     runtime.entries.push(*entry);
                 }
             }
@@ -2409,6 +2478,19 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             });
             self.cancel_state_timers(&compiled, state);
             self.cancel_state_activities(state, context.entity, activities, trace);
+        }
+        if let Some(active_states) = self.active_states.as_mut() {
+            for state in &self.active[exit_depth..] {
+                active_states[state.index()] = false;
+            }
+        }
+        if let Some(runtime) = self.parallel.as_mut() {
+            for state in &self.active[exit_depth..] {
+                runtime.completed_states[state.index()] = false;
+            }
+            runtime
+                .completed
+                .retain(|state| runtime.completed_states[state.index()]);
         }
         self.active.truncate(exit_depth);
 
@@ -2529,6 +2611,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         self.active.push(entry.state);
+        if let Some(active_states) = self.active_states.as_mut() {
+            active_states[entry.state.index()] = true;
+        }
         let state = compiled.state(entry.state);
         trace.record(StateTreeTraceRecord::StateEntered { state: &state.name });
         self.arm_state_timers(compiled, entry.state);
@@ -3029,7 +3114,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 .compiled,
         );
         if compiled.children(compiled.root).iter().any(|child| {
-            self.active.contains(child) && compiled.state(*child).kind == StateKind::Final
+            self.is_state_active(*child) && compiled.state(*child).kind == StateKind::Final
         }) {
             self.status = InstanceStatus::Complete;
             self.cancel_all_timers();
@@ -3043,12 +3128,12 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     compiled.state(*state).depth == depth && *state != compiled.root
                 })
             {
-                if runtime.completed.contains(&state) {
+                if runtime.completed_states[state.index()] {
                     continue;
                 }
                 let complete = match compiled.state(state).kind {
                     StateKind::Compound { .. } => compiled.children(state).iter().any(|child| {
-                        self.active.contains(child)
+                        self.is_state_active(*child)
                             && compiled.state(*child).kind == StateKind::Final
                     }),
                     StateKind::Parallel { .. } => {
@@ -3056,13 +3141,14 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                             && compiled
                                 .children(state)
                                 .iter()
-                                .all(|child| runtime.completed.contains(child))
+                                .all(|child| runtime.completed_states[child.index()])
                     }
                     StateKind::Atomic | StateKind::Final => false,
                 };
                 if !complete {
                     continue;
                 }
+                runtime.completed_states[state.index()] = true;
                 runtime.completed.push(state);
                 let completion = match compiled.state(state).kind {
                     StateKind::Compound { completion, .. } | StateKind::Parallel { completion } => {
@@ -3283,8 +3369,78 @@ fn is_descendant(compiled: &CompiledDefinition, state: StateId, ancestor: StateI
     false
 }
 
-fn exits_domain(compiled: &CompiledDefinition, state: StateId, domain: Option<StateId>) -> bool {
-    domain.is_none_or(|domain| is_descendant(compiled, state, domain))
+fn parallel_candidate_may_conflict(
+    compiled: &CompiledDefinition,
+    runtime: &ParallelRuntime,
+    candidate: SelectedTransition,
+) -> bool {
+    if candidate.transition.target.is_none() || runtime.selected_targetful == 0 {
+        return false;
+    }
+    let Some(domain) = candidate.transition.domain else {
+        return true;
+    };
+    if runtime.selected_root_domain
+        || runtime.selected_domains[domain.index()]
+        || runtime.selected_domain_descendants[domain.index()] != 0
+    {
+        return true;
+    }
+    let mut cursor = compiled.state(domain).parent;
+    while let Some(ancestor) = cursor {
+        if runtime.selected_domains[ancestor.index()] {
+            return true;
+        }
+        cursor = compiled.state(ancestor).parent;
+    }
+    false
+}
+
+fn mark_selected_transition(
+    compiled: &CompiledDefinition,
+    runtime: &mut ParallelRuntime,
+    selected: SelectedTransition,
+) {
+    runtime.selected_sources[selected.source.index()] = true;
+    if selected.transition.target.is_none() {
+        return;
+    }
+    runtime.selected_targetful += 1;
+    let Some(domain) = selected.transition.domain else {
+        runtime.selected_root_domain = true;
+        return;
+    };
+    runtime.selected_domains[domain.index()] = true;
+    let mut cursor = compiled.state(domain).parent;
+    while let Some(ancestor) = cursor {
+        runtime.selected_domain_descendants[ancestor.index()] += 1;
+        cursor = compiled.state(ancestor).parent;
+    }
+}
+
+fn unmark_selected_transition(
+    compiled: &CompiledDefinition,
+    runtime: &mut ParallelRuntime,
+    selected: SelectedTransition,
+) {
+    runtime.selected_sources[selected.source.index()] = runtime
+        .selected
+        .iter()
+        .any(|candidate| candidate.source == selected.source);
+    if selected.transition.target.is_none() {
+        return;
+    }
+    runtime.selected_targetful -= 1;
+    let Some(domain) = selected.transition.domain else {
+        runtime.selected_root_domain = false;
+        return;
+    };
+    runtime.selected_domains[domain.index()] = false;
+    let mut cursor = compiled.state(domain).parent;
+    while let Some(ancestor) = cursor {
+        runtime.selected_domain_descendants[ancestor.index()] -= 1;
+        cursor = compiled.state(ancestor).parent;
+    }
 }
 
 fn transitions_conflict(
@@ -3640,6 +3796,49 @@ mod tests {
                 "right-leaf"
             ]
         );
+    }
+
+    #[test]
+    fn wide_parallel_regions_toggle_repeatedly_in_canonical_order() {
+        const REGIONS: usize = 64;
+
+        let mut builder = StateTreeBuilder::new("wide-parallel");
+        let root = builder.compound_root("root").unwrap();
+        let parallel = builder.parallel("parallel", root).unwrap();
+        builder.initial(root, parallel).unwrap();
+        for index in 0..REGIONS {
+            let region = builder
+                .compound(format!("region-{index}"), parallel)
+                .unwrap();
+            let left = builder
+                .atomic(format!("region-{index}-left"), region)
+                .unwrap();
+            let right = builder
+                .atomic(format!("region-{index}-right"), region)
+                .unwrap();
+            builder.initial(region, left).unwrap();
+            builder
+                .add_transition(left, StateTreeTransition::on("advance").target(right))
+                .unwrap();
+            builder
+                .add_transition(right, StateTreeTransition::on("advance").target(left))
+                .unwrap();
+        }
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 128);
+
+        for expected_leaf in ["right", "left", "right"] {
+            assert!(process_event(&mut instance, &TestEvents::Advance, 128));
+            let active = instance.active_state_names().collect::<Vec<_>>();
+            assert_eq!(active.len(), 2 + REGIONS * 2);
+            for index in 0..REGIONS {
+                assert_eq!(active[2 + index * 2], format!("region-{index}"));
+                assert_eq!(
+                    active[3 + index * 2],
+                    format!("region-{index}-{expected_leaf}")
+                );
+            }
+        }
     }
 
     #[test]

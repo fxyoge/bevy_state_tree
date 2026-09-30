@@ -90,7 +90,7 @@ fn depth_reentry(bencher: Bencher<'_, '_>, depth: usize) {
     process_broadcast(bencher, 1_000, || support::deep_definition(depth));
 }
 
-#[divan::bench(args = [2, 8, 32, 64], sample_count = 10)]
+#[divan::bench(args = [2, 8, 32, 64, 128, 256], sample_count = 10)]
 fn parallel_width(bencher: Bencher<'_, '_>, regions: usize) {
     process_broadcast(bencher, 1_000, || {
         support::wide_parallel_definition(regions)
