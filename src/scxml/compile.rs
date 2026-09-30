@@ -584,9 +584,6 @@ impl<'a> Compiler<'a> {
                 "transition requires an event, condition, or target",
             );
         }
-        if transition.transition_type == Some(TransitionType::Internal) {
-            return self.unsupported(transition.span, "internal transitions");
-        }
         if transition.condition.is_some() && self.document.root.datamodel.as_deref() != Some("luau")
         {
             return self.invalid_datamodel(
@@ -617,6 +614,9 @@ impl<'a> Compiler<'a> {
         .actions(actions);
         if let Some(condition) = transition.condition.as_deref() {
             specification = specification.condition_at(condition, transition.span.start);
+        }
+        if transition.transition_type == Some(TransitionType::Internal) {
+            specification = specification.internal();
         }
         if let Some(target) = target {
             specification = specification.target(target);

@@ -470,6 +470,7 @@ struct DraftTransition {
     trigger: DraftTransitionTrigger,
     condition: Option<ExpressionId>,
     target: Option<StateId>,
+    internal: bool,
     actions: Vec<DraftAction>,
     span_start: Option<u32>,
 }
@@ -679,6 +680,7 @@ pub struct StateTreeTransition {
     trigger: StateTreeTransitionTrigger,
     condition: Option<AuthoredExpression>,
     target: Option<StateId>,
+    internal: bool,
     actions: Vec<StateTreeAction>,
     span_start: usize,
 }
@@ -700,6 +702,7 @@ impl StateTreeTransition {
             ),
             condition: None,
             target: None,
+            internal: false,
             actions: Vec::new(),
             span_start: 0,
         }
@@ -711,6 +714,7 @@ impl StateTreeTransition {
             trigger: StateTreeTransitionTrigger::Eventless,
             condition: None,
             target: None,
+            internal: false,
             actions: Vec::new(),
             span_start: 0,
         }
@@ -726,6 +730,7 @@ impl StateTreeTransition {
             trigger: StateTreeTransitionTrigger::After(duration),
             condition: None,
             target: None,
+            internal: false,
             actions: Vec::new(),
             span_start: 0,
         }
@@ -743,6 +748,17 @@ impl StateTreeTransition {
     /// Sets the transition target. A transition without a target only runs actions.
     pub fn target(mut self, target: StateId) -> Self {
         self.target = Some(target);
+        self
+    }
+
+    /// Uses SCXML internal-transition semantics when a compound source targets
+    /// one of its descendants.
+    ///
+    /// Such a transition preserves the source state and exits only the active
+    /// descendants below it. For all other source-target relationships, SCXML
+    /// defines an internal transition to behave like an external transition.
+    pub fn internal(mut self) -> Self {
+        self.internal = true;
         self
     }
 
@@ -981,6 +997,7 @@ impl StateTreeBuilder {
                         DraftTransitionTrigger::Event(EventPattern::Descriptor(event)),
                         condition,
                         transition.target,
+                        transition.internal,
                         actions.clone(),
                         span_start,
                     )?;
@@ -992,6 +1009,7 @@ impl StateTreeBuilder {
                     DraftTransitionTrigger::Eventless,
                     condition,
                     transition.target,
+                    transition.internal,
                     actions,
                     span_start,
                 )?;
@@ -1002,6 +1020,7 @@ impl StateTreeBuilder {
                     DraftTransitionTrigger::After(duration),
                     condition,
                     transition.target,
+                    transition.internal,
                     actions,
                     span_start,
                 )?;
@@ -1345,13 +1364,20 @@ impl StateTreeBuilder {
                     let entry_len = append_transition_entries(
                         state_id,
                         target,
+                        transition.internal,
                         &self.states,
                         &depths,
                         &children_by_state,
                         &mut transition_entries,
                     )?;
                     (
-                        transition_exit_depth(state_id, target, &self.states, &depths),
+                        transition_exit_depth(
+                            state_id,
+                            target,
+                            transition.internal,
+                            &self.states,
+                            &depths,
+                        ),
                         entry_start,
                         entry_len,
                     )
@@ -1363,7 +1389,13 @@ impl StateTreeBuilder {
                     condition: transition.condition,
                     target: transition.target,
                     domain: transition.target.and_then(|target| {
-                        transition_domain(state_id, target, &self.states, &depths)
+                        transition_domain(
+                            state_id,
+                            target,
+                            transition.internal,
+                            &self.states,
+                            &depths,
+                        )
                     }),
                     exit_depth,
                     entry_start,
@@ -1591,6 +1623,7 @@ impl StateTreeBuilder {
         trigger: DraftTransitionTrigger,
         condition: Option<ExpressionId>,
         target: Option<StateId>,
+        internal: bool,
         actions: Vec<DraftAction>,
         span_start: Option<u32>,
     ) -> Result<&mut Self, BuildError> {
@@ -1605,6 +1638,7 @@ impl StateTreeBuilder {
             trigger,
             condition,
             target,
+            internal,
             actions,
             span_start,
         });
@@ -1740,9 +1774,17 @@ fn compile_action(
 fn transition_domain(
     source: StateId,
     target: StateId,
+    internal: bool,
     states: &[DraftState],
     depths: &[u32],
 ) -> Option<StateId> {
+    if internal
+        && matches!(states[source.index()].kind, DraftKind::Compound { .. })
+        && is_proper_descendant(target, source, states)
+    {
+        return Some(source);
+    }
+
     let mut source_ancestor = Some(source);
     let mut source_depth = depths[source.index()];
     let mut target_ancestor = Some(target);
@@ -1772,21 +1814,24 @@ fn transition_domain(
 fn transition_exit_depth(
     source: StateId,
     target: StateId,
+    internal: bool,
     states: &[DraftState],
     depths: &[u32],
 ) -> u32 {
-    transition_domain(source, target, states, depths).map_or(0, |state| depths[state.index()] + 1)
+    transition_domain(source, target, internal, states, depths)
+        .map_or(0, |state| depths[state.index()] + 1)
 }
 
 fn append_transition_entries(
     source: StateId,
     target: StateId,
+    internal: bool,
     states: &[DraftState],
     depths: &[u32],
     children: &[Vec<StateId>],
     entries: &mut Vec<Entry>,
 ) -> Result<u32, BuildError> {
-    let domain = transition_domain(source, target, states, depths);
+    let domain = transition_domain(source, target, internal, states, depths);
     let start = entries.len();
     let mut reverse = Vec::with_capacity(depths[target.index()] as usize + 1);
     let mut cursor = Some(target);
@@ -1812,6 +1857,17 @@ fn append_transition_entries(
     }
 
     u32::try_from(entries.len() - start).map_err(|_| BuildError::TooManyStates)
+}
+
+fn is_proper_descendant(state: StateId, ancestor: StateId, states: &[DraftState]) -> bool {
+    let mut cursor = states[state.index()].parent;
+    while let Some(parent) = cursor {
+        if parent == ancestor {
+            return true;
+        }
+        cursor = states[parent.index()].parent;
+    }
+    false
 }
 
 fn append_entry_configuration(
@@ -2276,6 +2332,33 @@ mod tests {
             definition.compiled.state(first).transitions[1].target,
             Some(first)
         );
+    }
+
+    #[test]
+    fn internal_transition_without_descendant_target_uses_external_domain() {
+        fn definition(internal: bool) -> StateTreeDefinition {
+            let mut builder = StateTreeBuilder::new("internal-fallback");
+            let root = builder.compound_root("root").unwrap();
+            let parent = builder.compound("parent", root).unwrap();
+            let child = builder.atomic("child", parent).unwrap();
+            let sibling = builder.atomic("sibling", root).unwrap();
+            builder.initial(root, parent).unwrap();
+            builder.initial(parent, child).unwrap();
+            let transition = StateTreeTransition::on("advance").target(sibling);
+            builder
+                .add_transition(
+                    parent,
+                    if internal {
+                        transition.internal()
+                    } else {
+                        transition
+                    },
+                )
+                .unwrap();
+            builder.build().unwrap()
+        }
+
+        assert_definition_semantics_eq(&definition(true), &definition(false));
     }
 
     #[test]

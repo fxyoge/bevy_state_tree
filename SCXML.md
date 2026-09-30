@@ -68,6 +68,14 @@ then transition actions run in document order, then entries run in document
 order. A parallel state raises `done.state.<id>` after all of its regions have
 completed. Multi-target transitions remain unsupported.
 
+## Internal Transitions
+
+`<transition type="internal">` follows SCXML transition-domain semantics. When
+a compound source targets one of its descendants, the source remains active and
+only its active descendants are exited. Internal transitions with any other
+source-target relationship behave like external transitions. Transition actions
+and descendant exit and entry actions retain their normal execution order.
+
 ## Completion
 
 Entering a final child of a nested compound state raises `done.state.<id>` once

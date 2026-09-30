@@ -1,0 +1,13 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="parent">
+  <state id="parent" initial="first">
+    <onentry><raise event="parent.entered"/></onentry>
+    <onexit><raise event="parent.exited"/></onexit>
+    <transition event="advance" target="second" type="internal"/>
+    <state id="first">
+      <onexit><raise event="first.exited"/></onexit>
+    </state>
+    <state id="second">
+      <onentry><raise event="second.entered"/></onentry>
+    </state>
+  </state>
+</scxml>

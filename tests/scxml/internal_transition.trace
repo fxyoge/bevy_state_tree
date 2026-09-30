@@ -1,0 +1,30 @@
+state-tree-trace 1
+macrostep initialize
+enter "#document"
+enter "parent"
+raise "parent.entered"
+enter "first"
+consume internal "parent.entered"
+configuration
+active "#document"
+active "parent"
+active "first"
+status running
+macrostep end
+macrostep external "advance"
+microstep 1
+transition "parent"
+target "second"
+exit begin "first"
+raise "first.exited"
+exit "first"
+enter "second"
+raise "second.entered"
+consume internal "first.exited"
+consume internal "second.entered"
+configuration
+active "#document"
+active "parent"
+active "second"
+status running
+macrostep end

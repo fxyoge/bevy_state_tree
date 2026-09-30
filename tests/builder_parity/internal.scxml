@@ -1,0 +1,7 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml" name="internal-transition">
+  <state id="parent" initial="first">
+    <transition event="advance" target="second" type="internal"/>
+    <state id="first"/>
+    <state id="second"/>
+  </state>
+</scxml>

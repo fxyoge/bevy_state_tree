@@ -30,6 +30,7 @@ definition_parity_test!(transition_parity, "transitions", transition_definition)
 definition_parity_test!(action_parity, "actions", action_definition);
 definition_parity_test!(minimal_luau_parity, "minimal_luau", minimal_luau_definition);
 definition_parity_test!(after_transition_parity, "after", after_definition);
+definition_parity_test!(internal_transition_parity, "internal", internal_definition);
 
 fn hierarchy_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("hierarchy");
@@ -156,6 +157,21 @@ fn after_definition() -> Result<StateTreeDefinition, BuildError> {
     builder.add_transition(
         waiting,
         StateTreeTransition::after(Duration::from_millis(250)).target(done),
+    )?;
+    builder.build()
+}
+
+fn internal_definition() -> Result<StateTreeDefinition, BuildError> {
+    let mut builder = StateTreeBuilder::new("internal-transition");
+    let root = builder.compound_root("#document")?;
+    let parent = builder.compound("parent", root)?;
+    let first = builder.atomic("first", parent)?;
+    let second = builder.atomic("second", parent)?;
+    builder.initial(root, parent)?;
+    builder.initial(parent, first)?;
+    builder.add_transition(
+        parent,
+        StateTreeTransition::on("advance").target(second).internal(),
     )?;
     builder.build()
 }

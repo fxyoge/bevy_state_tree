@@ -8,6 +8,7 @@ The crate currently provides the runtime foundation:
 - entity-local, domain-typed `StateTreeInstance` components;
 - atomic, compound, parallel, and final states;
 - hierarchical, eventless, and compound-completion transitions;
+- external and internal transition semantics;
 - static state-scoped `after` transitions with deterministic deadline ordering;
 - Luau data expressions and transition guards;
 - ordered SCXML `raise` and Luau `assign` actions on entry, exit, initial, and
@@ -139,9 +140,10 @@ fn add_generated_definition(
 }
 ```
 
-The public builder is a low-level compilation target for programmatically
-generated definitions. It represents every semantic construct accepted by the
-SCXML compiler without providing alternate runtime semantics. Declarative
+The public builder is a low-level, Rust-flavored compilation target for
+programmatically generated definitions. It is intentionally not a convenience
+DSL or a state-query API. It represents every semantic construct accepted by
+the SCXML compiler without providing alternate runtime semantics. Declarative
 specifications preserve datamodel, transition, and action order while the
 builder compiles them into the same dense runtime form:
 
