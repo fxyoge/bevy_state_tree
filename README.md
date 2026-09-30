@@ -8,6 +8,7 @@ The crate currently provides the runtime foundation:
 - entity-local, domain-typed `StateTreeInstance` components;
 - atomic, compound, parallel, and final states;
 - hierarchical, eventless, and compound-completion transitions;
+- static state-scoped `after` transitions with deterministic deadline ordering;
 - Luau data expressions and transition guards;
 - ordered SCXML `raise` and Luau `assign` actions on entry, exit, initial, and
   regular transitions;
@@ -57,6 +58,7 @@ use bevy_app::{App, FixedUpdate};
 use bevy_asset::AssetPlugin;
 use bevy_ecs::prelude::*;
 use bevy_state_tree::prelude::*;
+use bevy_time::TimePlugin;
 
 struct Simulation;
 
@@ -85,7 +87,7 @@ fn wake(mut events: EntityStateTreeEventWriter<Simulation>) {
 }
 
 let mut app = App::new();
-app.add_plugins(AssetPlugin::default())
+app.add_plugins((TimePlugin, AssetPlugin::default()))
     .add_plugins(StateTreePlugin::<Simulation>::new(FixedUpdate))
     .add_systems(FixedUpdate, wake.in_set(StateTreeSet::QueueEvents));
 ```
@@ -165,6 +167,21 @@ let definition = builder.build()?;
 # }
 ```
 
+Static timeouts use `StateTreeTransition::after(Duration)` in generated
+definitions or `bst:after` in SCXML. A timeout is armed whenever its source
+state is entered, cancelled when that state exits, and rearmed from the current
+clock on reentry. Targetless timeouts are one-shot. Timeouts that share a
+deadline are selected as one transition cohort, while multiple overdue
+deadlines are processed chronologically so an earlier transition can cancel a
+later timeout.
+
+Headless execution advances its explicit clock with
+`StateTreeExecution::advance_time` and the corresponding traced or effect-sink
+variants. Bevy execution reads `Time`, so `TimePlugin` must be installed before
+`StateTreePlugin`. Due timeouts run in `StateTreeSet::ProcessTimers`, before
+`QueueEvents` and `ProcessEvents`; a timeout therefore wins over an external
+event delivered in the same schedule run when both leave the same active state.
+
 Malformed XML and unsupported runtime semantics fail asset loading. Typed event
 descriptors and effects are domain-specific, so they are linked later when an
 instance initializes. A linking failure leaves the loaded definition intact and
@@ -226,15 +243,17 @@ Run `just bench` for both throughput and allocation profiles, or use
 `just _bench-execution` and `just _bench-allocation` separately. Throughput cases
 cover broadcast processing across as many as one million independent trees,
 sparse entity events in a population of 100,000, initialization, deep re-entry,
-transition scanning, typed effects, and wide parallel configurations. Parsing,
-compilation, and spawning remain outside steady-state timings; each measured
-schedule run queues and processes exactly one configured event.
+transition scanning, typed effects, wide parallel configurations, far-future
+idle timer populations, and dense timer expiry. Parsing, compilation, and
+spawning remain outside steady-state processing timings; event cases queue and
+process exactly one configured event per measured schedule run.
 
 The allocation suite uses Divan's global allocator profiler and a single-threaded
 Bevy schedule, so Bevy-owned worker threads cannot hide allocations.
 Initialization cases measure the full pending-to-running lifecycle, while
 spawn-and-initialize cases additionally include ECS component storage after
-warming the empty schedule. Divan's `max alloc` column is peak net requested
+warming the empty schedule. Timer cases separately measure initialization and
+arming plus steady-state dense expiry. Divan's `max alloc` column is peak net requested
 memory attributed to the measured interval, not process RSS or total live heap;
 setup-owned deallocations may reduce it in processing cases. Allocation
 profiling affects timing, so compare its allocation columns rather than its

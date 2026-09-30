@@ -420,6 +420,8 @@ dependencies = [
  "bevy_reflect",
  "bevy_state_tree_macros",
  "bevy_tasks",
+ "bevy_time",
+ "bevy_utils",
  "divan",
  "full_moon",
  "mlua",
@@ -465,7 +467,10 @@ dependencies = [
  "bevy_app",
  "bevy_ecs",
  "bevy_platform",
+ "bevy_reflect",
+ "crossbeam-channel",
  "log",
+ "serde",
 ]
 
 [[package]]
@@ -474,6 +479,7 @@ version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de51fa7ea2e95d4c2d1278c5629285d59eec951cc60c992964c03f30910ef5a1"
 dependencies = [
+ "async-channel",
  "bevy_platform",
  "disqualified",
  "indexmap 2.14.2",

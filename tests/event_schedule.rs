@@ -5,6 +5,7 @@ use bevy_ecs::{
     schedule::{ScheduleLabel, SingleThreadedExecutor},
 };
 use bevy_state_tree::prelude::*;
+use bevy_time::TimePlugin;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ScheduleLabel)]
 struct StateTreeUpdate;
@@ -33,7 +34,7 @@ fn queue_advance(target: Res<Target>, mut events: EntityStateTreeEventWriter<Sim
 #[test]
 fn queue_set_delivers_on_a_single_threaded_schedule_without_task_pool_plugin() {
     let mut app = App::new();
-    app.add_plugins(AssetPlugin::default())
+    app.add_plugins((TimePlugin, AssetPlugin::default()))
         .init_schedule(StateTreeUpdate)
         .add_plugins(StateTreePlugin::<Simulation>::new(StateTreeUpdate))
         .add_systems(

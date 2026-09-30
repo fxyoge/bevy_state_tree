@@ -2,6 +2,7 @@ use bevy_app::{App, TaskPoolPlugin};
 use bevy_asset::{AssetPlugin, AssetServer, Assets, LoadState};
 use bevy_ecs::schedule::ScheduleLabel;
 use bevy_state_tree::prelude::*;
+use bevy_time::TimePlugin;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ScheduleLabel)]
 struct StateTreeUpdate;
@@ -26,6 +27,7 @@ fn test_app() -> App {
     let mut app = App::new();
     app.add_plugins((
         TaskPoolPlugin::default(),
+        TimePlugin,
         AssetPlugin {
             file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets").into(),
             watch_for_changes_override: Some(false),

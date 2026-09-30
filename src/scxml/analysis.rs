@@ -167,7 +167,9 @@ impl<'a> CapabilityAnalyzer<'a> {
         } else {
             transition.events.iter().map(String::as_str).collect()
         };
-        if event_tokens.is_empty() {
+        if transition.after.is_some() {
+            self.add(Capability::AfterTransition);
+        } else if event_tokens.is_empty() {
             self.add(Capability::EventlessTransition);
         }
         if event_tokens.len() > 1 {

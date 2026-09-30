@@ -1,6 +1,6 @@
 mod support;
 
-use std::cell::RefCell;
+use std::{cell::RefCell, time::Duration};
 
 use divan::{Bencher, counter::ItemsCount};
 use support::{BenchmarkApp, BenchmarkDefinition, Executor};
@@ -87,6 +87,35 @@ fn sparse_entity_events(bencher: Bencher<'_, '_>, targets: usize) {
     bencher
         .counter(ItemsCount::new(targets))
         .bench_local(|| benchmark.borrow_mut().run_schedule());
+}
+
+#[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 20)]
+fn timers_far_future_idle(bencher: Bencher<'_, '_>, instances: usize) {
+    let benchmark = RefCell::new(BenchmarkApp::initialized(
+        support::timer_definition(Duration::from_secs(3_600)),
+        instances,
+        Executor::Parallel,
+    ));
+    bencher.bench_local(|| benchmark.borrow_mut().run_schedule());
+}
+
+#[divan::bench(args = [1_000, 100_000], sample_count = 10)]
+fn timers_dense_expiry(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            let mut benchmark = BenchmarkApp::initialized(
+                support::timer_definition(Duration::from_secs(1)),
+                instances,
+                Executor::Parallel,
+            );
+            benchmark.advance_time(Duration::from_secs(1));
+            benchmark
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
 }
 
 #[divan::bench(args = [1_000, 10_000], sample_count = 5)]

@@ -1,5 +1,7 @@
 mod support;
 
+use std::time::Duration;
+
 use divan::{AllocProfiler, Bencher, counter::ItemsCount};
 use support::{BenchmarkApp, BenchmarkDefinition, Executor};
 
@@ -108,6 +110,25 @@ fn process_depth(bencher: Bencher<'_, '_>, depth: usize) {
 }
 
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
+fn process_dense_timer_expiry(bencher: Bencher<'_, '_>, instances: usize) {
+    bencher
+        .counter(ItemsCount::new(instances))
+        .with_inputs(|| {
+            let mut benchmark = BenchmarkApp::initialized(
+                support::timer_definition(Duration::from_secs(1)),
+                instances,
+                Executor::SingleThreaded,
+            );
+            benchmark.advance_time(Duration::from_secs(1));
+            benchmark
+        })
+        .bench_local_values(|mut benchmark| {
+            benchmark.run_schedule();
+            divan::black_box(benchmark)
+        });
+}
+
+#[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
 fn initialize_toggle(bencher: Bencher<'_, '_>, instances: usize) {
     profile_initialization(bencher, instances, support::toggle_definition);
 }
@@ -120,6 +141,13 @@ fn initialize_luau(bencher: Bencher<'_, '_>, instances: usize) {
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
 fn initialize_parallel(bencher: Bencher<'_, '_>, instances: usize) {
     profile_initialization(bencher, instances, support::parallel_definition);
+}
+
+#[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]
+fn initialize_and_arm_timer(bencher: Bencher<'_, '_>, instances: usize) {
+    profile_initialization(bencher, instances, || {
+        support::timer_definition(Duration::from_secs(1))
+    });
 }
 
 #[divan::bench(args = [1, 1_000, 10_000], sample_count = 5)]

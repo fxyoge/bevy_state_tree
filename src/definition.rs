@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use bevy_asset::Asset;
@@ -36,6 +37,15 @@ pub(crate) struct EventId(u32);
 
 impl EventId {
     fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TimerId(pub(crate) u32);
+
+impl TimerId {
+    pub(crate) fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -155,8 +165,15 @@ pub(crate) struct Entry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionTrigger {
+    Event(EventId),
+    Eventless,
+    After(TimerId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Transition {
-    pub event: Option<EventId>,
+    pub trigger: TransitionTrigger,
     pub condition: Option<ExpressionId>,
     pub target: Option<StateId>,
     pub domain: Option<StateId>,
@@ -195,6 +212,7 @@ pub(crate) struct CompiledDefinition {
     pub max_active: usize,
     pub has_parallel: bool,
     pub datamodel: Option<CompiledLuauDataModel>,
+    pub timers: Box<[Duration]>,
     events: Box<[EventPattern]>,
     event_requirements: Box<[EventRequirement]>,
     internal_events: Box<[EventId]>,
@@ -449,11 +467,18 @@ struct DraftState {
 
 #[derive(Clone, Debug)]
 struct DraftTransition {
-    event: Option<EventPattern>,
+    trigger: DraftTransitionTrigger,
     condition: Option<ExpressionId>,
     target: Option<StateId>,
     actions: Vec<DraftAction>,
     span_start: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+enum DraftTransitionTrigger {
+    Event(EventPattern),
+    Eventless,
+    After(Duration),
 }
 
 #[derive(Clone, Debug)]
@@ -645,6 +670,7 @@ impl StateTreeAction {
 enum StateTreeTransitionTrigger {
     EventDescriptors(Vec<Box<str>>),
     Eventless,
+    After(Duration),
 }
 
 /// A complete transition authored through [`StateTreeBuilder`].
@@ -683,6 +709,21 @@ impl StateTreeTransition {
     pub fn eventless() -> Self {
         Self {
             trigger: StateTreeTransitionTrigger::Eventless,
+            condition: None,
+            target: None,
+            actions: Vec::new(),
+            span_start: 0,
+        }
+    }
+
+    /// Creates a one-shot transition triggered after its source state has
+    /// remained active for `duration`.
+    ///
+    /// The timer is armed on state entry and cancelled on state exit. Re-entering
+    /// the state starts a fresh timer.
+    pub fn after(duration: Duration) -> Self {
+        Self {
+            trigger: StateTreeTransitionTrigger::After(duration),
             condition: None,
             target: None,
             actions: Vec::new(),
@@ -906,6 +947,10 @@ impl StateTreeBuilder {
                 return Err(BuildError::EmptyTransition);
             }
             StateTreeTransitionTrigger::Eventless => {}
+            StateTreeTransitionTrigger::After(duration) if duration.is_zero() => {
+                return Err(BuildError::ZeroTimerDuration);
+            }
+            StateTreeTransitionTrigger::After(_) => {}
         }
         let expression_checkpoint = self.expression_count();
         let condition = transition
@@ -933,7 +978,7 @@ impl StateTreeBuilder {
                 for event in events {
                     self.push_transition(
                         source,
-                        Some(EventPattern::Descriptor(event)),
+                        DraftTransitionTrigger::Event(EventPattern::Descriptor(event)),
                         condition,
                         transition.target,
                         actions.clone(),
@@ -944,7 +989,17 @@ impl StateTreeBuilder {
             StateTreeTransitionTrigger::Eventless => {
                 self.push_transition(
                     source,
-                    None,
+                    DraftTransitionTrigger::Eventless,
+                    condition,
+                    transition.target,
+                    actions,
+                    span_start,
+                )?;
+            }
+            StateTreeTransitionTrigger::After(duration) => {
+                self.push_transition(
+                    source,
+                    DraftTransitionTrigger::After(duration),
                     condition,
                     transition.target,
                     actions,
@@ -1201,6 +1256,7 @@ impl StateTreeBuilder {
         let mut states = Vec::with_capacity(self.states.len());
         let mut transition_entries = Vec::new();
         let mut transition_actions = Vec::new();
+        let mut timers = Vec::new();
         let mut effects = Vec::<Box<str>>::new();
         let mut effect_ids = HashMap::<Box<str>, EffectId>::new();
         let mut effect_arguments = Vec::new();
@@ -1265,19 +1321,24 @@ impl StateTreeBuilder {
 
             let mut transitions = Vec::with_capacity(draft.transitions.len());
             for transition in &draft.transitions {
-                let event = match &transition.event {
-                    Some(pattern) => {
+                let trigger = match &transition.trigger {
+                    DraftTransitionTrigger::Event(pattern) => {
                         let event = intern_event(&mut events, &mut event_ids, pattern.clone())?;
-                        Some(event)
+                        event_requirements.push(EventRequirement {
+                            event,
+                            span_start: transition.span_start,
+                        });
+                        TransitionTrigger::Event(event)
                     }
-                    None => None,
+                    DraftTransitionTrigger::Eventless => TransitionTrigger::Eventless,
+                    DraftTransitionTrigger::After(duration) => {
+                        let timer = TimerId(
+                            u32::try_from(timers.len()).map_err(|_| BuildError::TooManyTimers)?,
+                        );
+                        timers.push(*duration);
+                        TransitionTrigger::After(timer)
+                    }
                 };
-                if let Some(event) = event {
-                    event_requirements.push(EventRequirement {
-                        event,
-                        span_start: transition.span_start,
-                    });
-                }
                 let (exit_depth, entry_start, entry_len) = if let Some(target) = transition.target {
                     let entry_start = u32::try_from(transition_entries.len())
                         .map_err(|_| BuildError::TooManyStates)?;
@@ -1298,7 +1359,7 @@ impl StateTreeBuilder {
                     (0, 0, 0)
                 };
                 transitions.push(Transition {
-                    event,
+                    trigger,
                     condition: transition.condition,
                     target: transition.target,
                     domain: transition.target.and_then(|target| {
@@ -1462,6 +1523,7 @@ impl StateTreeBuilder {
                 max_active: max_configurations[root.index()],
                 has_parallel,
                 datamodel,
+                timers: timers.into_boxed_slice(),
                 events: events.into_boxed_slice(),
                 event_requirements: event_requirements.into_boxed_slice(),
                 internal_events: internal_events.into_boxed_slice(),
@@ -1526,7 +1588,7 @@ impl StateTreeBuilder {
     fn push_transition(
         &mut self,
         source: StateId,
-        event: Option<EventPattern>,
+        trigger: DraftTransitionTrigger,
         condition: Option<ExpressionId>,
         target: Option<StateId>,
         actions: Vec<DraftAction>,
@@ -1540,7 +1602,7 @@ impl StateTreeBuilder {
             return Err(BuildError::FinalHasTransition(source));
         }
         state.transitions.push(DraftTransition {
-            event,
+            trigger,
             condition,
             target,
             actions,
@@ -1907,6 +1969,8 @@ pub enum BuildError {
     InvalidEventDescriptor(Box<str>),
     #[error("an eventless transition requires a condition or target")]
     EmptyTransition,
+    #[error("an after transition requires a positive duration")]
+    ZeroTimerDuration,
     #[error("an effect name cannot be empty")]
     EmptyEffectName,
     #[error("an effect argument name cannot be empty")]
@@ -1926,6 +1990,8 @@ pub enum BuildError {
     TooManyEffects,
     #[error("a definition cannot contain more than u32::MAX effect arguments")]
     TooManyEffectArguments,
+    #[error("a definition cannot contain more than u32::MAX timers")]
+    TooManyTimers,
 }
 
 #[cfg(test)]
@@ -1945,6 +2011,7 @@ struct DefinitionSemantics {
     max_active: usize,
     has_parallel: bool,
     datamodel: Option<DataModelSemantics>,
+    timers: Vec<Duration>,
     events: Vec<EventPattern>,
     event_requirements: Vec<EventId>,
     internal_events: Vec<EventId>,
@@ -1979,7 +2046,7 @@ enum StateKindSemantics {
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 struct TransitionSemantics {
-    event: Option<EventId>,
+    trigger: TransitionTrigger,
     condition: Option<ExpressionId>,
     target: Option<u32>,
     domain: Option<u32>,
@@ -2072,7 +2139,7 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                     .transitions
                     .iter()
                     .map(|transition| TransitionSemantics {
-                        event: transition.event,
+                        trigger: transition.trigger,
                         condition: transition.condition,
                         target: transition.target.map(|state| state.index),
                         domain: transition.domain.map(|state| state.index),
@@ -2124,6 +2191,7 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                     })
                     .collect(),
             }),
+        timers: compiled.timers.to_vec(),
         events: compiled.events.to_vec(),
         event_requirements: compiled
             .event_requirements
@@ -2286,6 +2354,20 @@ mod tests {
                 )
                 .unwrap_err(),
             BuildError::InvalidEventDescriptor("advance fast".into())
+        );
+    }
+
+    #[test]
+    fn rejects_zero_duration_after_transitions() {
+        let mut builder = StateTreeBuilder::new("zero-timeout");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+
+        assert_eq!(
+            builder
+                .add_transition(waiting, StateTreeTransition::after(Duration::ZERO))
+                .unwrap_err(),
+            BuildError::ZeroTimerDuration
         );
     }
 

@@ -536,6 +536,7 @@ impl<'a> Compiler<'a> {
             return self.invalid_initial(transition.span);
         }
         if transition.event.is_some()
+            || transition.after.is_some()
             || transition.condition.is_some()
             || transition.transition_type.is_some()
             || has_foreign_attributes(&transition.attributes)
@@ -564,10 +565,17 @@ impl<'a> Compiler<'a> {
         {
             return self.invalid_document(transition.span, "transition event cannot be empty");
         }
+        if transition.after.is_some() && transition.event.is_some() {
+            return self.invalid_document(
+                transition.span,
+                "transition cannot combine bst:after with event",
+            );
+        }
         if target_attribute.is_some_and(|target| target.trim().is_empty()) {
             return self.invalid_document(transition.span, "transition target cannot be empty");
         }
         if transition.event.is_none()
+            && transition.after.is_none()
             && transition.condition.is_none()
             && target_attribute.is_none()
         {
@@ -587,7 +595,7 @@ impl<'a> Compiler<'a> {
             );
         }
         let actions = self.actions(&transition.content, transition.span)?;
-        if has_foreign_attributes(&transition.attributes) {
+        if has_unsupported_transition_attributes(&transition.attributes) {
             return self.unsupported(transition.span, "foreign transition attributes");
         }
         if transition.targets.len() > 1 {
@@ -598,7 +606,9 @@ impl<'a> Compiler<'a> {
             .first()
             .map(|target| self.target(target, transition.span))
             .transpose()?;
-        let mut specification = if transition.events.is_empty() {
+        let mut specification = if let Some(after) = transition.after {
+            StateTreeTransition::after(after)
+        } else if transition.events.is_empty() {
             StateTreeTransition::eventless()
         } else {
             StateTreeTransition::on_any(transition.events.iter().cloned())
@@ -969,6 +979,16 @@ fn has_foreign_attributes(attributes: &[Attribute]) -> bool {
     })
 }
 
+fn has_unsupported_transition_attributes(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.namespace.is_some()
+            && attribute.name != "xmlns"
+            && !attribute.name.starts_with("xmlns:")
+            && !(attribute.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
+                && attribute.local_name == "after")
+    })
+}
+
 fn has_substantive_content(content: Option<&Content>) -> bool {
     content.is_some_and(|content| {
         !content.text.trim().is_empty()
@@ -1099,6 +1119,54 @@ mod tests {
                     .contains(expected)
             );
         }
+    }
+
+    #[test]
+    fn rejects_event_and_after_on_the_same_transition() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}"><state><transition event="go" bst:after="1s"/></state></scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let document = scxml::parse("event-after.scxml", &source).unwrap();
+
+        assert!(
+            compile(&document)
+                .unwrap_err()
+                .to_string()
+                .contains("transition cannot combine bst:after with event")
+        );
+    }
+
+    #[test]
+    fn after_does_not_allow_other_foreign_transition_attributes() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}" xmlns:bst="{}" xmlns:x="urn:other"><state><transition bst:after="1s" x:after="2s"/></state></scxml>"#,
+            super::super::BEVY_STATE_TREE_NAMESPACE,
+        );
+        let document = scxml::parse("foreign-after.scxml", &source).unwrap();
+
+        assert!(matches!(
+            compile(&document),
+            Err(CompileError::Unsupported {
+                feature: "foreign transition attributes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unqualified_after_is_not_the_bevy_extension() {
+        let source = format!(
+            r#"<scxml xmlns="{NS}"><state><transition after="1s" target="done"/></state><final id="done"/></scxml>"#,
+        );
+        let document = scxml::parse("unqualified-after.scxml", &source).unwrap();
+
+        assert!(
+            compile(&document)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown attribute `after` on <transition>")
+        );
     }
 
     #[test]

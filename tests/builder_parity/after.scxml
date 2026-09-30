@@ -1,0 +1,9 @@
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree"
+       name="after-transitions"
+       initial="waiting">
+  <state id="waiting">
+    <transition bst:after="250ms" target="done"/>
+  </state>
+  <final id="done"/>
+</scxml>

@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use bevy_asset::{AssetId, Handle};
@@ -15,7 +16,7 @@ use bevy_ecs::{
 
 use crate::definition::{
     Action, CompiledDefinition, Entry, EventId, EventSet, ExpressionId, LinkedDefinition, StateId,
-    StateKind, Transition,
+    StateKind, TimerId, Transition, TransitionTrigger,
 };
 use crate::effect::{
     HeadlessEffectSink, RejectEffects, RuntimeEffectSink, StateTreeEffectArgs,
@@ -24,7 +25,7 @@ use crate::effect::{
 use crate::{
     LuauValue, NoStateTreeTrace, StateTreeDefinition, StateTreeDomain, StateTreeEvents,
     StateTreeLinkError, StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, luau,
-    plugin::StateTreeEventInbox,
+    plugin::{StateTreeEventInbox, StateTreeTimers},
 };
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -33,6 +34,29 @@ enum Trigger<'a, E> {
     Eventless(Option<&'a str>, Option<&'a E>),
     Internal(EventId),
     External(&'a EventSet, &'a str, &'a E),
+    After(&'a [TimerToken]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TimerToken {
+    pub runtime_id: u64,
+    pub timer: TimerId,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TimerUpdate {
+    Arm {
+        token: TimerToken,
+        deadline: Duration,
+    },
+    Cancel(TimerToken),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TimerSlot {
+    generation: u64,
+    armed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +100,7 @@ impl<'a, E> Trigger<'a, E> {
             Self::Eventless(name, _) => *name,
             Self::Internal(event) => compiled.event_name(*event),
             Self::External(_, name, _) => Some(name),
+            Self::After(_) => None,
         }
     }
 
@@ -84,6 +109,7 @@ impl<'a, E> Trigger<'a, E> {
             Self::Eventless(_, event) => *event,
             Self::External(_, _, event) => Some(*event),
             Self::Internal(_) => None,
+            Self::After(_) => None,
         }
     }
 }
@@ -101,6 +127,8 @@ impl<E: StateTreeEvents> StateTreeDomain for HeadlessDomain<E> {
 /// Construction performs all definition linking and reserves runtime storage.
 pub struct StateTreeExecution<E: StateTreeEvents> {
     instance: StateTreeInstance<HeadlessDomain<E>>,
+    now: Duration,
+    timers: Vec<(Duration, TimerToken)>,
 }
 
 impl<E: StateTreeEvents> StateTreeExecution<E> {
@@ -142,7 +170,13 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
             &mut RejectEffects,
             trace,
         );
-        Ok(Self { instance })
+        let mut execution = Self {
+            instance,
+            now: Duration::ZERO,
+            timers: Vec::new(),
+        };
+        execution.apply_timer_updates();
+        Ok(execution)
     }
 
     /// Links and initializes a definition while delivering effects and tracing execution.
@@ -164,7 +198,13 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
             &mut HeadlessEffectSink { sink },
             trace,
         );
-        Ok(Self { instance })
+        let mut execution = Self {
+            instance,
+            now: Duration::ZERO,
+            timers: Vec::new(),
+        };
+        execution.apply_timer_updates();
+        Ok(execution)
     }
 
     /// Returns the current execution status.
@@ -194,13 +234,15 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         microstep_limit: NonZeroUsize,
         sink: &mut S,
     ) -> bool {
-        self.instance.process_event_traced(
+        let processed = self.instance.process_event_traced(
             event,
             microstep_limit.get(),
             None,
             &mut HeadlessEffectSink { sink },
             &mut NoStateTreeTrace,
-        )
+        );
+        self.apply_timer_updates();
+        processed
     }
 
     /// Processes one external event while writing its complete semantic trace.
@@ -210,13 +252,15 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         microstep_limit: NonZeroUsize,
         trace: &mut T,
     ) -> bool {
-        self.instance.process_event_traced(
+        let processed = self.instance.process_event_traced(
             event,
             microstep_limit.get(),
             None,
             &mut RejectEffects,
             trace,
-        )
+        );
+        self.apply_timer_updates();
+        processed
     }
 
     /// Processes one external event while delivering effects and tracing execution.
@@ -230,13 +274,115 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         sink: &mut S,
         trace: &mut T,
     ) -> bool {
-        self.instance.process_event_traced(
+        let processed = self.instance.process_event_traced(
             event,
             microstep_limit.get(),
             None,
             &mut HeadlessEffectSink { sink },
             trace,
+        );
+        self.apply_timer_updates();
+        processed
+    }
+
+    /// Advances the headless clock and processes every newly due timeout in
+    /// chronological deadline order.
+    pub fn advance_time(&mut self, delta: Duration, microstep_limit: NonZeroUsize) -> bool {
+        self.advance_time_traced(delta, microstep_limit, &mut NoStateTreeTrace)
+    }
+
+    /// Advances time while delivering effects to `sink`.
+    pub fn advance_time_with_sink<S: StateTreeEffectSink<E> + ?Sized>(
+        &mut self,
+        delta: Duration,
+        microstep_limit: NonZeroUsize,
+        sink: &mut S,
+    ) -> bool {
+        self.advance_time_traced_with_sink(delta, microstep_limit, sink, &mut NoStateTreeTrace)
+    }
+
+    /// Advances time while writing complete semantic traces for due timeouts.
+    pub fn advance_time_traced<T: StateTreeTrace + ?Sized>(
+        &mut self,
+        delta: Duration,
+        microstep_limit: NonZeroUsize,
+        trace: &mut T,
+    ) -> bool {
+        self.advance_time_inner(delta, microstep_limit, &mut RejectEffects, trace)
+    }
+
+    /// Advances time while delivering effects and writing semantic traces.
+    pub fn advance_time_traced_with_sink<
+        S: StateTreeEffectSink<E> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        delta: Duration,
+        microstep_limit: NonZeroUsize,
+        sink: &mut S,
+        trace: &mut T,
+    ) -> bool {
+        self.advance_time_inner(
+            delta,
+            microstep_limit,
+            &mut HeadlessEffectSink { sink },
+            trace,
         )
+    }
+
+    fn advance_time_inner<
+        S: RuntimeEffectSink<HeadlessDomain<E>> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        delta: Duration,
+        microstep_limit: NonZeroUsize,
+        effects: &mut S,
+        trace: &mut T,
+    ) -> bool {
+        self.now = self.now.saturating_add(delta);
+        self.instance.set_time(self.now);
+        let mut transitioned = false;
+        let mut due = Vec::new();
+        self.timers.retain(|(deadline, token)| {
+            if *deadline <= self.now {
+                due.push((*deadline, *token));
+                false
+            } else {
+                true
+            }
+        });
+        due.sort_unstable();
+        let mut start = 0;
+        while start < due.len() {
+            let deadline = due[start].0;
+            let mut end = start + 1;
+            while end < due.len() && due[end].0 == deadline {
+                end += 1;
+            }
+            let tokens: Vec<_> = due[start..end].iter().map(|(_, token)| *token).collect();
+            transitioned |= self.instance.process_timers_traced(
+                &tokens,
+                microstep_limit.get(),
+                None,
+                effects,
+                trace,
+            );
+            self.apply_timer_updates();
+            start = end;
+        }
+        transitioned
+    }
+
+    fn apply_timer_updates(&mut self) {
+        for update in self.instance.timer_updates.drain(..) {
+            match update {
+                TimerUpdate::Arm { token, deadline } => self.timers.push((deadline, token)),
+                TimerUpdate::Cancel(token) => {
+                    self.timers.retain(|(_, candidate)| *candidate != token);
+                }
+            }
+        }
     }
 }
 
@@ -312,12 +458,22 @@ pub struct StateTreeInstance<D: StateTreeDomain> {
     active: Vec<StateId>,
     parallel: Option<Box<ParallelRuntime>>,
     internal_events: VecDeque<EventId>,
+    now: Duration,
+    timers: Vec<TimerSlot>,
+    timer_updates: Vec<TimerUpdate>,
     data: Vec<LuauValue>,
     status: InstanceStatus,
     marker: PhantomData<fn() -> D>,
 }
 
 fn release_event_inbox<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
+    let timer_tokens = world
+        .get::<StateTreeInstance<D>>(context.entity)
+        .map(StateTreeInstance::armed_timer_tokens)
+        .unwrap_or_default();
+    if let Some(mut timers) = world.get_resource_mut::<StateTreeTimers<D>>() {
+        timers.cancel_tokens(timer_tokens);
+    }
     let mut entity = world.entity_mut(context.entity);
     let Some(mut inbox) = entity.get_mut::<StateTreeEventInbox<D>>() else {
         return;
@@ -335,6 +491,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             active: Vec::new(),
             parallel: None,
             internal_events: VecDeque::new(),
+            now: Duration::ZERO,
+            timers: Vec::new(),
+            timer_updates: Vec::new(),
             data: Vec::new(),
             status: InstanceStatus::Pending,
             marker: PhantomData,
@@ -353,6 +512,27 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
     pub(crate) fn runtime_id(&self) -> u64 {
         self.runtime_id
+    }
+
+    pub(crate) fn set_time(&mut self, now: Duration) {
+        self.now = now;
+    }
+
+    pub(crate) fn drain_timer_updates(&mut self) -> std::vec::Drain<'_, TimerUpdate> {
+        self.timer_updates.drain(..)
+    }
+
+    fn armed_timer_tokens(&self) -> Vec<TimerToken> {
+        self.timers
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.armed)
+            .map(|(index, slot)| TimerToken {
+                runtime_id: self.runtime_id,
+                timer: TimerId(u32::try_from(index).expect("compiled timer index fits u32")),
+                generation: slot.generation,
+            })
+            .collect()
     }
 
     /// Returns the current execution status.
@@ -428,10 +608,14 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.internal_events.clear();
         self.internal_events
             .reserve(compiled.max_depth.max(compiled.max_active));
+        self.timers.clear();
+        self.timers
+            .resize(compiled.timers.len(), TimerSlot::default());
+        self.timer_updates.clear();
         self.data.clear();
         self.status = InstanceStatus::Running;
         if let Err(fault) = self.initialize_datamodel(compiled, trace) {
-            self.status = InstanceStatus::Faulted(fault);
+            self.set_fault(fault);
             self.finish_macrostep(compiled, trace);
             return;
         }
@@ -447,7 +631,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 effects,
                 trace,
             ) {
-                self.status = InstanceStatus::Faulted(fault);
+                self.set_fault(fault);
                 self.finish_macrostep(compiled, trace);
                 return;
             }
@@ -525,7 +709,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 return false;
             }
             Err(fault) => {
-                self.status = InstanceStatus::Faulted(fault);
+                self.set_fault(fault);
                 self.finish_current_macrostep(trace);
                 return true;
             }
@@ -543,7 +727,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             effects,
             trace,
         ) {
-            self.status = InstanceStatus::Faulted(fault);
+            self.set_fault(fault);
             self.finish_current_macrostep(trace);
             return true;
         }
@@ -557,6 +741,101 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 ActionContext {
                     event_name: Some(event_name),
                     external_event: Some(event),
+                    entity,
+                },
+                effects,
+                trace,
+            );
+        }
+        self.finish_current_macrostep(trace);
+        true
+    }
+
+    pub(crate) fn process_timers<S: RuntimeEffectSink<D> + ?Sized>(
+        &mut self,
+        tokens: &[TimerToken],
+        microstep_limit: usize,
+        entity: Option<Entity>,
+        effects: &mut S,
+    ) -> bool {
+        self.process_timers_traced(
+            tokens,
+            microstep_limit,
+            entity,
+            effects,
+            &mut NoStateTreeTrace,
+        )
+    }
+
+    fn process_timers_traced<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+        &mut self,
+        tokens: &[TimerToken],
+        microstep_limit: usize,
+        entity: Option<Entity>,
+        effects: &mut S,
+        trace: &mut T,
+    ) -> bool {
+        if self.status != InstanceStatus::Running {
+            return false;
+        }
+        let mut any_due = false;
+        for token in tokens {
+            if token.runtime_id != self.runtime_id {
+                continue;
+            }
+            let Some(slot) = self.timers.get_mut(token.timer.index()) else {
+                continue;
+            };
+            if !slot.armed || slot.generation != token.generation {
+                continue;
+            }
+            slot.armed = false;
+            any_due = true;
+        }
+        if !any_due {
+            return false;
+        }
+        trace.record(StateTreeTraceRecord::MacrostepStarted {
+            trigger: StateTreeTraceTrigger::Timer,
+        });
+        let transition = match self.select_step(Trigger::After(tokens)) {
+            Ok(Some(transition)) => transition,
+            Ok(None) => {
+                self.finish_current_macrostep(trace);
+                return false;
+            }
+            Err(fault) => {
+                self.set_fault(fault);
+                self.finish_current_macrostep(trace);
+                return true;
+            }
+        };
+        let configuration_changed = self.selected_step_changes_configuration(transition);
+        self.trace_selected_step(1, transition, trace);
+        if let Err(fault) = self.take_selected_step(
+            transition,
+            ActionContext {
+                event_name: None,
+                external_event: None,
+                entity,
+            },
+            effects,
+            trace,
+        ) {
+            self.set_fault(fault);
+            self.finish_current_macrostep(trace);
+            return true;
+        }
+        if configuration_changed {
+            self.update_completion(trace);
+        }
+        if self.status == InstanceStatus::Running {
+            self.stabilize(
+                microstep_limit,
+                1,
+                ActionContext {
+                    event_name: None,
+                    external_event: None,
                     entity,
                 },
                 effects,
@@ -602,19 +881,18 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                             Ok(Some(transition)) => transition,
                             Ok(None) => continue,
                             Err(fault) => {
-                                self.status = InstanceStatus::Faulted(fault);
+                                self.set_fault(fault);
                                 return;
                             }
                         }
                     }
                     Err(fault) => {
-                        self.status = InstanceStatus::Faulted(fault);
+                        self.set_fault(fault);
                         return;
                     }
                 };
             if transitions_taken == limit {
-                self.status =
-                    InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit });
+                self.set_fault(RuntimeFault::MicrostepLimitExceeded { limit });
                 return;
             }
             let configuration_changed = self.selected_step_changes_configuration(transition);
@@ -629,7 +907,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 effects,
                 trace,
             ) {
-                self.status = InstanceStatus::Faulted(fault);
+                self.set_fault(fault);
                 return;
             }
             transitions_taken += 1;
@@ -651,12 +929,17 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         };
         for state in self.active.iter().rev() {
             for (index, transition) in compiled.state(*state).transitions.iter().enumerate() {
-                let matches = match (transition.event, &trigger) {
-                    (None, Trigger::Eventless(_, _)) => true,
-                    (Some(candidate), Trigger::Internal(emitted)) => {
+                let matches = match (transition.trigger, &trigger) {
+                    (TransitionTrigger::Eventless, Trigger::Eventless(_, _)) => true,
+                    (TransitionTrigger::Event(candidate), Trigger::Internal(emitted)) => {
                         compiled.internal_event_matches(candidate, *emitted)
                     }
-                    (Some(event), Trigger::External(events, _, _)) => events.contains(event),
+                    (TransitionTrigger::Event(event), Trigger::External(events, _, _)) => {
+                        events.contains(event)
+                    }
+                    (TransitionTrigger::After(timer), Trigger::After(due)) => {
+                        self.timer_matches(due, timer)
+                    }
                     _ => false,
                 };
                 if !matches {
@@ -735,12 +1018,17 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let mut candidate = None;
             while let Some(state) = cursor {
                 for (index, transition) in compiled.state(state).transitions.iter().enumerate() {
-                    let matches = match (transition.event, trigger) {
-                        (None, Trigger::Eventless(_, _)) => true,
-                        (Some(candidate), Trigger::Internal(emitted)) => {
+                    let matches = match (transition.trigger, trigger) {
+                        (TransitionTrigger::Eventless, Trigger::Eventless(_, _)) => true,
+                        (TransitionTrigger::Event(candidate), Trigger::Internal(emitted)) => {
                             compiled.internal_event_matches(candidate, *emitted)
                         }
-                        (Some(event), Trigger::External(events, _, _)) => events.contains(event),
+                        (TransitionTrigger::Event(event), Trigger::External(events, _, _)) => {
+                            events.contains(event)
+                        }
+                        (TransitionTrigger::After(timer), Trigger::After(due)) => {
+                            self.timer_matches(due, timer)
+                        }
                         _ => false,
                     };
                     if !matches {
@@ -880,6 +1168,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             trace.record(StateTreeTraceRecord::StateExited {
                 state: &compiled.state(*state).name,
             });
+            self.cancel_state_timers(&compiled, *state);
         }
         self.active.retain(|state| !runtime.exited.contains(state));
         runtime
@@ -978,6 +1267,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             trace.record(StateTreeTraceRecord::StateExited {
                 state: &compiled.state(state).name,
             });
+            self.cancel_state_timers(&compiled, state);
         }
         self.active.truncate(exit_depth);
 
@@ -1071,11 +1361,80 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.active.push(entry.state);
         let state = compiled.state(entry.state);
         trace.record(StateTreeTraceRecord::StateEntered { state: &state.name });
+        self.arm_state_timers(compiled, entry.state);
         self.execute_actions(compiled, &state.entry_actions, context, effects, trace)?;
         if entry.take_initial {
             self.execute_actions(compiled, &state.initial_actions, context, effects, trace)?;
         }
         Ok(())
+    }
+
+    fn arm_state_timers(&mut self, compiled: &CompiledDefinition, state: StateId) {
+        for transition in &compiled.state(state).transitions {
+            let TransitionTrigger::After(timer) = transition.trigger else {
+                continue;
+            };
+            let slot = &mut self.timers[timer.index()];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.armed = true;
+            let Some(deadline) = self.now.checked_add(compiled.timers[timer.index()]) else {
+                continue;
+            };
+            self.timer_updates.push(TimerUpdate::Arm {
+                token: TimerToken {
+                    runtime_id: self.runtime_id,
+                    timer,
+                    generation: slot.generation,
+                },
+                deadline,
+            });
+        }
+    }
+
+    fn timer_matches(&self, due: &[TimerToken], timer: TimerId) -> bool {
+        let Ok(index) = due.binary_search_by_key(&timer, |token| token.timer) else {
+            return false;
+        };
+        let token = due[index];
+        token.runtime_id == self.runtime_id
+            && self.timers[timer.index()].generation == token.generation
+    }
+
+    fn cancel_state_timers(&mut self, compiled: &CompiledDefinition, state: StateId) {
+        for transition in &compiled.state(state).transitions {
+            let TransitionTrigger::After(timer) = transition.trigger else {
+                continue;
+            };
+            let slot = &mut self.timers[timer.index()];
+            if !slot.armed {
+                continue;
+            }
+            slot.armed = false;
+            self.timer_updates.push(TimerUpdate::Cancel(TimerToken {
+                runtime_id: self.runtime_id,
+                timer,
+                generation: slot.generation,
+            }));
+        }
+    }
+
+    fn cancel_all_timers(&mut self) {
+        for (index, slot) in self.timers.iter_mut().enumerate() {
+            if !slot.armed {
+                continue;
+            }
+            slot.armed = false;
+            self.timer_updates.push(TimerUpdate::Cancel(TimerToken {
+                runtime_id: self.runtime_id,
+                timer: TimerId(u32::try_from(index).expect("compiled timer index fits u32")),
+                generation: slot.generation,
+            }));
+        }
+    }
+
+    fn set_fault(&mut self, fault: RuntimeFault) {
+        self.status = InstanceStatus::Faulted(fault);
+        self.cancel_all_timers();
     }
 
     fn initialize_datamodel<T: StateTreeTrace + ?Sized>(
@@ -1280,6 +1639,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         };
         if parent == compiled.root {
             self.status = InstanceStatus::Complete;
+            self.cancel_all_timers();
             return;
         }
         let StateKind::Compound { completion, .. } = compiled.state(parent).kind else {
@@ -1307,6 +1667,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             self.active.contains(child) && compiled.state(*child).kind == StateKind::Final
         }) {
             self.status = InstanceStatus::Complete;
+            self.cancel_all_timers();
             return;
         }
 
@@ -1420,10 +1781,12 @@ impl<D: StateTreeDomain> Default for PendingStateTree<D> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use bevy_asset::Handle;
 
     use super::*;
-    use crate::{StateTreeBuilder, StateTreeTransition};
+    use crate::{StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeTransition};
 
     struct TestDomain;
 
@@ -1467,6 +1830,14 @@ mod tests {
         limit: usize,
     ) -> bool {
         instance.process_event(event, limit, None, &mut RejectEffects)
+    }
+
+    fn execution(definition: &StateTreeDefinition) -> StateTreeExecution<TestEvents> {
+        StateTreeExecution::new(definition, NonZeroUsize::new(64).unwrap()).unwrap()
+    }
+
+    fn advance(execution: &mut StateTreeExecution<TestEvents>, duration: Duration) -> bool {
+        execution.advance_time(duration, NonZeroUsize::new(64).unwrap())
     }
 
     enum DescriptorEvents {
@@ -1841,5 +2212,272 @@ mod tests {
             instance.active_state_names().collect::<Vec<_>>(),
             ["root", "nested", "done"]
         );
+    }
+
+    #[test]
+    fn headless_after_transition_fires_only_at_its_deadline() {
+        let mut builder = StateTreeBuilder::new("deadline");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let elapsed = builder.atomic("elapsed", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(elapsed),
+            )
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+
+        assert!(!advance(&mut execution, Duration::from_millis(999)));
+        assert_eq!(execution.active_state_names().last(), Some("waiting"));
+        assert!(advance(&mut execution, Duration::from_millis(1)));
+        assert_eq!(execution.active_state_names().last(), Some("elapsed"));
+    }
+
+    #[test]
+    fn timer_rearm_beyond_the_clock_range_does_not_refire_immediately() {
+        let mut builder = StateTreeBuilder::new("maximum-deadline");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::MAX).target(waiting),
+            )
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+
+        assert!(advance(&mut execution, Duration::MAX));
+        assert!(!advance(&mut execution, Duration::ZERO));
+        assert_eq!(execution.active_state_names().last(), Some("waiting"));
+    }
+
+    #[test]
+    fn exiting_cancels_a_timeout_and_reentry_rearms_it() {
+        let mut builder = StateTreeBuilder::new("rearm");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let away = builder.atomic("away", root).unwrap();
+        let elapsed = builder.atomic("elapsed", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(elapsed),
+            )
+            .unwrap();
+        builder
+            .add_transition(waiting, StateTreeTransition::on("advance").target(away))
+            .unwrap();
+        builder
+            .add_transition(away, StateTreeTransition::on("finish").target(waiting))
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+        let limit = NonZeroUsize::new(64).unwrap();
+
+        advance(&mut execution, Duration::from_millis(500));
+        execution.process_event(&TestEvents::Advance, limit);
+        assert!(!advance(&mut execution, Duration::from_secs(1)));
+        execution.process_event(&TestEvents::Finish, limit);
+        assert!(!advance(&mut execution, Duration::from_millis(999)));
+        assert_eq!(execution.active_state_names().last(), Some("waiting"));
+        assert!(advance(&mut execution, Duration::from_millis(1)));
+        assert_eq!(execution.active_state_names().last(), Some("elapsed"));
+    }
+
+    #[test]
+    fn targetless_after_transition_fires_once() {
+        let mut builder = StateTreeBuilder::new("targetless-timeout");
+        builder
+            .luau_datamodel([StateTreeData::new("fires").with_initializer("0")])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_millis(10))
+                    .actions([StateTreeAction::assign("fires", "fires + 1")]),
+            )
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+
+        assert!(advance(&mut execution, Duration::from_millis(10)));
+        assert_eq!(execution.data("fires"), Some(&LuauValue::Integer(1)));
+        assert!(!advance(&mut execution, Duration::from_secs(10)));
+        assert_eq!(execution.data("fires"), Some(&LuauValue::Integer(1)));
+    }
+
+    #[test]
+    fn same_deadline_after_transitions_use_authored_guard_order() {
+        let mut builder = StateTreeBuilder::new("guarded-timeouts");
+        builder.luau_datamodel([]).unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let rejected = builder.atomic("rejected", root).unwrap();
+        let accepted = builder.atomic("accepted", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1))
+                    .condition("false")
+                    .target(rejected),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1))
+                    .condition("true")
+                    .target(accepted),
+            )
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+
+        assert!(advance(&mut execution, Duration::from_secs(1)));
+        assert_eq!(execution.active_state_names().last(), Some("accepted"));
+    }
+
+    #[test]
+    fn overdue_deadlines_run_chronologically_and_cancel_later_timeouts() {
+        let mut builder = StateTreeBuilder::new("overdue-timeouts");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let first = builder.atomic("first", root).unwrap();
+        let wrong = builder.atomic("wrong", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(2)).target(wrong),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(first),
+            )
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+
+        assert!(advance(&mut execution, Duration::from_secs(3)));
+        assert_eq!(execution.active_state_names().last(), Some("first"));
+    }
+
+    #[test]
+    fn parallel_same_deadline_timeouts_form_one_cohort() {
+        let mut builder = StateTreeBuilder::new("parallel-timeouts");
+        let root = builder.compound_root("root").unwrap();
+        let parallel = builder.parallel("parallel", root).unwrap();
+        let left = builder.compound("left", parallel).unwrap();
+        let left_waiting = builder.atomic("left-waiting", left).unwrap();
+        let left_elapsed = builder.atomic("left-elapsed", left).unwrap();
+        let right = builder.compound("right", parallel).unwrap();
+        let right_waiting = builder.atomic("right-waiting", right).unwrap();
+        let right_elapsed = builder.atomic("right-elapsed", right).unwrap();
+        builder.initial(root, parallel).unwrap();
+        builder.initial(left, left_waiting).unwrap();
+        builder.initial(right, right_waiting).unwrap();
+        builder
+            .add_transition(
+                left_waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(left_elapsed),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                right_waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(right_elapsed),
+            )
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+
+        assert!(advance(&mut execution, Duration::from_secs(1)));
+        let active = execution.active_state_names().collect::<Vec<_>>();
+        assert!(active.contains(&"left-elapsed"));
+        assert!(active.contains(&"right-elapsed"));
+    }
+
+    #[test]
+    fn timeout_macrostep_stabilizes_eventless_and_internal_transitions() {
+        let mut builder = StateTreeBuilder::new("timeout-stabilization");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let eventless = builder.atomic("eventless", root).unwrap();
+        let internal = builder.atomic("internal", root).unwrap();
+        let stable = builder.atomic("stable", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1))
+                    .target(eventless)
+                    .actions([StateTreeAction::raise("continue")]),
+            )
+            .unwrap();
+        builder
+            .add_transition(eventless, StateTreeTransition::eventless().target(internal))
+            .unwrap();
+        builder
+            .add_transition(internal, StateTreeTransition::on("continue").target(stable))
+            .unwrap();
+        let mut execution = execution(&builder.build().unwrap());
+
+        assert!(advance(&mut execution, Duration::from_secs(1)));
+        assert_eq!(execution.active_state_names().last(), Some("stable"));
+    }
+
+    #[test]
+    fn timeout_can_complete_or_fault_the_root_execution() {
+        let mut complete_builder = StateTreeBuilder::new("timeout-complete");
+        let root = complete_builder.compound_root("root").unwrap();
+        let waiting = complete_builder.atomic("waiting", root).unwrap();
+        let done = complete_builder.final_state("done", root).unwrap();
+        complete_builder.initial(root, waiting).unwrap();
+        complete_builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(done),
+            )
+            .unwrap();
+        let mut complete = execution(&complete_builder.build().unwrap());
+
+        assert!(advance(&mut complete, Duration::from_secs(1)));
+        assert_eq!(complete.status(), &InstanceStatus::Complete);
+        assert!(!advance(&mut complete, Duration::from_secs(1)));
+
+        let mut fault_builder = StateTreeBuilder::new("timeout-fault");
+        let root = fault_builder.compound_root("root").unwrap();
+        let waiting = fault_builder.atomic("waiting", root).unwrap();
+        let first = fault_builder.atomic("first", root).unwrap();
+        let second = fault_builder.atomic("second", root).unwrap();
+        fault_builder.initial(root, waiting).unwrap();
+        fault_builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(first),
+            )
+            .unwrap();
+        fault_builder
+            .add_transition(first, StateTreeTransition::eventless().target(second))
+            .unwrap();
+        fault_builder
+            .add_transition(second, StateTreeTransition::eventless().target(first))
+            .unwrap();
+        let definition = fault_builder.build().unwrap();
+        let mut fault =
+            StateTreeExecution::<TestEvents>::new(&definition, NonZeroUsize::new(2).unwrap())
+                .unwrap();
+
+        assert!(fault.advance_time(Duration::from_secs(1), NonZeroUsize::new(2).unwrap()));
+        assert_eq!(
+            fault.status(),
+            &InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit: 2 })
+        );
+        assert!(!fault.advance_time(Duration::from_secs(1), NonZeroUsize::new(2).unwrap()));
     }
 }

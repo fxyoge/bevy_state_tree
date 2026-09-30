@@ -1,36 +1,43 @@
 use std::{
-    collections::HashMap,
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
     marker::PhantomData,
     num::NonZeroUsize,
+    ops::Range,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use bevy_app::{App, Plugin};
 use bevy_asset::{AssetApp, AssetServer, Assets};
 use bevy_ecs::{
     change_detection::DetectChangesMut,
-    entity::EntityHashSet,
+    entity::{EntityHashMap, EntityHashSet},
     prelude::{Component, Entity, Mut, Query, Res, ResMut, Resource, With},
     schedule::{InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemSet},
     system::{ParallelCommands, SystemParam},
 };
 use bevy_tasks::ComputeTaskPool;
+use bevy_time::Time;
+use bevy_utils::Parallel;
 
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
     StateTreeDomain, StateTreeInstance, StateTreeLinkError,
     definition::{CompiledDefinition, LinkedDefinition},
     effect::{BevyEffectSink, StateTreeEffectRegistry},
-    instance::PendingStateTree,
+    instance::{PendingStateTree, TimerToken, TimerUpdate},
     scxml::ScxmlLoader,
 };
 
 /// Ordered phases installed into each state-tree domain schedule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 pub enum StateTreeSet {
+    /// Delivers timers whose deadlines have elapsed.
+    ProcessTimers,
     /// Produces state-tree events that must be delivered in this schedule run.
     QueueEvents,
     /// Initializes instances whose definition assets are available.
@@ -100,6 +107,10 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             !app.world().contains_resource::<StateTreeEventIngress<D>>(),
             "StateTreePlugin was added more than once for this domain"
         );
+        assert!(
+            app.world().contains_resource::<Time>(),
+            "StateTreePlugin requires Bevy's TimePlugin to be installed first"
+        );
 
         if !app.world().contains_resource::<StateTreeAssetsInstalled>() {
             assert!(
@@ -117,12 +128,14 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
         }
 
         app.init_resource::<StateTreeEventIngress<D>>()
+            .init_resource::<StateTreeTimers<D>>()
             .init_resource::<LinkedStateTreeDefinitions<D>>()
             .init_resource::<StateTreeEffectRegistry<D>>()
             .init_resource::<StateTreeSettings<D>>()
             .configure_sets(
                 self.schedule,
                 (
+                    StateTreeSet::ProcessTimers,
                     StateTreeSet::QueueEvents,
                     StateTreeSet::Initialize,
                     StateTreeSet::ProcessEvents,
@@ -133,6 +146,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             .add_systems(
                 self.schedule,
                 (
+                    process_timers::<D>.in_set(StateTreeSet::ProcessTimers),
                     initialize_pending::<D>.in_set(StateTreeSet::Initialize),
                     process_events::<D>.in_set(StateTreeSet::ProcessEvents),
                 ),
@@ -271,6 +285,92 @@ impl<D: StateTreeDomain> Default for StateTreeEventIngress<D> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ScheduledTimer {
+    deadline: Duration,
+    entity: Entity,
+    token: TimerToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveTimer {
+    deadline: Duration,
+    entity: Entity,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EntityTimerUpdate {
+    entity: Entity,
+    update: TimerUpdate,
+}
+
+#[derive(Resource)]
+pub(crate) struct StateTreeTimers<D: StateTreeDomain> {
+    heap: BinaryHeap<Reverse<ScheduledTimer>>,
+    active: HashMap<TimerToken, ActiveTimer>,
+    staged: Parallel<Vec<EntityTimerUpdate>>,
+    merged: Vec<EntityTimerUpdate>,
+    marker: PhantomData<fn() -> D>,
+}
+
+impl<D: StateTreeDomain> Default for StateTreeTimers<D> {
+    fn default() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            active: HashMap::new(),
+            staged: Parallel::default(),
+            merged: Vec::new(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<D: StateTreeDomain> StateTreeTimers<D> {
+    fn apply(&mut self, entity: Entity, update: TimerUpdate) {
+        match update {
+            TimerUpdate::Arm { token, deadline } => {
+                self.active.insert(token, ActiveTimer { deadline, entity });
+                self.heap.push(Reverse(ScheduledTimer {
+                    deadline,
+                    entity,
+                    token,
+                }));
+            }
+            TimerUpdate::Cancel(token) => {
+                self.active.remove(&token);
+            }
+        }
+    }
+
+    fn apply_staged(&mut self) {
+        self.staged.drain_into(&mut self.merged);
+        for index in 0..self.merged.len() {
+            let update = self.merged[index];
+            self.apply(update.entity, update.update);
+        }
+        self.merged.clear();
+        self.compact_if_needed();
+    }
+
+    fn compact_if_needed(&mut self) {
+        if self.heap.len() > self.active.len().saturating_mul(2).saturating_add(1024) {
+            self.heap.retain(|Reverse(timer)| {
+                self.active.get(&timer.token)
+                    == Some(&ActiveTimer {
+                        deadline: timer.deadline,
+                        entity: timer.entity,
+                    })
+            });
+        }
+    }
+
+    pub(crate) fn cancel_tokens(&mut self, tokens: impl IntoIterator<Item = TimerToken>) {
+        for token in tokens {
+            self.active.remove(&token);
+        }
+    }
+}
+
 /// Writes one declared entity event to its target state-tree instance.
 ///
 /// Events are queued independently for each instance. Systems that require
@@ -393,10 +493,12 @@ fn initialize_pending<D: StateTreeDomain>(
     commands: ParallelCommands,
     definitions: Res<Assets<StateTreeDefinition>>,
     mut linked_definitions: ResMut<LinkedStateTreeDefinitions<D>>,
+    timer_runtime: (Res<Time>, ResMut<StateTreeTimers<D>>),
     effects: Res<StateTreeEffectRegistry<D>>,
     settings: Res<StateTreeSettings<D>>,
     mut instances: PendingStateTrees<'_, '_, D>,
 ) {
+    let (time, mut timers) = timer_runtime;
     for (entity, mut instance, previous_failure) in &mut instances {
         let Some(definition) = definitions.get(instance.definition()) else {
             if previous_failure.is_some() {
@@ -420,6 +522,7 @@ fn initialize_pending<D: StateTreeDomain>(
                 continue;
             }
         };
+        instance.set_time(time.elapsed());
         instance.initialize(
             linked,
             settings.max_microsteps.get(),
@@ -428,12 +531,29 @@ fn initialize_pending<D: StateTreeDomain>(
                 commands: &commands,
             },
         );
+        for update in instance.drain_timer_updates() {
+            timers.apply(entity, update);
+        }
         commands.command_scope(|mut commands| {
             commands
                 .entity(entity)
                 .remove::<(PendingStateTree<D>, StateTreeLinkFailure<D>)>();
         });
     }
+}
+
+fn stage_timer_updates<D: StateTreeDomain>(
+    instance: &mut StateTreeInstance<D>,
+    entity: Entity,
+    staged: &Parallel<Vec<EntityTimerUpdate>>,
+) {
+    staged.scope(|updates| {
+        updates.extend(
+            instance
+                .drain_timer_updates()
+                .map(|update| EntityTimerUpdate { entity, update }),
+        );
+    });
 }
 
 type StateTrees<'w, 's, D> = Query<
@@ -446,9 +566,110 @@ type StateTrees<'w, 's, D> = Query<
     ),
 >;
 
+type TimedStateTrees<'w, 's, D> = Query<'w, 's, (Entity, &'static mut StateTreeInstance<D>)>;
+
+fn process_timers<D: StateTreeDomain>(
+    commands: ParallelCommands,
+    time: Res<Time>,
+    settings: Res<StateTreeSettings<D>>,
+    mut timers: ResMut<StateTreeTimers<D>>,
+    mut instances: TimedStateTrees<'_, '_, D>,
+) {
+    let now = time.elapsed();
+    timers.compact_if_needed();
+    let mut due = Vec::new();
+    while timers
+        .heap
+        .peek()
+        .is_some_and(|Reverse(timer)| timer.deadline <= now)
+    {
+        let Reverse(timer) = timers.heap.pop().expect("peeked timer exists");
+        let active = ActiveTimer {
+            deadline: timer.deadline,
+            entity: timer.entity,
+        };
+        if timers.active.get(&timer.token) != Some(&active) {
+            continue;
+        }
+        timers.active.remove(&timer.token);
+        due.push(timer);
+    }
+    if due.is_empty() {
+        return;
+    }
+
+    let microstep_limit = settings.max_microsteps.get();
+    let parallel = ComputeTaskPool::try_get().is_some();
+    {
+        let staged = &timers.staged;
+        let mut start = 0;
+        while start < due.len() {
+            let deadline = due[start].deadline;
+            let mut end = start + 1;
+            while end < due.len() && due[end].deadline == deadline {
+                end += 1;
+            }
+            let mut by_entity = EntityHashMap::<Range<usize>>::default();
+            let mut entities = EntityHashSet::default();
+            let mut tokens = Vec::with_capacity(end - start);
+            for timer in &due[start..end] {
+                let index = tokens.len();
+                tokens.push(timer.token);
+                by_entity
+                    .entry(timer.entity)
+                    .and_modify(|range| range.end = index + 1)
+                    .or_insert(index..index + 1);
+                entities.insert(timer.entity);
+            }
+            let dense = entities.len().saturating_mul(4) >= instances.iter().len();
+            let process_instance =
+                |(entity, mut instance): (Entity, Mut<'_, StateTreeInstance<D>>)| {
+                    let Some(range) = by_entity.get(&entity) else {
+                        return;
+                    };
+                    let changed = {
+                        let instance = instance.bypass_change_detection();
+                        instance.set_time(now);
+                        instance.process_timers(
+                            &tokens[range.clone()],
+                            microstep_limit,
+                            Some(entity),
+                            &mut BevyEffectSink {
+                                commands: &commands,
+                            },
+                        )
+                    };
+                    stage_timer_updates(instance.bypass_change_detection(), entity, staged);
+                    if changed {
+                        instance.set_changed();
+                    }
+                };
+            if dense && parallel {
+                instances.par_iter_mut().for_each(&process_instance);
+            } else if dense {
+                for instance in &mut instances {
+                    process_instance(instance);
+                }
+            } else if parallel {
+                instances
+                    .par_iter_many_unique_mut(&entities)
+                    .for_each(&process_instance);
+            } else {
+                for instance in instances.iter_many_unique_mut(&entities) {
+                    process_instance(instance);
+                }
+            }
+            start = end;
+        }
+    }
+    timers.apply_staged();
+}
+
 fn process_events<D: StateTreeDomain>(
     commands: ParallelCommands,
     mut ingress: ResMut<StateTreeEventIngress<D>>,
+    time: Res<Time>,
+    mut timers: ResMut<StateTreeTimers<D>>,
     settings: Res<StateTreeSettings<D>>,
     mut instances: StateTrees<'_, '_, D>,
 ) {
@@ -466,73 +687,78 @@ fn process_events<D: StateTreeDomain>(
         return;
     }
     let microstep_limit = settings.max_microsteps.get();
-
-    let process_instance = |(entity, mut instance, inbox): (
-        Entity,
-        Mut<'_, StateTreeInstance<D>>,
-        &StateTreeEventInbox<D>,
-    )| {
-        let mut entity_events = inbox
-            .events
-            .lock()
-            .expect("state-tree event inbox poisoned");
-        if instance.status() == &InstanceStatus::Pending {
-            entity_events.clear();
-            return;
-        }
-
-        let mut broadcast_cursor = 0;
-
-        for event in entity_events.drain(..) {
-            if event.instance != instance.runtime_id() || event.batch != batch {
-                continue;
+    let now = time.elapsed();
+    {
+        let staged = &timers.staged;
+        let process_instance = |(entity, mut instance, inbox): (
+            Entity,
+            Mut<'_, StateTreeInstance<D>>,
+            &StateTreeEventInbox<D>,
+        )| {
+            instance.bypass_change_detection().set_time(now);
+            let mut entity_events = inbox
+                .events
+                .lock()
+                .expect("state-tree event inbox poisoned");
+            if instance.status() == &InstanceStatus::Pending {
+                entity_events.clear();
+                return;
             }
-            debug_assert!(event.broadcasts_before <= broadcasts.len());
-            while broadcast_cursor < event.broadcasts_before {
+
+            let mut broadcast_cursor = 0;
+
+            for event in entity_events.drain(..) {
+                if event.instance != instance.runtime_id() || event.batch != batch {
+                    continue;
+                }
+                debug_assert!(event.broadcasts_before <= broadcasts.len());
+                while broadcast_cursor < event.broadcasts_before {
+                    process_external_event(
+                        &mut instance,
+                        &broadcasts[broadcast_cursor],
+                        microstep_limit,
+                        entity,
+                        &commands,
+                    );
+                    broadcast_cursor += 1;
+                }
                 process_external_event(
                     &mut instance,
-                    &broadcasts[broadcast_cursor],
+                    &event.event,
                     microstep_limit,
                     entity,
                     &commands,
                 );
-                broadcast_cursor += 1;
             }
-            process_external_event(
-                &mut instance,
-                &event.event,
-                microstep_limit,
-                entity,
-                &commands,
-            );
-        }
 
-        for event in &broadcasts[broadcast_cursor..] {
-            process_external_event(&mut instance, event, microstep_limit, entity, &commands);
-        }
-    };
+            for event in &broadcasts[broadcast_cursor..] {
+                process_external_event(&mut instance, event, microstep_limit, entity, &commands);
+            }
+            stage_timer_updates(instance.bypass_change_detection(), entity, staged);
+        };
 
-    let parallel = ComputeTaskPool::try_get().is_some();
-    if broadcasts.is_empty() && parallel {
-        instances
-            .par_iter_many_unique_mut(&*dirty_entities)
-            .for_each(&process_instance);
-    } else if broadcasts.is_empty() {
-        for instance in instances.iter_many_unique_mut(&*dirty_entities) {
-            process_instance(instance);
-        }
-    } else if parallel {
-        instances.par_iter_mut().for_each(&process_instance);
-    } else {
-        for instance in &mut instances {
-            process_instance(instance);
+        let parallel = ComputeTaskPool::try_get().is_some();
+        if broadcasts.is_empty() && parallel {
+            instances
+                .par_iter_many_unique_mut(&*dirty_entities)
+                .for_each(&process_instance);
+        } else if broadcasts.is_empty() {
+            for instance in instances.iter_many_unique_mut(&*dirty_entities) {
+                process_instance(instance);
+            }
+        } else if parallel {
+            instances.par_iter_mut().for_each(&process_instance);
+        } else {
+            for instance in &mut instances {
+                process_instance(instance);
+            }
         }
     }
-
     broadcasts.clear();
     dirty_entities.clear();
     *ingress.batch.get_mut() = batch.wrapping_add(1);
     *ingress.published_broadcasts.get_mut() = 0;
+    timers.apply_staged();
 }
 
 fn process_external_event<D: StateTreeDomain>(
@@ -564,6 +790,7 @@ mod tests {
         schedule::ScheduleBuildSettings,
         system::{In, RunSystemOnce},
     };
+    use bevy_time::TimePlugin;
 
     use super::*;
     use crate::{
@@ -655,10 +882,26 @@ mod tests {
         builder.build().unwrap()
     }
 
+    fn timeout_definition() -> StateTreeDefinition {
+        let mut builder = StateTreeBuilder::new("timeout");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let elapsed = builder.atomic("elapsed", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(elapsed),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    }
+
     fn app() -> App {
         let mut app = App::new();
         app.add_plugins((
             TaskPoolPlugin::default(),
+            TimePlugin,
             AssetPlugin {
                 file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets").into(),
                 watch_for_changes_override: Some(false),
@@ -826,7 +1069,7 @@ mod tests {
     #[test]
     fn plugin_preserves_an_existing_definition_asset_store() {
         let mut app = App::new();
-        app.add_plugins(AssetPlugin::default())
+        app.add_plugins((TimePlugin, AssetPlugin::default()))
             .init_asset::<StateTreeDefinition>();
         let handle = app
             .world_mut()
@@ -918,6 +1161,132 @@ mod tests {
             .last()
             .unwrap()
             .to_owned()
+    }
+
+    fn advance_clock(app: &mut App, duration: Duration) {
+        app.world_mut().resource_mut::<Time>().advance_by(duration);
+        app.world_mut().run_schedule(Update);
+    }
+
+    #[test]
+    fn bevy_clock_delivers_due_after_transitions() {
+        let mut app = app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(timeout_definition());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+
+        advance_clock(&mut app, Duration::from_millis(999));
+        assert_eq!(active_leaf(&app, entity), "waiting");
+        advance_clock(&mut app, Duration::from_millis(1));
+        assert_eq!(active_leaf(&app, entity), "elapsed");
+    }
+
+    #[test]
+    fn due_timeout_precedes_an_external_event_in_the_same_schedule_run() {
+        let mut builder = StateTreeBuilder::new("timeout-order");
+        let root = builder.compound_root("root").unwrap();
+        let waiting = builder.atomic("waiting", root).unwrap();
+        let timed_out = builder.atomic("timed-out", root).unwrap();
+        let event_won = builder.atomic("event-won", root).unwrap();
+        builder.initial(root, waiting).unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::after(Duration::from_secs(1)).target(timed_out),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                waiting,
+                StateTreeTransition::on("advance").target(event_won),
+            )
+            .unwrap();
+        let mut app = app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(builder.build().unwrap());
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle))
+            .id();
+        app.update();
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        queue_advance(&mut app, entity);
+        app.world_mut().run_schedule(Update);
+
+        assert_eq!(active_leaf(&app, entity), "timed-out");
+    }
+
+    #[test]
+    fn removing_or_replacing_an_instance_invalidates_its_stale_timers() {
+        let mut app = app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(timeout_definition());
+        let removed = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .id();
+        let replaced = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<StateTreeTimers<Simulation>>()
+                .active
+                .len(),
+            2
+        );
+
+        app.world_mut()
+            .entity_mut(removed)
+            .remove::<StateTreeInstance<Simulation>>();
+        assert_eq!(
+            app.world()
+                .resource::<StateTreeTimers<Simulation>>()
+                .active
+                .len(),
+            1
+        );
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(500));
+        app.world_mut()
+            .entity_mut(replaced)
+            .insert(StateTreeInstance::<Simulation>::new(handle));
+        app.world_mut().run_schedule(Update);
+
+        advance_clock(&mut app, Duration::from_millis(500));
+
+        assert!(
+            app.world()
+                .get::<StateTreeInstance<Simulation>>(removed)
+                .is_none()
+        );
+        assert_eq!(active_leaf(&app, replaced), "waiting");
+
+        advance_clock(&mut app, Duration::from_millis(500));
+
+        assert_eq!(active_leaf(&app, replaced), "elapsed");
+        assert!(
+            app.world()
+                .resource::<StateTreeTimers<Simulation>>()
+                .active
+                .is_empty()
+        );
     }
 
     #[test]

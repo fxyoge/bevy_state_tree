@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::definition::assert_definition_semantics_eq;
 use crate::{
     BuildError, StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeDefinition,
@@ -27,6 +29,7 @@ definition_parity_test!(hierarchy_parity, "hierarchy", hierarchy_definition);
 definition_parity_test!(transition_parity, "transitions", transition_definition);
 definition_parity_test!(action_parity, "actions", action_definition);
 definition_parity_test!(minimal_luau_parity, "minimal_luau", minimal_luau_definition);
+definition_parity_test!(after_transition_parity, "after", after_definition);
 
 fn hierarchy_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("hierarchy");
@@ -141,5 +144,18 @@ fn minimal_luau_definition() -> Result<StateTreeDefinition, BuildError> {
     let state = builder.atomic("#anonymous0", root)?;
     builder.initial(root, state)?;
     builder.add_transition(state, StateTreeTransition::eventless().condition("false"))?;
+    builder.build()
+}
+
+fn after_definition() -> Result<StateTreeDefinition, BuildError> {
+    let mut builder = StateTreeBuilder::new("after-transitions");
+    let root = builder.compound_root("#document")?;
+    let waiting = builder.atomic("waiting", root)?;
+    let done = builder.final_state("done", root)?;
+    builder.initial(root, waiting)?;
+    builder.add_transition(
+        waiting,
+        StateTreeTransition::after(Duration::from_millis(250)).target(done),
+    )?;
     builder.build()
 }

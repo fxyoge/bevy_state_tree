@@ -81,6 +81,33 @@ interpreter shutdown, completion does not execute the final state's exit
 actions. Applications should put terminal output on final entry or the incoming
 transition and let ECS lifecycle code replace or remove the completed instance.
 
+## After Transitions
+
+The Bevy extension namespace adds state-scoped after transitions with the
+`bst:after` transition attribute:
+
+```xml
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree">
+  <state id="waiting">
+    <transition bst:after="250ms" target="ready"/>
+  </state>
+  <state id="ready"/>
+</scxml>
+```
+
+The value is a positive static duration: an integer or decimal number followed
+immediately by `ms` or `s`, such as `250ms`, `1s`, or `1.5s`. Zero, signs,
+exponents, non-finite values, overflow, whitespace, and other units are
+rejected. `bst:after` cannot be combined with `event` on one transition.
+
+An after transition is scoped to its source state. Its timeout starts when that
+state is entered, is discarded when the state exits, and starts fresh on
+re-entry. A pending timeout is considered before external events for the same
+processing point. After transitions are not eventless transitions and therefore
+do not participate in eventless stabilization merely because they omit
+`event`.
+
 ## Send
 
 SCXML `<send>` will not be supported. Its generic string event, dynamic

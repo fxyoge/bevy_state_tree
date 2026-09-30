@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use bevy_app::{App, TaskPoolPlugin};
 use bevy_asset::{AssetPlugin, AssetServer, Assets, Handle, LoadState};
 use bevy_ecs::{
@@ -14,6 +16,8 @@ use bevy_state_tree::{
     StateTreeDefinition, StateTreeEvents, StateTreeInstance, StateTreePlugin, StateTreeSet,
     StateTreeTransition,
 };
+use bevy_tasks::{AsyncComputeTaskPool, IoTaskPool, TaskPoolBuilder};
+use bevy_time::{Time, TimePlugin};
 
 const TOGGLE: &str = "tests/scxml/benchmark_toggle.scxml";
 const LUAU: &str = "tests/scxml/benchmark_luau.scxml";
@@ -79,8 +83,14 @@ pub struct BenchmarkApp {
 impl BenchmarkApp {
     pub fn empty(definition: BenchmarkDefinition, executor: Executor) -> Self {
         let mut app = App::new();
+        if matches!(executor, Executor::Parallel) {
+            app.add_plugins(TaskPoolPlugin::default());
+        } else {
+            IoTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(1).build());
+            AsyncComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(1).build());
+        }
         app.add_plugins((
-            TaskPoolPlugin::default(),
+            TimePlugin,
             AssetPlugin {
                 file_path: env!("CARGO_MANIFEST_DIR").into(),
                 watch_for_changes_override: Some(false),
@@ -158,6 +168,13 @@ impl BenchmarkApp {
 
     pub fn run_schedule(&mut self) {
         self.app.world_mut().run_schedule(AiUpdate);
+    }
+
+    pub fn advance_time(&mut self, duration: Duration) {
+        self.app
+            .world_mut()
+            .resource_mut::<Time>()
+            .advance_by(duration);
     }
 
     pub fn queue_broadcast(&mut self) {
@@ -327,6 +344,21 @@ pub fn transition_scan_definition(candidates: usize) -> BenchmarkDefinition {
         .unwrap();
     builder
         .add_transition(right, StateTreeTransition::on("tick").target(left))
+        .unwrap();
+    BenchmarkDefinition::Generated(builder.build().unwrap())
+}
+
+pub fn timer_definition(duration: Duration) -> BenchmarkDefinition {
+    let mut builder = StateTreeBuilder::new("timer");
+    let root = builder.compound_root("root").unwrap();
+    let waiting = builder.atomic("waiting", root).unwrap();
+    let elapsed = builder.atomic("elapsed", root).unwrap();
+    builder.initial(root, waiting).unwrap();
+    builder
+        .add_transition(
+            waiting,
+            StateTreeTransition::after(duration).target(elapsed),
+        )
         .unwrap();
     BenchmarkDefinition::Generated(builder.build().unwrap())
 }

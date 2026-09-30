@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// A complete parsed SCXML document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
@@ -30,6 +32,8 @@ pub enum Capability {
     DeepHistory,
     /// An eventless transition is present.
     EventlessTransition,
+    /// A state-scoped after transition is present.
+    AfterTransition,
     /// A transition has more than one event descriptor.
     MultiEventTransition,
     /// A transition has more than one target.
@@ -221,6 +225,7 @@ pub struct Transition {
     pub span: Span,
     pub event: Option<String>,
     pub events: Vec<String>,
+    pub after: Option<Duration>,
     pub condition: Option<String>,
     pub targets: Vec<String>,
     pub transition_type: Option<TransitionType>,

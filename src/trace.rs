@@ -28,6 +28,7 @@ impl StateTreeTrace for NoStateTreeTrace {
 pub enum StateTreeTraceTrigger<'a> {
     Initialization,
     ExternalEvent(&'a str),
+    Timer,
 }
 
 /// One semantic operation in a state-tree execution.
@@ -103,6 +104,9 @@ impl StateTreeTrace for StateTreeEventLog {
             } => {
                 writeln!(self.output, "macrostep external {event:?}").unwrap();
             }
+            StateTreeTraceRecord::MacrostepStarted {
+                trigger: StateTreeTraceTrigger::Timer,
+            } => self.output.push_str("macrostep timer\n"),
             StateTreeTraceRecord::MicrostepStarted { index } => {
                 writeln!(self.output, "microstep {index}").unwrap();
             }
