@@ -9,7 +9,9 @@ struct StateTreeUpdate;
 
 struct TestDomain;
 
-impl StateTreeDomain for TestDomain {}
+impl StateTreeDomain for TestDomain {
+    fn configure(_config: &mut StateTreeConfig<'_, Self>) {}
+}
 
 fn test_app() -> App {
     let mut app = App::new();

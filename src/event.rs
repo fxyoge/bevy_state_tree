@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use bevy_app::App;
 use bevy_ecs::event::{EntityEvent, Event};
 use thiserror::Error;
 
@@ -26,7 +27,10 @@ impl StateTreeEventDataError {
 }
 
 /// Identifies one independent state-tree runtime.
-pub trait StateTreeDomain: Send + Sync + 'static {}
+pub trait StateTreeDomain: Send + Sync + 'static + Sized {
+    /// Declares this domain's complete typed protocol.
+    fn configure(config: &mut crate::StateTreeConfig<'_, Self>);
+}
 
 /// One external event payload accepted by a state-tree domain.
 ///
@@ -50,20 +54,17 @@ pub trait BroadcastStateTreeEvent<D: StateTreeDomain>: StateTreeEvent<D> {}
 
 /// Invalid state-tree event protocol registration.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum StateTreeEventRegistrationError {
+pub(crate) enum StateTreeEventRegistrationError {
     /// The same Rust payload type was registered more than once.
     #[error("state-tree event payload type `{type_name}` is already registered")]
     DuplicateType { type_name: &'static str },
-    /// Execution has already frozen this domain's event protocol.
-    #[error("the state-tree event protocol is already frozen")]
-    Frozen,
     /// Authored event names must contain at least one character.
     #[error("state-tree event payload type `{type_name}` has an empty authored name")]
     EmptyName { type_name: &'static str },
 }
 
 /// Builds an open external event protocol for one state-tree domain.
-pub struct StateTreeEventRegistry<D: StateTreeDomain> {
+pub(crate) struct StateTreeEventRegistry<D: StateTreeDomain> {
     entries: Vec<RegisteredEvent>,
     type_ids: HashMap<TypeId, RegisteredEventId>,
     frozen: OnceLock<StateTreeEventProtocol<D>>,
@@ -100,7 +101,7 @@ impl<D: StateTreeDomain> Default for StateTreeEventRegistry<D> {
 
 impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
     /// Creates an empty event protocol builder.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
             type_ids: HashMap::new(),
@@ -110,13 +111,10 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
     }
 
     /// Registers one concrete event payload in insertion order.
-    pub fn register<E>(&mut self) -> Result<&mut Self, StateTreeEventRegistrationError>
+    pub(crate) fn register<E>(&mut self) -> Result<&mut Self, StateTreeEventRegistrationError>
     where
         E: StateTreeEvent<D>,
     {
-        if self.frozen.get().is_some() {
-            return Err(StateTreeEventRegistrationError::Frozen);
-        }
         if E::AUTHORED_NAME.is_empty() {
             return Err(StateTreeEventRegistrationError::EmptyName {
                 type_name: type_name::<E>(),
@@ -141,7 +139,8 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
     }
 
     /// Freezes this builder into an immutable, cheaply cloneable protocol.
-    pub fn freeze(&self) -> StateTreeEventProtocol<D> {
+    #[cfg(test)]
+    pub(crate) fn freeze(&self) -> StateTreeEventProtocol<D> {
         self.protocol().clone()
     }
 
@@ -165,9 +164,26 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
 }
 
 /// An immutable external event protocol for one state-tree domain.
-pub struct StateTreeEventProtocol<D: StateTreeDomain> {
+pub(crate) struct StateTreeEventProtocol<D: StateTreeDomain> {
     inner: Arc<StateTreeEventProtocolInner>,
     marker: PhantomData<fn() -> D>,
+}
+
+pub(crate) fn register_event<D, E>(app: &mut App)
+where
+    D: StateTreeDomain,
+    E: StateTreeEvent<D>,
+{
+    let result = app
+        .world_mut()
+        .resource_mut::<StateTreeAppEventRegistry<D>>()
+        .register::<E>();
+    if let Err(error) = result {
+        panic!(
+            "failed to register state-tree event `{}`: {error}",
+            type_name::<E>()
+        );
+    }
 }
 
 impl<D: StateTreeDomain> Clone for StateTreeEventProtocol<D> {
@@ -213,6 +229,7 @@ impl<D: StateTreeDomain> StateTreeEventProtocol<D> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn borrowed_event<'a, E>(&'a self, event: &'a E) -> Option<StateTreeEventRef<'a, D>>
     where
         E: StateTreeEvent<D>,
@@ -343,22 +360,21 @@ where
 mod tests {
     use std::{
         any::{TypeId, type_name},
-        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
     };
 
-    use bevy_app::App;
     use bevy_ecs::event::Event;
 
     use super::*;
-    use crate::StateTreeAppExt;
 
     struct TestDomain;
 
-    impl StateTreeDomain for TestDomain {}
+    impl StateTreeDomain for TestDomain {
+        fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
+    }
 
     #[derive(Event)]
     struct First(u32);
@@ -470,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn freeze_is_idempotent_cloneable_and_rejects_registration() {
+    fn freeze_is_idempotent_and_cloneable() {
         let mut registry = StateTreeEventRegistry::<TestDomain>::new();
         registry.register::<First>().unwrap();
 
@@ -479,10 +495,6 @@ mod tests {
         let cloned = first.clone();
         assert!(Arc::ptr_eq(&first.inner, &second.inner));
         assert!(Arc::ptr_eq(&first.inner, &cloned.inner));
-        assert_eq!(
-            registry.register::<Second>().err().unwrap(),
-            StateTreeEventRegistrationError::Frozen
-        );
     }
 
     #[test]
@@ -544,19 +556,5 @@ mod tests {
         assert_eq!(PROJECTIONS.load(Ordering::Relaxed), 0);
         assert_eq!(view.event_data().unwrap(), Some(LuauValue::Integer(23)));
         assert_eq!(PROJECTIONS.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn app_registration_after_freeze_panics() {
-        let mut app = App::new();
-        app.register_state_tree_event::<TestDomain, First>();
-        app.world()
-            .resource::<StateTreeAppEventRegistry<TestDomain>>()
-            .protocol();
-
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            app.register_state_tree_event::<TestDomain, Second>();
-        }));
-        assert!(result.is_err());
     }
 }

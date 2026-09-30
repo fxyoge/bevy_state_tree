@@ -1,8 +1,6 @@
 use std::{
-    any::type_name,
     collections::VecDeque,
     marker::PhantomData,
-    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -16,22 +14,17 @@ use bevy_ecs::{
 };
 
 use crate::activity::{
-    ErasedActivityToken, HeadlessActivitySink, RejectActivities, RuntimeActivitySink,
-    RuntimeActivityStart, StateTreeActivityInbox, StateTreeActivitySink,
-    StateTreeHeadlessActivityToken,
+    ErasedActivityToken, RuntimeActivitySink, RuntimeActivityStart, StateTreeActivityInbox,
 };
 use crate::definition::{
     Action, ActivityId, CompiledDefinition, Entry, EventId, EventSet, ExpressionId, HistoryIndex,
     LinkedDefinition, StateId, StateKind, StateTreeTarget, TimerId, Transition, TransitionTrigger,
 };
-use crate::effect::{
-    HeadlessEffectSink, RejectEffects, RuntimeEffectSink, StateTreeEffectArgs,
-    StateTreeEffectContext, StateTreeEffectSink,
-};
+use crate::effect::{RuntimeEffectSink, StateTreeEffectArgs, StateTreeEffectContext};
 use crate::{
     LuauValue, NoStateTreeTrace, StateTreeActivityArgs, StateTreeDefinition, StateTreeDomain,
-    StateTreeEvent, StateTreeEventProtocol, StateTreeEventRef, StateTreeHistoryResolution,
-    StateTreeLinkError, StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, luau,
+    StateTreeEventRef, StateTreeHistoryResolution, StateTreeTrace, StateTreeTraceRecord,
+    StateTreeTraceTrigger, luau,
     plugin::{StateTreeEventInbox, StateTreeTimers},
 };
 
@@ -165,7 +158,7 @@ struct ActionContext<'a, D: StateTreeDomain> {
     event_name: Option<&'a str>,
     external_event: Option<StateTreeEventRef<'a, D>>,
     event_data: Option<&'a LuauValue>,
-    entity: Option<Entity>,
+    entity: Entity,
 }
 
 impl<D: StateTreeDomain> Clone for ActionContext<'_, D> {
@@ -199,962 +192,6 @@ impl<'a, D: StateTreeDomain> Trigger<'a, D> {
         match self {
             Self::Eventless(_, _, data) | Self::Internal(_, data) => *data,
             Self::External(..) | Self::After(_) => None,
-        }
-    }
-}
-
-/// A headless execution of one compiled state tree.
-///
-/// This uses the same linked definition and macrostep engine as
-/// [`StateTreeInstance`], without requiring a Bevy [`World`](bevy_ecs::world::World).
-/// Construction performs all definition linking and reserves runtime storage.
-pub struct StateTreeExecution<D: StateTreeDomain> {
-    instance: StateTreeInstance<D>,
-    protocol: StateTreeEventProtocol<D>,
-    now: Duration,
-    timers: Vec<(Duration, TimerToken)>,
-}
-
-impl<D: StateTreeDomain> StateTreeExecution<D> {
-    /// Links and initializes a definition for headless execution.
-    ///
-    /// Linking fails when an authored event descriptor cannot match either the
-    /// typed event protocol or an event produced internally by the definition.
-    pub fn new(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_with_initial_data(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-        )
-    }
-
-    /// Links and initializes a definition with instance-local initial data.
-    pub fn new_with_initial_data(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut RejectEffects,
-            &mut RejectActivities,
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Links and initializes a definition while delivering effects to `sink`.
-    pub fn new_with_sink<S: StateTreeEffectSink<D> + ?Sized>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_with_initial_data_and_sink(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-            sink,
-        )
-    }
-
-    /// Links and initializes with initial data while delivering effects to `sink`.
-    pub fn new_with_initial_data_and_sink<S: StateTreeEffectSink<D> + ?Sized>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        sink: &mut S,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut HeadlessEffectSink { sink },
-            &mut RejectActivities,
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Links and initializes a definition while delivering activity starts.
-    pub fn new_with_activity_sink<S: StateTreeActivitySink<D> + ?Sized>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_with_initial_data_and_activity_sink(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-            sink,
-        )
-    }
-
-    /// Links and initializes with initial data while delivering activity starts.
-    pub fn new_with_initial_data_and_activity_sink<S: StateTreeActivitySink<D> + ?Sized>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        sink: &mut S,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut RejectEffects,
-            &mut HeadlessActivitySink { sink },
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Links and initializes while delivering both effects and activity lifecycle changes.
-    pub fn new_with_sinks<ES, AS>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-    ) -> Result<Self, StateTreeLinkError>
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-    {
-        Self::new_with_initial_data_and_sinks(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-            effects,
-            activities,
-        )
-    }
-
-    /// Links and initializes with initial data and both output sinks.
-    pub fn new_with_initial_data_and_sinks<ES, AS>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        effects: &mut ES,
-        activities: &mut AS,
-    ) -> Result<Self, StateTreeLinkError>
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-    {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Links and initializes with both output sinks and semantic tracing.
-    pub fn new_traced_with_sinks<ES, AS, T>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError>
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        Self::new_traced_with_initial_data_and_sinks(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-            effects,
-            activities,
-            trace,
-        )
-    }
-
-    /// Links and initializes with initial data, both output sinks, and tracing.
-    pub fn new_traced_with_initial_data_and_sinks<ES, AS, T>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        effects: &mut ES,
-        activities: &mut AS,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError>
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            trace,
-        )
-    }
-
-    /// Links and initializes while delivering activities and semantic traces.
-    pub fn new_traced_with_activity_sink<
-        S: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_traced_with_initial_data_and_activity_sink(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-            sink,
-            trace,
-        )
-    }
-
-    /// Links and initializes with initial data, activity delivery, and tracing.
-    pub fn new_traced_with_initial_data_and_activity_sink<
-        S: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut RejectEffects,
-            &mut HeadlessActivitySink { sink },
-            trace,
-        )
-    }
-
-    /// Links and initializes a definition while writing its semantic trace.
-    pub fn new_traced<T: StateTreeTrace + ?Sized>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_traced_with_initial_data(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-            trace,
-        )
-    }
-
-    /// Links and initializes with initial data while writing its semantic trace.
-    pub fn new_traced_with_initial_data<T: StateTreeTrace + ?Sized>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut RejectEffects,
-            &mut RejectActivities,
-            trace,
-        )
-    }
-
-    /// Links and initializes a definition while delivering effects and tracing execution.
-    pub fn new_traced_with_sink<S: StateTreeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_traced_with_initial_data_and_sink(
-            definition,
-            protocol,
-            microstep_limit,
-            StateTreeDataOverrides::default(),
-            sink,
-            trace,
-        )
-    }
-
-    /// Links and initializes with initial data, effect delivery, and tracing.
-    pub fn new_traced_with_initial_data_and_sink<
-        S: StateTreeEffectSink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError> {
-        Self::new_inner(
-            definition,
-            protocol,
-            microstep_limit,
-            initial_data,
-            &mut HeadlessEffectSink { sink },
-            &mut RejectActivities,
-            trace,
-        )
-    }
-
-    fn new_inner<S, A, T>(
-        definition: &StateTreeDefinition,
-        protocol: StateTreeEventProtocol<D>,
-        microstep_limit: NonZeroUsize,
-        initial_data: StateTreeDataOverrides,
-        effects: &mut S,
-        activities: &mut A,
-        trace: &mut T,
-    ) -> Result<Self, StateTreeLinkError>
-    where
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        let linked = Arc::new(LinkedDefinition::<D>::new(
-            Arc::clone(&definition.compiled),
-            &protocol,
-            None,
-            None,
-        )?);
-        let mut instance =
-            StateTreeInstance::new_with_initial_data(Handle::default(), initial_data);
-        instance.initialize_traced(
-            linked,
-            microstep_limit.get(),
-            None,
-            effects,
-            activities,
-            trace,
-        );
-        let mut execution = Self {
-            instance,
-            protocol,
-            now: Duration::ZERO,
-            timers: Vec::new(),
-        };
-        execution.apply_timer_updates();
-        Ok(execution)
-    }
-
-    /// Returns the current execution status.
-    pub fn status(&self) -> &InstanceStatus {
-        self.instance.status()
-    }
-
-    /// Returns the active authored state names in canonical definition order.
-    pub fn active_state_names(&self) -> impl Iterator<Item = &str> {
-        self.instance.active_state_names()
-    }
-
-    /// Returns one instance-local Luau datamodel value by authored id.
-    pub fn data(&self, name: &str) -> Option<&LuauValue> {
-        self.instance.data(name)
-    }
-
-    /// Processes one external event through a complete macrostep.
-    pub fn process_event<E: StateTreeEvent<D>>(
-        &mut self,
-        event: &E,
-        microstep_limit: NonZeroUsize,
-    ) -> bool {
-        self.process_event_traced(event, microstep_limit, &mut NoStateTreeTrace)
-    }
-
-    /// Processes one external event while delivering effects to `sink`.
-    pub fn process_event_with_sink<E: StateTreeEvent<D>, S: StateTreeEffectSink<D> + ?Sized>(
-        &mut self,
-        event: &E,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> bool {
-        let event = self.protocol.borrowed_event(event).unwrap_or_else(|| {
-            panic!(
-                "state-tree event payload type `{}` is not registered in this execution's protocol",
-                type_name::<E>()
-            )
-        });
-        let processed = self.instance.process_event_traced(
-            event,
-            microstep_limit.get(),
-            None,
-            &mut HeadlessEffectSink { sink },
-            &mut RejectActivities,
-            &mut NoStateTreeTrace,
-        );
-        self.apply_timer_updates();
-        processed
-    }
-
-    /// Processes one external event while delivering activity lifecycle changes.
-    pub fn process_event_with_activity_sink<
-        E: StateTreeEvent<D>,
-        S: StateTreeActivitySink<D> + ?Sized,
-    >(
-        &mut self,
-        event: &E,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> bool {
-        let event = self.protocol.borrowed_event(event).unwrap_or_else(|| {
-            panic!(
-                "state-tree event payload type `{}` is not registered in this execution's protocol",
-                type_name::<E>()
-            )
-        });
-        let processed = self.instance.process_event_traced(
-            event,
-            microstep_limit.get(),
-            None,
-            &mut RejectEffects,
-            &mut HeadlessActivitySink { sink },
-            &mut NoStateTreeTrace,
-        );
-        self.apply_timer_updates();
-        processed
-    }
-
-    /// Processes one external event while delivering both effects and activities.
-    pub fn process_event_with_sinks<E: StateTreeEvent<D>, ES, AS>(
-        &mut self,
-        event: &E,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-    {
-        self.process_event_traced_with_sinks(
-            event,
-            microstep_limit,
-            effects,
-            activities,
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Processes one external event with both output sinks and semantic tracing.
-    pub fn process_event_traced_with_sinks<E: StateTreeEvent<D>, ES, AS, T>(
-        &mut self,
-        event: &E,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-        trace: &mut T,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        let event = self.protocol.borrowed_event(event).unwrap_or_else(|| {
-            panic!(
-                "state-tree event payload type `{}` is not registered in this execution's protocol",
-                type_name::<E>()
-            )
-        });
-        let processed = self.instance.process_event_traced(
-            event,
-            microstep_limit.get(),
-            None,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            trace,
-        );
-        self.apply_timer_updates();
-        processed
-    }
-
-    /// Completes one current activity run with portable Luau event data.
-    pub fn complete_activity<S: StateTreeActivitySink<D> + ?Sized>(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> bool {
-        self.process_activity(
-            token,
-            crate::activity::ActivityOutcomeKind::Complete,
-            data,
-            microstep_limit,
-            sink,
-        )
-    }
-
-    /// Fails one current activity run with portable Luau event data.
-    pub fn fail_activity<S: StateTreeActivitySink<D> + ?Sized>(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> bool {
-        self.process_activity(
-            token,
-            crate::activity::ActivityOutcomeKind::Fail,
-            data,
-            microstep_limit,
-            sink,
-        )
-    }
-
-    /// Completes an activity while delivering both effects and activity changes.
-    pub fn complete_activity_with_sinks<ES, AS>(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-    {
-        self.process_activity_with_sinks(
-            (token, crate::activity::ActivityOutcomeKind::Complete, data),
-            microstep_limit,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Fails an activity while delivering both effects and activity changes.
-    pub fn fail_activity_with_sinks<ES, AS>(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-    {
-        self.process_activity_with_sinks(
-            (token, crate::activity::ActivityOutcomeKind::Fail, data),
-            microstep_limit,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Completes one activity while writing its semantic macrostep trace.
-    pub fn complete_activity_traced<
-        S: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> bool {
-        self.process_activity_with_sinks(
-            (token, crate::activity::ActivityOutcomeKind::Complete, data),
-            microstep_limit,
-            &mut RejectEffects,
-            &mut HeadlessActivitySink { sink },
-            trace,
-        )
-    }
-
-    /// Fails one activity while writing its semantic macrostep trace.
-    pub fn fail_activity_traced<
-        S: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> bool {
-        self.process_activity_with_sinks(
-            (token, crate::activity::ActivityOutcomeKind::Fail, data),
-            microstep_limit,
-            &mut RejectEffects,
-            &mut HeadlessActivitySink { sink },
-            trace,
-        )
-    }
-
-    /// Completes an activity with both output sinks and semantic tracing.
-    pub fn complete_activity_traced_with_sinks<ES, AS, T>(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-        trace: &mut T,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        self.process_activity_with_sinks(
-            (token, crate::activity::ActivityOutcomeKind::Complete, data),
-            microstep_limit,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            trace,
-        )
-    }
-
-    /// Fails an activity with both output sinks and semantic tracing.
-    pub fn fail_activity_traced_with_sinks<ES, AS, T>(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-        trace: &mut T,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        self.process_activity_with_sinks(
-            (token, crate::activity::ActivityOutcomeKind::Fail, data),
-            microstep_limit,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            trace,
-        )
-    }
-
-    fn process_activity<S: StateTreeActivitySink<D> + ?Sized>(
-        &mut self,
-        token: StateTreeHeadlessActivityToken,
-        kind: crate::activity::ActivityOutcomeKind,
-        data: Option<LuauValue>,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> bool {
-        self.process_activity_with_sinks(
-            (token, kind, data),
-            microstep_limit,
-            &mut RejectEffects,
-            &mut HeadlessActivitySink { sink },
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    fn process_activity_with_sinks<ES, AS, T>(
-        &mut self,
-        outcome: (
-            StateTreeHeadlessActivityToken,
-            crate::activity::ActivityOutcomeKind,
-            Option<LuauValue>,
-        ),
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-        trace: &mut T,
-    ) -> bool
-    where
-        ES: RuntimeEffectSink<D> + ?Sized,
-        AS: RuntimeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        let (token, kind, data) = outcome;
-        let outcome = crate::activity::ActivityOutcome {
-            token: ErasedActivityToken {
-                entity: Entity::PLACEHOLDER,
-                runtime_id: token.runtime_id,
-                activity: token.activity,
-                generation: token.generation,
-            },
-            kind,
-            data: Ok(data),
-        };
-        let processed = self.instance.process_activity_outcome_traced(
-            outcome,
-            microstep_limit.get(),
-            None,
-            effects,
-            activities,
-            trace,
-        );
-        self.apply_timer_updates();
-        processed
-    }
-
-    /// Processes one external event while writing its complete semantic trace.
-    pub fn process_event_traced<E: StateTreeEvent<D>, T: StateTreeTrace + ?Sized>(
-        &mut self,
-        event: &E,
-        microstep_limit: NonZeroUsize,
-        trace: &mut T,
-    ) -> bool {
-        let event = self.protocol.borrowed_event(event).unwrap_or_else(|| {
-            panic!(
-                "state-tree event payload type `{}` is not registered in this execution's protocol",
-                type_name::<E>()
-            )
-        });
-        let processed = self.instance.process_event_traced(
-            event,
-            microstep_limit.get(),
-            None,
-            &mut RejectEffects,
-            &mut RejectActivities,
-            trace,
-        );
-        self.apply_timer_updates();
-        processed
-    }
-
-    /// Processes one external event while delivering effects and tracing execution.
-    pub fn process_event_traced_with_sink<
-        E: StateTreeEvent<D>,
-        S: StateTreeEffectSink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        &mut self,
-        event: &E,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> bool {
-        let event = self.protocol.borrowed_event(event).unwrap_or_else(|| {
-            panic!(
-                "state-tree event payload type `{}` is not registered in this execution's protocol",
-                type_name::<E>()
-            )
-        });
-        let processed = self.instance.process_event_traced(
-            event,
-            microstep_limit.get(),
-            None,
-            &mut HeadlessEffectSink { sink },
-            &mut RejectActivities,
-            trace,
-        );
-        self.apply_timer_updates();
-        processed
-    }
-
-    /// Advances the headless clock and processes every newly due timeout in
-    /// chronological deadline order.
-    pub fn advance_time(&mut self, delta: Duration, microstep_limit: NonZeroUsize) -> bool {
-        self.advance_time_traced(delta, microstep_limit, &mut NoStateTreeTrace)
-    }
-
-    /// Advances time while delivering effects to `sink`.
-    pub fn advance_time_with_sink<S: StateTreeEffectSink<D> + ?Sized>(
-        &mut self,
-        delta: Duration,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> bool {
-        self.advance_time_traced_with_sink(delta, microstep_limit, sink, &mut NoStateTreeTrace)
-    }
-
-    /// Advances time while delivering activity lifecycle changes.
-    pub fn advance_time_with_activity_sink<S: StateTreeActivitySink<D> + ?Sized>(
-        &mut self,
-        delta: Duration,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-    ) -> bool {
-        self.advance_time_inner(
-            delta,
-            microstep_limit,
-            &mut RejectEffects,
-            &mut HeadlessActivitySink { sink },
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Advances time while delivering both effects and activity lifecycle changes.
-    pub fn advance_time_with_sinks<ES, AS>(
-        &mut self,
-        delta: Duration,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-    {
-        self.advance_time_traced_with_sinks(
-            delta,
-            microstep_limit,
-            effects,
-            activities,
-            &mut NoStateTreeTrace,
-        )
-    }
-
-    /// Advances time with both output sinks and semantic tracing.
-    pub fn advance_time_traced_with_sinks<ES, AS, T>(
-        &mut self,
-        delta: Duration,
-        microstep_limit: NonZeroUsize,
-        effects: &mut ES,
-        activities: &mut AS,
-        trace: &mut T,
-    ) -> bool
-    where
-        ES: StateTreeEffectSink<D> + ?Sized,
-        AS: StateTreeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    {
-        self.advance_time_inner(
-            delta,
-            microstep_limit,
-            &mut HeadlessEffectSink { sink: effects },
-            &mut HeadlessActivitySink { sink: activities },
-            trace,
-        )
-    }
-
-    /// Advances time while writing complete semantic traces for due timeouts.
-    pub fn advance_time_traced<T: StateTreeTrace + ?Sized>(
-        &mut self,
-        delta: Duration,
-        microstep_limit: NonZeroUsize,
-        trace: &mut T,
-    ) -> bool {
-        self.advance_time_inner(
-            delta,
-            microstep_limit,
-            &mut RejectEffects,
-            &mut RejectActivities,
-            trace,
-        )
-    }
-
-    /// Advances time while delivering effects and writing semantic traces.
-    pub fn advance_time_traced_with_sink<
-        S: StateTreeEffectSink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        &mut self,
-        delta: Duration,
-        microstep_limit: NonZeroUsize,
-        sink: &mut S,
-        trace: &mut T,
-    ) -> bool {
-        self.advance_time_inner(
-            delta,
-            microstep_limit,
-            &mut HeadlessEffectSink { sink },
-            &mut RejectActivities,
-            trace,
-        )
-    }
-
-    fn advance_time_inner<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
-        &mut self,
-        delta: Duration,
-        microstep_limit: NonZeroUsize,
-        effects: &mut S,
-        activities: &mut A,
-        trace: &mut T,
-    ) -> bool {
-        self.now = self.now.saturating_add(delta);
-        self.instance.set_time(self.now);
-        let mut transitioned = false;
-        let mut due = Vec::new();
-        self.timers.retain(|(deadline, token)| {
-            if *deadline <= self.now {
-                due.push((*deadline, *token));
-                false
-            } else {
-                true
-            }
-        });
-        due.sort_unstable();
-        let mut start = 0;
-        while start < due.len() {
-            let deadline = due[start].0;
-            let mut end = start + 1;
-            while end < due.len() && due[end].0 == deadline {
-                end += 1;
-            }
-            let tokens: Vec<_> = due[start..end].iter().map(|(_, token)| *token).collect();
-            transitioned |= self.instance.process_timers_traced(
-                &tokens,
-                microstep_limit.get(),
-                None,
-                effects,
-                activities,
-                trace,
-            );
-            self.apply_timer_updates();
-            start = end;
-        }
-        transitioned
-    }
-
-    fn apply_timer_updates(&mut self) {
-        for update in self.instance.timer_updates.drain(..) {
-            match update {
-                TimerUpdate::Arm { token, deadline } => self.timers.push((deadline, token)),
-                TimerUpdate::Cancel(token) => {
-                    self.timers.retain(|(_, candidate)| *candidate != token);
-                }
-            }
         }
     }
 }
@@ -1237,7 +274,7 @@ pub enum DatamodelOperation {
 /// reload support can migrate that retained definition without reusing the
 /// initial [`InstanceStatus::Pending`] state or replacing the event inbox.
 #[derive(Component, Debug)]
-#[component(on_remove = release_event_inbox::<D>)]
+#[component(on_discard = release_runtime_state::<D>)]
 #[require(PendingStateTree<D>, StateTreeEventInbox<D>)]
 pub struct StateTreeInstance<D: StateTreeDomain> {
     runtime_id: u64,
@@ -1264,7 +301,7 @@ struct ActivitySlot {
     active: bool,
 }
 
-fn release_event_inbox<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
+fn release_runtime_state<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
     let cancellations = world
         .get::<StateTreeInstance<D>>(context.entity)
         .map(|instance| instance.active_activity_tokens(context.entity))
@@ -1295,6 +332,9 @@ fn release_event_inbox<D: StateTreeDomain>(mut world: DeferredWorld, context: Ho
     }
     if let Some(mut timers) = world.get_resource_mut::<StateTreeTimers<D>>() {
         timers.cancel_tokens(timer_tokens);
+    }
+    if let Some(traces) = world.get_resource::<crate::StateTreeTraceLog<D>>() {
+        traces.discard(context.entity);
     }
     let mut entity = world.entity_mut(context.entity);
     let Some(mut inbox) = entity.get_mut::<StateTreeEventInbox<D>>() else {
@@ -1386,19 +426,17 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .iter()
             .enumerate()
             .filter(|(_, slot)| slot.active)
-            .filter_map(|(index, slot)| {
+            .map(|(index, slot)| {
                 let id = ActivityId(index as u32);
-                linked.activity(id).cloned().map(|handler| {
-                    (
-                        handler,
-                        ErasedActivityToken {
-                            entity,
-                            runtime_id: self.runtime_id,
-                            activity: id,
-                            generation: slot.generation,
-                        },
-                    )
-                })
+                (
+                    Arc::clone(linked.activity(id)),
+                    ErasedActivityToken {
+                        entity,
+                        runtime_id: self.runtime_id,
+                        activity: id,
+                        generation: slot.generation,
+                    },
+                )
             })
             .collect()
     }
@@ -1469,7 +507,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         linked: Arc<LinkedDefinition<D>>,
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
     ) {
@@ -1483,7 +521,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         );
     }
 
-    fn initialize_traced<
+    pub(crate) fn initialize_traced<
         S: RuntimeEffectSink<D> + ?Sized,
         A: RuntimeActivitySink<D> + ?Sized,
         T: StateTreeTrace + ?Sized,
@@ -1491,7 +529,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         linked: Arc<LinkedDefinition<D>>,
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1611,7 +649,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         event: StateTreeEventRef<'_, D>,
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
     ) -> bool {
@@ -1625,7 +663,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         )
     }
 
-    fn process_event_traced<
+    pub(crate) fn process_event_traced<
         S: RuntimeEffectSink<D> + ?Sized,
         A: RuntimeActivitySink<D> + ?Sized,
         T: StateTreeTrace + ?Sized,
@@ -1633,7 +671,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         event: StateTreeEventRef<'_, D>,
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1723,7 +761,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         tokens: &[TimerToken],
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
     ) -> bool {
@@ -1737,7 +775,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         )
     }
 
-    fn process_timers_traced<
+    pub(crate) fn process_timers_traced<
         S: RuntimeEffectSink<D> + ?Sized,
         A: RuntimeActivitySink<D> + ?Sized,
         T: StateTreeTrace + ?Sized,
@@ -1745,7 +783,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         tokens: &[TimerToken],
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1832,7 +870,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         outcome: crate::activity::ActivityOutcome,
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
     ) -> bool {
@@ -1846,7 +884,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         )
     }
 
-    fn process_activity_outcome_traced<
+    pub(crate) fn process_activity_outcome_traced<
         S: RuntimeEffectSink<D> + ?Sized,
         A: RuntimeActivitySink<D> + ?Sized,
         T: StateTreeTrace + ?Sized,
@@ -1854,7 +892,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &mut self,
         outcome: crate::activity::ActivityOutcome,
         microstep_limit: usize,
-        entity: Option<Entity>,
+        entity: Entity,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -2738,12 +1776,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             slot.active = false;
             let generation = slot.generation;
             let token = ErasedActivityToken {
-                entity: context.entity.unwrap_or(Entity::PLACEHOLDER),
+                entity: context.entity,
                 runtime_id: self.runtime_id,
                 activity: id,
                 generation,
             };
-            let handler = self.linked.as_ref().and_then(|linked| linked.activity(id));
+            let handler = self
+                .linked
+                .as_ref()
+                .expect("running instance is linked")
+                .activity(id);
             let (data_names, data) = compiled
                 .datamodel
                 .as_ref()
@@ -2758,13 +1800,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 data,
             };
             if let Err(error) = sink.start(RuntimeActivityStart {
-                id: &definition.id,
-                name: &definition.name,
                 handler,
                 context: activity_context,
                 arguments: StateTreeActivityArgs::new(values),
                 token,
-                span_start: definition.span_start as usize,
             }) {
                 return Err(RuntimeFault::Activity {
                     activity: definition.name.clone(),
@@ -2788,7 +1827,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     fn cancel_state_activities<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         state: StateId,
-        entity: Option<Entity>,
+        entity: Entity,
         sink: &mut A,
         trace: &mut T,
     ) {
@@ -2812,7 +1851,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             slot.active = false;
             let id = ActivityId(index as u32);
             let token = ErasedActivityToken {
-                entity: entity.unwrap_or(Entity::PLACEHOLDER),
+                entity,
                 runtime_id: self.runtime_id,
                 activity: id,
                 generation: slot.generation,
@@ -2827,7 +1866,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
     fn cancel_all_activities<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
-        entity: Option<Entity>,
+        entity: Entity,
         sink: &mut A,
         trace: &mut T,
     ) {
@@ -2840,7 +1879,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     fn set_fault<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         fault: RuntimeFault,
-        entity: Option<Entity>,
+        entity: Entity,
         activities: &mut A,
         trace: &mut T,
     ) {
@@ -3024,8 +2063,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     let handler = self
                         .linked
                         .as_ref()
-                        .and_then(|linked| linked.effect(effect))
-                        .cloned();
+                        .map(|linked| linked.effect(effect))
+                        .expect("running instance is linked");
+                    let handler = Arc::clone(handler);
                     let name = compiled.effect_name(effect);
                     let context = StateTreeEffectContext {
                         entity: context.entity,
@@ -3034,13 +2074,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                         data_names,
                         data,
                     };
-                    if let Err(error) = effects.emit(
-                        name,
-                        handler.as_ref(),
-                        context,
-                        StateTreeEffectArgs::new(values),
-                        span_start as usize,
-                    ) {
+                    if let Err(error) =
+                        effects.emit(&handler, context, StateTreeEffectArgs::new(values))
+                    {
                         return Err(RuntimeFault::Effect {
                             effect: name.into(),
                             argument: error.argument_name().map(Into::into),
@@ -3057,7 +2093,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
     fn update_completion<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
-        entity: Option<Entity>,
+        entity: Entity,
         activities: &mut A,
         trace: &mut T,
     ) {
@@ -3102,7 +2138,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     >(
         &mut self,
         runtime: &mut ParallelRuntime,
-        entity: Option<Entity>,
+        entity: Entity,
         activities: &mut A,
         trace: &mut T,
     ) {
@@ -3472,26 +2508,29 @@ impl<D: StateTreeDomain> Default for PendingStateTree<D> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use bevy_asset::Handle;
+    use std::{num::NonZeroUsize, time::Duration};
 
     use super::*;
     use crate::{
-        StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeEventLog, StateTreeTransition,
+        StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeTransition,
+        test_harness::TestApp,
     };
 
     struct TestDomain;
 
-    impl crate::StateTreeDomain for TestDomain {}
+    impl crate::StateTreeDomain for TestDomain {
+        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
+            config.event::<Advance>().event::<Finish>();
+        }
+    }
 
     struct TestEvents;
 
-    #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
+    #[derive(Clone, Copy, bevy_ecs::event::Event, crate::StateTreeEvent)]
     #[state_tree(domain = TestDomain, name = "advance", broadcast)]
     struct Advance;
 
-    #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
+    #[derive(Clone, Copy, bevy_ecs::event::Event, crate::StateTreeEvent)]
     #[state_tree(domain = TestDomain, name = "finish", broadcast)]
     struct Finish;
 
@@ -3501,50 +2540,24 @@ mod tests {
         const Finish: Finish = Finish;
     }
 
-    fn protocol() -> StateTreeEventProtocol<TestDomain> {
-        let mut registry = crate::StateTreeEventRegistry::new();
-        registry.register::<Advance>().unwrap();
-        registry.register::<Finish>().unwrap();
-        registry.freeze()
-    }
-
-    fn instance(definition: &StateTreeDefinition, limit: usize) -> StateTreeInstance<TestDomain> {
-        let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize(
-            Arc::new(
-                LinkedDefinition::<TestDomain>::new(
-                    Arc::clone(&definition.compiled),
-                    &protocol(),
-                    None,
-                    None,
-                )
-                .unwrap(),
-            ),
-            limit,
-            None,
-            &mut RejectEffects,
-            &mut RejectActivities,
-        );
-        instance
-    }
-
-    fn process_event<E: StateTreeEvent<TestDomain>>(
-        instance: &mut StateTreeInstance<TestDomain>,
-        event: &E,
-        limit: usize,
-    ) -> bool {
-        let protocol = protocol();
-        instance.process_event(
-            protocol.borrowed_event(event).unwrap(),
-            limit,
-            None,
-            &mut RejectEffects,
-            &mut RejectActivities,
+    fn instance(definition: &StateTreeDefinition, limit: usize) -> TestApp<TestDomain> {
+        TestApp::new(
+            definition.clone(),
+            NonZeroUsize::new(limit).expect("test limit is non-zero"),
         )
     }
 
-    fn execution(definition: &StateTreeDefinition) -> StateTreeExecution<TestDomain> {
-        StateTreeExecution::new(definition, protocol(), NonZeroUsize::new(64).unwrap()).unwrap()
+    fn process_event<E: crate::BroadcastStateTreeEvent<TestDomain> + Clone>(
+        instance: &mut TestApp<TestDomain>,
+        event: &E,
+        limit: usize,
+    ) -> bool {
+        assert!(limit > 0);
+        instance.process_event(event.clone())
+    }
+
+    fn execution(definition: &StateTreeDefinition) -> TestApp<TestDomain> {
+        TestApp::new(definition.clone(), NonZeroUsize::new(64).unwrap())
     }
 
     #[test]
@@ -3557,7 +2570,7 @@ mod tests {
 
         let instance = instance(&definition, 8);
 
-        assert!(instance.activities.is_none());
+        assert!(instance.instance().activities.is_none());
     }
 
     #[test]
@@ -3594,13 +2607,11 @@ mod tests {
         let initial_data =
             StateTreeDataOverrides::try_new([("seed", LuauValue::Integer(7))]).unwrap();
 
-        let execution = StateTreeExecution::<TestDomain>::new_with_initial_data(
-            &definition,
-            protocol(),
+        let execution = TestApp::<TestDomain>::with_initial_data(
+            definition,
             NonZeroUsize::new(64).unwrap(),
             initial_data,
-        )
-        .unwrap();
+        );
 
         assert_eq!(execution.status(), &InstanceStatus::Running);
         assert_eq!(execution.data("seed"), Some(&LuauValue::Integer(7)));
@@ -3619,23 +2630,10 @@ mod tests {
         let definition = builder.build().unwrap();
         let initial_data =
             StateTreeDataOverrides::try_new([("value", LuauValue::Integer(9))]).unwrap();
-        let mut instance =
-            StateTreeInstance::<TestDomain>::new_with_initial_data(Handle::default(), initial_data);
-
-        instance.initialize(
-            Arc::new(
-                LinkedDefinition::<TestDomain>::new(
-                    Arc::clone(&definition.compiled),
-                    &protocol(),
-                    None,
-                    None,
-                )
-                .unwrap(),
-            ),
-            64,
-            None,
-            &mut RejectEffects,
-            &mut RejectActivities,
+        let instance = TestApp::<TestDomain>::with_initial_data(
+            definition,
+            NonZeroUsize::new(64).unwrap(),
+            initial_data,
         );
 
         assert_eq!(instance.status(), &InstanceStatus::Running);
@@ -3658,13 +2656,11 @@ mod tests {
         ])
         .unwrap();
 
-        let execution = StateTreeExecution::<TestDomain>::new_with_initial_data(
-            &definition,
-            protocol(),
+        let execution = TestApp::<TestDomain>::with_initial_data(
+            definition,
             NonZeroUsize::new(64).unwrap(),
             initial_data,
-        )
-        .unwrap();
+        );
 
         assert_eq!(
             execution.status(),
@@ -3686,13 +2682,11 @@ mod tests {
         let initial_data =
             StateTreeDataOverrides::try_new([("value", LuauValue::Integer(1))]).unwrap();
 
-        let execution = StateTreeExecution::<TestDomain>::new_with_initial_data(
-            &definition,
-            protocol(),
+        let execution = TestApp::<TestDomain>::with_initial_data(
+            definition,
             NonZeroUsize::new(64).unwrap(),
             initial_data,
-        )
-        .unwrap();
+        );
 
         assert_eq!(
             execution.status(),
@@ -3703,15 +2697,19 @@ mod tests {
         assert_eq!(execution.active_state_names().next(), None);
     }
 
-    fn advance(execution: &mut StateTreeExecution<TestDomain>, duration: Duration) -> bool {
-        execution.advance_time(duration, NonZeroUsize::new(64).unwrap())
+    fn advance(execution: &mut TestApp<TestDomain>, duration: Duration) -> bool {
+        execution.advance_time(duration)
     }
 
     struct DescriptorDomain;
 
-    impl StateTreeDomain for DescriptorDomain {}
+    impl StateTreeDomain for DescriptorDomain {
+        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
+            config.event::<DescriptorEvents>();
+        }
+    }
 
-    #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
+    #[derive(Clone, Copy, bevy_ecs::event::Event, crate::StateTreeEvent)]
     #[state_tree(domain = DescriptorDomain, name = "combat.damage", broadcast)]
     struct DescriptorEvents;
 
@@ -3731,16 +2729,10 @@ mod tests {
             .add_transition(waiting, StateTreeTransition::on("combat").target(done))
             .unwrap();
         let definition = builder.build().unwrap();
-        let mut registry = crate::StateTreeEventRegistry::new();
-        registry.register::<DescriptorEvents>().unwrap();
-        let mut execution = StateTreeExecution::<DescriptorDomain>::new(
-            &definition,
-            registry.freeze(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<DescriptorDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
-        assert!(execution.process_event(&DescriptorEvents::Combat, NonZeroUsize::new(8).unwrap()));
+        assert!(execution.process_event(DescriptorEvents::Combat));
         assert_eq!(execution.status(), &InstanceStatus::Complete);
     }
 
@@ -4256,30 +3248,11 @@ mod tests {
             .add_transition(first, StateTreeTransition::on("finish").target(outside))
             .unwrap();
         let definition = builder.build().unwrap();
-        let mut trace = StateTreeEventLog::new();
-        let mut execution = StateTreeExecution::<TestDomain>::new_traced(
-            &definition,
-            protocol(),
-            NonZeroUsize::new(64).unwrap(),
-            &mut trace,
-        )
-        .unwrap();
-
-        execution.process_event_traced(
-            &TestEvents::Advance,
-            NonZeroUsize::new(64).unwrap(),
-            &mut trace,
-        );
-        execution.process_event_traced(
-            &TestEvents::Finish,
-            NonZeroUsize::new(64).unwrap(),
-            &mut trace,
-        );
-        execution.process_event_traced(
-            &TestEvents::Advance,
-            NonZeroUsize::new(64).unwrap(),
-            &mut trace,
-        );
+        let mut execution = execution(&definition);
+        execution.process_event(TestEvents::Advance);
+        execution.process_event(TestEvents::Finish);
+        execution.process_event(TestEvents::Advance);
+        let trace = execution.trace();
 
         assert_eq!(
             trace
@@ -4778,7 +3751,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_after_transition_fires_only_at_its_deadline() {
+    fn app_after_transition_fires_only_at_its_deadline() {
         let mut builder = StateTreeBuilder::new("deadline");
         let root = builder.compound_root("root").unwrap();
         let waiting = builder.atomic("waiting", root).unwrap();
@@ -4838,12 +3811,10 @@ mod tests {
             .add_transition(away, StateTreeTransition::on("finish").target(waiting))
             .unwrap();
         let mut execution = execution(&builder.build().unwrap());
-        let limit = NonZeroUsize::new(64).unwrap();
-
         advance(&mut execution, Duration::from_millis(500));
-        execution.process_event(&TestEvents::Advance, limit);
+        execution.process_event(TestEvents::Advance);
         assert!(!advance(&mut execution, Duration::from_secs(1)));
-        execution.process_event(&TestEvents::Finish, limit);
+        execution.process_event(TestEvents::Finish);
         assert!(!advance(&mut execution, Duration::from_millis(999)));
         assert_eq!(execution.active_state_names().last(), Some("waiting"));
         assert!(advance(&mut execution, Duration::from_millis(1)));
@@ -4958,23 +3929,12 @@ mod tests {
             )
             .unwrap();
         let definition = builder.build().unwrap();
-        let mut trace = StateTreeEventLog::new();
-        let mut execution = StateTreeExecution::<TestDomain>::new_traced(
-            &definition,
-            protocol(),
-            NonZeroUsize::new(64).unwrap(),
-            &mut trace,
-        )
-        .unwrap();
-
-        assert!(execution.advance_time_traced(
-            Duration::from_secs(1),
-            NonZeroUsize::new(64).unwrap(),
-            &mut trace,
-        ));
+        let mut execution = execution(&definition);
+        assert!(execution.advance_time(Duration::from_secs(1)));
         let active = execution.active_state_names().collect::<Vec<_>>();
         assert!(active.contains(&"left-elapsed"));
         assert!(active.contains(&"right-elapsed"));
+        let trace = execution.trace();
         assert_eq!(trace.as_str().matches("macrostep timer\n").count(), 1);
         assert!(trace.as_str().contains("transition \"left-waiting\"\n"));
         assert!(trace.as_str().contains("transition \"right-waiting\"\n"));
@@ -5047,18 +4007,13 @@ mod tests {
             .add_transition(second, StateTreeTransition::eventless().target(first))
             .unwrap();
         let definition = fault_builder.build().unwrap();
-        let mut fault = StateTreeExecution::<TestDomain>::new(
-            &definition,
-            protocol(),
-            NonZeroUsize::new(2).unwrap(),
-        )
-        .unwrap();
+        let mut fault = TestApp::<TestDomain>::new(definition, NonZeroUsize::new(2).unwrap());
 
-        assert!(fault.advance_time(Duration::from_secs(1), NonZeroUsize::new(2).unwrap()));
+        assert!(fault.advance_time(Duration::from_secs(1)));
         assert_eq!(
             fault.status(),
             &InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { limit: 2 })
         );
-        assert!(!fault.advance_time(Duration::from_secs(1), NonZeroUsize::new(2).unwrap()));
+        assert!(!fault.advance_time(Duration::from_secs(1)));
     }
 }

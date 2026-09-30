@@ -12,7 +12,11 @@ struct StateTreeUpdate;
 
 struct Simulation;
 
-impl StateTreeDomain for Simulation {}
+impl StateTreeDomain for Simulation {
+    fn configure(config: &mut StateTreeConfig<'_, Self>) {
+        config.event::<Advance>();
+    }
+}
 
 #[derive(EntityEvent, StateTreeEvent)]
 #[state_tree(domain = Simulation, name = "advance")]
@@ -33,7 +37,6 @@ fn queue_set_delivers_on_a_single_threaded_schedule_without_task_pool_plugin() {
     app.add_plugins((TimePlugin, AssetPlugin::default()))
         .init_schedule(StateTreeUpdate)
         .add_plugins(StateTreePlugin::<Simulation>::new(StateTreeUpdate))
-        .register_state_tree_event::<Simulation, Advance>()
         .add_systems(
             StateTreeUpdate,
             queue_advance.in_set(StateTreeSet::QueueEvents),

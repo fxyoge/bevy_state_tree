@@ -1,10 +1,18 @@
-use std::fmt::Write;
+use std::{
+    collections::HashMap,
+    fmt::Write,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 
-use crate::{InstanceStatus, LuauValue, RuntimeFault};
+use bevy_app::{App, Plugin};
+use bevy_ecs::{entity::Entity, prelude::Resource};
+
+use crate::{InstanceStatus, LuauValue, RuntimeFault, StateTreeDomain};
 
 /// How a shallow-history target selected its descendant configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StateTreeHistoryResolution {
+pub(crate) enum StateTreeHistoryResolution {
     Default,
     Stored,
 }
@@ -16,14 +24,14 @@ pub enum StateTreeHistoryResolution {
 /// schedules, speculative transition candidates, or other implementation
 /// details. A sink must not attempt to re-enter the execution that is currently
 /// producing records.
-pub trait StateTreeTrace {
+pub(crate) trait StateTreeTrace {
     /// Observes one record in execution order.
     fn record(&mut self, record: StateTreeTraceRecord<'_>);
 }
 
 /// A trace sink that discards every record.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NoStateTreeTrace;
+pub(crate) struct NoStateTreeTrace;
 
 impl StateTreeTrace for NoStateTreeTrace {
     #[inline]
@@ -32,7 +40,7 @@ impl StateTreeTrace for NoStateTreeTrace {
 
 /// The event that initiated a macrostep.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StateTreeTraceTrigger<'a> {
+pub(crate) enum StateTreeTraceTrigger<'a> {
     Initialization,
     ExternalEvent(&'a str),
     Timer,
@@ -46,7 +54,7 @@ pub enum StateTreeTraceTrigger<'a> {
 /// the same microstep when orthogonal regions are supported.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum StateTreeTraceRecord<'a> {
+pub(crate) enum StateTreeTraceRecord<'a> {
     MacrostepStarted {
         trigger: StateTreeTraceTrigger<'a>,
     },
@@ -252,6 +260,97 @@ impl StateTreeTrace for StateTreeEventLog {
     }
 }
 
+/// Opt-in storage for semantic traces produced by Bevy state-tree instances.
+///
+/// Install [`StateTreeTracePlugin`] for a domain, then inspect or remove each
+/// entity's accumulated log through this resource.
+#[derive(Resource)]
+pub struct StateTreeTraceLog<D: StateTreeDomain> {
+    logs: Mutex<HashMap<Entity, Arc<Mutex<StateTreeEventLog>>>>,
+    marker: PhantomData<fn() -> D>,
+}
+
+impl<D: StateTreeDomain> Default for StateTreeTraceLog<D> {
+    fn default() -> Self {
+        Self {
+            logs: Mutex::new(HashMap::new()),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<D: StateTreeDomain> StateTreeTraceLog<D> {
+    /// Returns a snapshot of one entity's accumulated event log.
+    pub fn get(&self, entity: Entity) -> Option<StateTreeEventLog> {
+        let log = self
+            .logs
+            .lock()
+            .expect("state-tree trace log poisoned")
+            .get(&entity)
+            .cloned()?;
+        let snapshot = log
+            .lock()
+            .expect("state-tree entity trace log poisoned")
+            .clone();
+        Some(snapshot)
+    }
+
+    /// Removes and returns one entity's accumulated event log.
+    pub fn remove(&self, entity: Entity) -> Option<StateTreeEventLog> {
+        let log = self
+            .logs
+            .lock()
+            .expect("state-tree trace log poisoned")
+            .remove(&entity)?;
+        let snapshot = log
+            .lock()
+            .expect("state-tree entity trace log poisoned")
+            .clone();
+        Some(snapshot)
+    }
+
+    pub(crate) fn record<R>(
+        &self,
+        entity: Entity,
+        record: impl FnOnce(&mut StateTreeEventLog) -> R,
+    ) -> R {
+        let log = {
+            let mut logs = self.logs.lock().expect("state-tree trace log poisoned");
+            Arc::clone(
+                logs.entry(entity)
+                    .or_insert_with(|| Arc::new(Mutex::new(StateTreeEventLog::new()))),
+            )
+        };
+        let mut log = log.lock().expect("state-tree entity trace log poisoned");
+        record(&mut log)
+    }
+
+    pub(crate) fn discard(&self, entity: Entity) {
+        self.logs
+            .lock()
+            .expect("state-tree trace log poisoned")
+            .remove(&entity);
+    }
+}
+
+/// Enables App-facing semantic trace collection for one domain.
+///
+/// Without this plugin, state-tree systems do not allocate, lock, or perform
+/// runtime work for individual trace records.
+pub struct StateTreeTracePlugin<D: StateTreeDomain>(PhantomData<fn() -> D>);
+
+impl<D: StateTreeDomain> Default for StateTreeTracePlugin<D> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<D: StateTreeDomain> Plugin for StateTreeTracePlugin<D> {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<StateTreeTraceLog<D>>();
+    }
+}
+
 fn write_fault(output: &mut String, fault: &RuntimeFault) {
     match fault {
         RuntimeFault::MicrostepLimitExceeded { limit } => {
@@ -308,5 +407,53 @@ fn write_luau_value(output: &mut String, value: &LuauValue) {
             }
             output.push('}');
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use bevy_ecs::world::World;
+
+    use super::*;
+
+    struct TestDomain;
+
+    impl StateTreeDomain for TestDomain {
+        fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
+    }
+
+    #[test]
+    fn separate_entity_logs_can_be_recorded_concurrently() {
+        let traces = StateTreeTraceLog::<TestDomain>::default();
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+        let (locked_sender, locked_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (recorded_sender, recorded_receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let trace_store = &traces;
+            scope.spawn(move || {
+                trace_store.record(first, |_log| {
+                    locked_sender.send(()).unwrap();
+                    release_receiver.recv().unwrap();
+                });
+            });
+            locked_receiver.recv().unwrap();
+            let trace_store = &traces;
+            scope.spawn(move || {
+                trace_store.record(second, |_log| {});
+                recorded_sender.send(()).unwrap();
+            });
+
+            let recorded_in_parallel = recorded_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok();
+            release_sender.send(()).unwrap();
+            assert!(recorded_in_parallel);
+        });
     }
 }

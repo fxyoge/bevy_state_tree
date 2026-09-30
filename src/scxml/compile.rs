@@ -1271,23 +1271,123 @@ fn has_substantive_content(content: Option<&Content>) -> bool {
 mod tests {
     use std::num::NonZeroUsize;
 
+    use bevy_ecs::{
+        message::Message,
+        system::{In, RunSystemOnce},
+    };
+
     use super::*;
     use crate::scxml;
     use crate::{
-        DatamodelOperation, InstanceStatus, LuauValue, RuntimeFault, StateTreeActivityRequest,
-        StateTreeActivitySink, StateTreeDomain, StateTreeEffectError, StateTreeEffectRequest,
-        StateTreeEffectSink, StateTreeEventRegistry, StateTreeExecution,
-        StateTreeHeadlessActivityToken,
+        DatamodelOperation, InstanceStatus, LuauValue, RuntimeFault, StateTreeActivity,
+        StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter, StateTreeActivityToken,
+        StateTreeDomain, StateTreeLinkFailure, test_harness::TestApp,
     };
 
     const NS: &str = super::super::SCXML_NAMESPACE;
 
     struct NoEventsDomain;
 
-    impl StateTreeDomain for NoEventsDomain {}
+    impl StateTreeDomain for NoEventsDomain {
+        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
+            config
+                .effect::<RecordedEffect, _>("record", |_context, arguments| {
+                    Ok(RecordedEffect(arguments.take("value")?))
+                })
+                .activity::<Work, _>("work", |context, arguments| {
+                    let argument_name =
+                        { arguments.iter().next().map(|(name, _)| name.to_owned()) };
+                    let argument = argument_name
+                        .map(|name| arguments.take::<LuauValue>(&name))
+                        .transpose()?
+                        .unwrap_or(LuauValue::Nil);
+                    Ok(Work {
+                        argument,
+                        target: context.data("target").cloned(),
+                    })
+                })
+                .activity::<Work, _>("find_path", |context, arguments| {
+                    let argument = arguments.take("destination")?;
+                    Ok(Work {
+                        argument,
+                        target: context.data("target").cloned(),
+                    })
+                });
+        }
+    }
 
-    fn no_events_protocol() -> crate::StateTreeEventProtocol<NoEventsDomain> {
-        StateTreeEventRegistry::new().freeze()
+    #[derive(Message)]
+    struct RecordedEffect(i64);
+
+    #[derive(Clone, Debug)]
+    struct Work {
+        argument: LuauValue,
+        target: Option<LuauValue>,
+    }
+
+    impl StateTreeActivity for Work {
+        type Output = Option<LuauValue>;
+        type Error = Option<LuauValue>;
+
+        fn output_data(
+            output: &Self::Output,
+        ) -> Result<Option<LuauValue>, crate::StateTreeEventDataError> {
+            Ok(output.clone())
+        }
+
+        fn error_data(
+            error: &Self::Error,
+        ) -> Result<Option<LuauValue>, crate::StateTreeEventDataError> {
+            Ok(error.clone())
+        }
+    }
+
+    type ActivityStarts<D> = Vec<(StateTreeActivityToken<D, Work>, Work)>;
+    type ActivityCancellations<D> = Vec<StateTreeActivityToken<D, Work>>;
+
+    fn drain_activities<D: StateTreeDomain>(
+        execution: &mut TestApp<D>,
+    ) -> (ActivityStarts<D>, ActivityCancellations<D>) {
+        let mut starts = Vec::new();
+        let mut cancellations = Vec::new();
+        for lifecycle in execution
+            .app_mut()
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<StateTreeActivityLifecycle<D, Work>>>()
+            .drain()
+        {
+            match lifecycle {
+                StateTreeActivityLifecycle::Started { token, activity } => {
+                    starts.push((token, activity));
+                }
+                StateTreeActivityLifecycle::Cancelled { token } => cancellations.push(token),
+            }
+        }
+        (starts, cancellations)
+    }
+
+    fn complete_activity<D: StateTreeDomain>(
+        execution: &mut TestApp<D>,
+        token: StateTreeActivityToken<D, Work>,
+        data: Option<LuauValue>,
+    ) -> bool {
+        let accepted = execution
+            .app_mut()
+            .world_mut()
+            .run_system_once_with(write_completion::<D>, (token, data))
+            .unwrap();
+        execution
+            .app_mut()
+            .world_mut()
+            .run_schedule(bevy_app::Update);
+        accepted
+    }
+
+    fn write_completion<D: StateTreeDomain>(
+        In((token, data)): In<(StateTreeActivityToken<D, Work>, Option<LuauValue>)>,
+        mut outcomes: StateTreeActivityOutcomeWriter<D, Work>,
+    ) -> bool {
+        outcomes.complete(token, data)
     }
 
     #[test]
@@ -1618,12 +1718,7 @@ mod tests {
         .unwrap();
         let definition = compile(&document).unwrap();
 
-        let execution = StateTreeExecution::<NoEventsDomain>::new(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
+        let execution = TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
         assert_eq!(execution.status(), &InstanceStatus::Complete);
         assert_eq!(execution.active_state_names().last(), Some("pass"));
@@ -1640,13 +1735,13 @@ mod tests {
         .unwrap();
         let definition = compile(&document).unwrap();
 
-        let error = StateTreeExecution::<NoEventsDomain>::new(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .err()
-        .unwrap();
+        let execution = TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let error = execution
+            .app()
+            .world()
+            .get::<StateTreeLinkFailure<NoEventsDomain>>(execution.entity())
+            .unwrap()
+            .error();
 
         assert!(matches!(
             &error.issues()[0],
@@ -1671,12 +1766,7 @@ mod tests {
         .unwrap();
         let definition = compile(&document).unwrap();
 
-        let execution = StateTreeExecution::<NoEventsDomain>::new(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
+        let execution = TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
         assert_eq!(execution.status(), &InstanceStatus::Complete);
         assert_eq!(
@@ -1686,29 +1776,10 @@ mod tests {
         assert_eq!(execution.data("exited"), Some(&LuauValue::Boolean(false)));
     }
 
-    fn execute(source: &str) -> StateTreeExecution<NoEventsDomain> {
+    fn execute(source: &str) -> TestApp<NoEventsDomain> {
         let document = scxml::parse("raises.scxml", source).unwrap();
         let definition = compile(&document).unwrap();
-        StateTreeExecution::<NoEventsDomain>::new(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(32).unwrap(),
-        )
-        .unwrap()
-    }
-
-    #[derive(Default)]
-    struct RecordingEffects(Vec<(String, i64)>);
-
-    impl StateTreeEffectSink<NoEventsDomain> for RecordingEffects {
-        fn emit(
-            &mut self,
-            mut request: StateTreeEffectRequest<'_, NoEventsDomain>,
-        ) -> Result<(), StateTreeEffectError> {
-            let value = request.arguments().take::<i64>("value")?;
-            self.0.push((request.name().to_owned(), value));
-            Ok(())
-        }
+        TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(32).unwrap())
     }
 
     #[test]
@@ -1723,56 +1794,18 @@ mod tests {
         );
         let document = scxml::parse("effect.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
-        let mut effects = RecordingEffects::default();
-
-        let execution = StateTreeExecution::<NoEventsDomain>::new_with_sink(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-            &mut effects,
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
         assert_eq!(execution.status(), &InstanceStatus::Running);
-        assert_eq!(effects.0, [("record".to_owned(), 5)]);
-    }
-
-    #[derive(Default)]
-    struct RecordingActivities {
-        starts: Vec<(
-            String,
-            String,
-            LuauValue,
-            StateTreeHeadlessActivityToken,
-            Option<LuauValue>,
-        )>,
-        cancellations: Vec<StateTreeHeadlessActivityToken>,
-    }
-
-    impl<D: StateTreeDomain> StateTreeActivitySink<D> for RecordingActivities {
-        fn start(
-            &mut self,
-            mut request: StateTreeActivityRequest<'_, D>,
-        ) -> Result<(), StateTreeEffectError> {
-            let value = request
-                .arguments()
-                .iter()
-                .next()
-                .map(|(_, value)| value.clone())
-                .unwrap_or(LuauValue::Nil);
-            self.starts.push((
-                request.id().to_owned(),
-                request.name().to_owned(),
-                value,
-                request.token(),
-                request.data("target").cloned(),
-            ));
-            Ok(())
-        }
-
-        fn cancel(&mut self, token: StateTreeHeadlessActivityToken) {
-            self.cancellations.push(token);
-        }
+        let effects = execution
+            .app_mut()
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<RecordedEffect>>()
+            .drain()
+            .map(|effect| effect.0)
+            .collect::<Vec<_>>();
+        assert_eq!(effects, [5]);
     }
 
     #[test]
@@ -1860,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_activity_completion_carries_data_and_is_accepted_once() {
+    fn app_activity_completion_carries_data_and_is_accepted_once() {
         let source = format!(
             r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
                 <datamodel><data id="target" expr="'north'"/><data id="result"/></datamodel>
@@ -1873,19 +1906,13 @@ mod tests {
             super::super::BEVY_STATE_TREE_NAMESPACE,
         );
         let definition = compile(&scxml::parse("activity.scxml", &source).unwrap()).unwrap();
-        let mut sink = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink,
-        )
-        .unwrap();
-        assert_eq!(sink.starts[0].0, "path");
-        assert_eq!(sink.starts[0].1, "find_path");
-        assert_eq!(sink.starts[0].2, LuauValue::String("south".into()));
-        assert_eq!(sink.starts[0].4, Some(LuauValue::String("south".into())));
-        let token = sink.starts[0].3;
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let (starts, cancellations) = drain_activities(&mut execution);
+        assert!(cancellations.is_empty());
+        assert_eq!(starts[0].1.argument, LuauValue::String("south".into()));
+        assert_eq!(starts[0].1.target, Some(LuauValue::String("south".into())));
+        let token = starts[0].0;
         let data = LuauValue::Record(
             [
                 (Box::from("ok"), LuauValue::Boolean(true)),
@@ -1894,24 +1921,14 @@ mod tests {
             .into(),
         );
 
-        assert!(execution.complete_activity(
-            token,
-            Some(data),
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink
-        ));
+        assert!(complete_activity(&mut execution, token, Some(data)));
         assert_eq!(
             execution.data("result"),
             Some(&LuauValue::String("n1".into()))
         );
         assert_eq!(execution.active_state_names().last(), Some("active"));
-        assert!(!execution.complete_activity(
-            token,
-            None,
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink
-        ));
-        assert!(sink.cancellations.is_empty());
+        assert!(!complete_activity(&mut execution, token, None));
+        assert!(drain_activities(&mut execution).1.is_empty());
     }
 
     #[test]
@@ -1928,21 +1945,14 @@ mod tests {
         );
         let definition =
             compile(&scxml::parse("activity-eventless.scxml", &source).unwrap()).unwrap();
-        let mut sink = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(1).unwrap(),
-            &mut sink,
-        )
-        .unwrap();
-        let token = sink.starts[0].3;
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(1).unwrap());
+        let token = drain_activities(&mut execution).0[0].0;
 
-        assert!(execution.complete_activity(
+        assert!(complete_activity(
+            &mut execution,
             token,
-            Some(LuauValue::Integer(7)),
-            NonZeroUsize::new(1).unwrap(),
-            &mut sink,
+            Some(LuauValue::Integer(7))
         ));
         assert_eq!(execution.status(), &InstanceStatus::Complete);
         assert_eq!(execution.active_state_names().last(), Some("pass"));
@@ -1966,27 +1976,20 @@ mod tests {
             super::super::BEVY_STATE_TREE_NAMESPACE,
         );
         let definition = compile(&scxml::parse("payload-scope.scxml", &source).unwrap()).unwrap();
-        let mut sink = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink,
-        )
-        .unwrap();
-        let token = sink.starts[0].3;
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let token = drain_activities(&mut execution).0[0].0;
 
-        assert!(execution.complete_activity(
+        assert!(complete_activity(
+            &mut execution,
             token,
-            Some(LuauValue::Integer(7)),
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink,
+            Some(LuauValue::Integer(7))
         ));
         assert_eq!(execution.active_state_names().last(), Some("pass"));
     }
 
     #[test]
-    fn headless_dual_sinks_support_mixed_activity_macrosteps() {
+    fn app_effects_and_activities_support_mixed_macrosteps() {
         let source = format!(
             r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
                 <state id="active">
@@ -2001,52 +2004,45 @@ mod tests {
             super::super::BEVY_STATE_TREE_NAMESPACE,
         );
         let definition = compile(&scxml::parse("mixed-sinks.scxml", &source).unwrap()).unwrap();
-        let mut effects = RecordingEffects::default();
-        let mut activities = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_sinks(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-            &mut effects,
-            &mut activities,
-        )
-        .unwrap();
-        let completed = activities.starts[0].3;
-        let cancelled = activities.starts[1].3;
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let (starts, _) = drain_activities(&mut execution);
+        let completed = starts[0].0;
+        let cancelled = starts[1].0;
 
-        assert!(execution.complete_activity_with_sinks(
-            completed,
-            None,
-            NonZeroUsize::new(8).unwrap(),
-            &mut effects,
-            &mut activities,
-        ));
-        assert_eq!(effects.0, [("record".to_owned(), 9)]);
-        assert_eq!(activities.cancellations, [cancelled]);
-        assert_eq!(
-            activities
-                .starts
-                .iter()
-                .map(|start| start.0.as_str())
-                .collect::<Vec<_>>(),
-            ["finished", "cancelled", "started"]
-        );
+        assert!(complete_activity(&mut execution, completed, None));
+        let effects = execution
+            .app_mut()
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<RecordedEffect>>()
+            .drain()
+            .map(|effect| effect.0)
+            .collect::<Vec<_>>();
+        assert_eq!(effects, [9]);
+        let (new_starts, cancellations) = drain_activities(&mut execution);
+        assert_eq!(cancellations, [cancelled]);
+        assert_eq!(new_starts.len(), 1);
         assert_eq!(execution.active_state_names().last(), Some("next"));
     }
 
     struct ReenterDomain;
 
-    impl StateTreeDomain for ReenterDomain {}
+    impl StateTreeDomain for ReenterDomain {
+        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
+            config
+                .event::<ReenterEvent>()
+                .activity::<Work, _>("work", |_context, _arguments| {
+                    Ok(Work {
+                        argument: LuauValue::Nil,
+                        target: None,
+                    })
+                });
+        }
+    }
 
     #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
     #[state_tree(domain = ReenterDomain, name = "reenter", broadcast)]
     struct ReenterEvent;
-
-    fn reenter_protocol() -> crate::StateTreeEventProtocol<ReenterDomain> {
-        let mut registry = StateTreeEventRegistry::new();
-        registry.register::<ReenterEvent>().unwrap();
-        registry.freeze()
-    }
 
     #[test]
     fn reentry_uses_a_new_generation_and_stale_outcomes_are_ignored() {
@@ -2057,35 +2053,16 @@ mod tests {
             super::super::BEVY_STATE_TREE_NAMESPACE
         );
         let definition = compile(&scxml::parse("reentry.scxml", &source).unwrap()).unwrap();
-        let mut sink = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<ReenterDomain>::new_with_activity_sink(
-            &definition,
-            reenter_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink,
-        )
-        .unwrap();
-        let first = sink.starts[0].3;
-        assert!(execution.process_event_with_activity_sink(
-            &ReenterEvent,
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink
-        ));
-        let second = sink.starts[1].3;
+        let mut execution =
+            TestApp::<ReenterDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let first = drain_activities(&mut execution).0[0].0;
+        assert!(execution.process_event(ReenterEvent));
+        let (starts, cancellations) = drain_activities(&mut execution);
+        let second = starts[0].0;
         assert_ne!(first, second);
-        assert_eq!(sink.cancellations, [first]);
-        assert!(!execution.complete_activity(
-            first,
-            None,
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink
-        ));
-        assert!(execution.complete_activity(
-            second,
-            None,
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink
-        ));
+        assert_eq!(cancellations, [first]);
+        assert!(!complete_activity(&mut execution, first, None));
+        assert!(complete_activity(&mut execution, second, None));
     }
 
     #[test]
@@ -2111,17 +2088,12 @@ mod tests {
             .add_activity(root, StateTreeActivityDefinition::new("root-job", "work"))
             .unwrap();
         let definition = builder.build().unwrap();
-        let mut sink = RecordingActivities::default();
-        let execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink,
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let (starts, cancellations) = drain_activities(&mut execution);
         assert_eq!(execution.status(), &InstanceStatus::Complete);
-        assert_eq!(sink.starts.len(), 1);
-        assert_eq!(sink.cancellations, [sink.starts[0].3]);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(cancellations, [starts[0].0]);
     }
 
     #[test]
@@ -2138,21 +2110,15 @@ mod tests {
         );
         let definition =
             compile(&scxml::parse("parallel-activity.scxml", &source).unwrap()).unwrap();
-        let mut sink = RecordingActivities::default();
-        let execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-            &mut sink,
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let (starts, _) = drain_activities(&mut execution);
         assert_eq!(execution.status(), &InstanceStatus::Running);
-        assert_eq!(
-            sink.starts
+        assert_eq!(starts.len(), 3);
+        assert!(
+            starts
                 .iter()
-                .map(|start| start.0.as_str())
-                .collect::<Vec<_>>(),
-            ["outer", "left-job", "right-job"]
+                .all(|(_, work)| work.argument == LuauValue::Nil)
         );
     }
 
@@ -2169,25 +2135,24 @@ mod tests {
             .add_transition(active, StateTreeTransition::eventless().target(active))
             .unwrap();
         let definition = builder.build().unwrap();
-        let mut sink = RecordingActivities::default();
-        let execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
-            &definition,
-            no_events_protocol(),
-            NonZeroUsize::new(1).unwrap(),
-            &mut sink,
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<NoEventsDomain>::new(definition, NonZeroUsize::new(1).unwrap());
+        let (starts, cancellations) = drain_activities(&mut execution);
         assert!(matches!(
             execution.status(),
             InstanceStatus::Faulted(RuntimeFault::MicrostepLimitExceeded { .. })
         ));
-        assert_eq!(sink.starts.len(), 2);
-        assert_eq!(sink.cancellations, [sink.starts[0].3, sink.starts[1].3]);
+        assert_eq!(starts.len(), 2);
+        assert_eq!(cancellations, [starts[0].0, starts[1].0]);
     }
 
     struct PayloadDomain;
 
-    impl StateTreeDomain for PayloadDomain {}
+    impl StateTreeDomain for PayloadDomain {
+        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
+            config.event::<PayloadEvent>();
+        }
+    }
 
     #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
     #[state_tree(
@@ -2208,12 +2173,6 @@ mod tests {
         ))
     }
 
-    fn payload_protocol() -> crate::StateTreeEventProtocol<PayloadDomain> {
-        let mut registry = StateTreeEventRegistry::new();
-        registry.register::<PayloadEvent>().unwrap();
-        registry.freeze()
-    }
-
     #[test]
     fn luau_conditions_can_read_projected_external_event_data() {
         let source = format!(
@@ -2227,22 +2186,20 @@ mod tests {
         );
         let document = scxml::parse("payload.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
-        let mut execution = StateTreeExecution::<PayloadDomain>::new(
-            &definition,
-            payload_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<PayloadDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
-        assert!(
-            execution.process_event(&PayloadEvent { amount: 7 }, NonZeroUsize::new(8).unwrap(),)
-        );
+        assert!(execution.process_event(PayloadEvent { amount: 7 }));
         assert_eq!(execution.active_state_names().last(), Some("pass"));
     }
 
     struct FailedProjectionDomain;
 
-    impl StateTreeDomain for FailedProjectionDomain {}
+    impl StateTreeDomain for FailedProjectionDomain {
+        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
+            config.event::<FailedProjectionEvent>();
+        }
+    }
 
     #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
     #[state_tree(
@@ -2259,12 +2216,6 @@ mod tests {
         Err(crate::StateTreeEventDataError::new("projection failed"))
     }
 
-    fn failed_projection_protocol() -> crate::StateTreeEventProtocol<FailedProjectionDomain> {
-        let mut registry = StateTreeEventRegistry::new();
-        registry.register::<FailedProjectionEvent>().unwrap();
-        registry.freeze()
-    }
-
     #[test]
     fn event_data_projection_errors_fault_the_instance() {
         let source = format!(
@@ -2275,14 +2226,10 @@ mod tests {
         );
         let document = scxml::parse("projection.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
-        let mut execution = StateTreeExecution::<FailedProjectionDomain>::new(
-            &definition,
-            failed_projection_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<FailedProjectionDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
-        assert!(execution.process_event(&FailedProjectionEvent, NonZeroUsize::new(8).unwrap(),));
+        assert!(!execution.process_event(FailedProjectionEvent));
         assert!(matches!(
             execution.status(),
             InstanceStatus::Faulted(RuntimeFault::EventDataProjection { .. })
@@ -2299,14 +2246,10 @@ mod tests {
         );
         let document = scxml::parse("event-name.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
-        let mut execution = StateTreeExecution::<FailedProjectionDomain>::new(
-            &definition,
-            failed_projection_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
+        let mut execution =
+            TestApp::<FailedProjectionDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
-        assert!(execution.process_event(&FailedProjectionEvent, NonZeroUsize::new(8).unwrap(),));
+        assert!(execution.process_event(FailedProjectionEvent));
         assert_eq!(execution.active_state_names().last(), Some("pass"));
     }
 
@@ -2535,17 +2478,15 @@ mod tests {
 
     struct CounterDomain;
 
-    impl StateTreeDomain for CounterDomain {}
+    impl StateTreeDomain for CounterDomain {
+        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
+            config.event::<CounterEvent>();
+        }
+    }
 
     #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
     #[state_tree(domain = CounterDomain, name = "tick", broadcast)]
     struct CounterEvent;
-
-    fn counter_protocol() -> crate::StateTreeEventProtocol<CounterDomain> {
-        let mut registry = StateTreeEventRegistry::new();
-        registry.register::<CounterEvent>().unwrap();
-        registry.freeze()
-    }
 
     #[test]
     fn instances_share_bytecode_but_not_luau_data() {
@@ -2564,30 +2505,16 @@ mod tests {
         )
         .unwrap();
         let definition = compile(&document).unwrap();
-        let mut first = StateTreeExecution::<CounterDomain>::new(
-            &definition,
-            counter_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
-        let second = StateTreeExecution::<CounterDomain>::new(
-            &definition,
-            counter_protocol(),
-            NonZeroUsize::new(8).unwrap(),
-        )
-        .unwrap();
+        let mut first =
+            TestApp::<CounterDomain>::new(definition.clone(), NonZeroUsize::new(8).unwrap());
+        let second = TestApp::<CounterDomain>::new(definition, NonZeroUsize::new(8).unwrap());
 
-        assert!(first.process_event(&CounterEvent, NonZeroUsize::new(8).unwrap()));
+        assert!(first.process_event(CounterEvent));
 
         assert_eq!(first.data("count"), Some(&LuauValue::Integer(1)));
         assert_eq!(second.data("count"), Some(&LuauValue::Integer(0)));
 
-        let first = std::thread::spawn(move || {
-            assert!(first.process_event(&CounterEvent, NonZeroUsize::new(8).unwrap()));
-            first
-        })
-        .join()
-        .unwrap();
+        assert!(first.process_event(CounterEvent));
         assert_eq!(first.data("count"), Some(&LuauValue::Integer(2)));
     }
 }

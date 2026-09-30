@@ -14,8 +14,9 @@ use thiserror::Error;
 
 use crate::activity::{RegisteredActivity, StateTreeActivityRegistry};
 use crate::effect::{RegisteredEffect, StateTreeEffectRegistry};
+use crate::event::StateTreeEventProtocol;
 use crate::{
-    StateTreeDomain, StateTreeEventProtocol,
+    StateTreeDomain,
     luau::{CompiledLuauExpression, compile_expression},
 };
 
@@ -405,8 +406,8 @@ impl CompiledDefinition {
 pub(crate) struct LinkedDefinition<D: StateTreeDomain> {
     pub compiled: Arc<CompiledDefinition>,
     external_events: Box<[EventSet]>,
-    effects: Box<[Option<Arc<dyn RegisteredEffect<D>>>]>,
-    activities: Box<[Option<Arc<dyn RegisteredActivity<D>>>]>,
+    effects: Box<[Arc<dyn RegisteredEffect<D>>]>,
+    activities: Box<[Arc<dyn RegisteredActivity<D>>]>,
 }
 
 impl<D: StateTreeDomain> std::fmt::Debug for LinkedDefinition<D> {
@@ -422,8 +423,8 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
     pub fn new(
         compiled: Arc<CompiledDefinition>,
         events: &StateTreeEventProtocol<D>,
-        effects: Option<&StateTreeEffectRegistry<D>>,
-        activities: Option<&StateTreeActivityRegistry<D>>,
+        effects: &StateTreeEffectRegistry<D>,
+        activities: &StateTreeActivityRegistry<D>,
     ) -> Result<Self, StateTreeLinkError> {
         let mut issues = Vec::new();
         for requirement in &compiled.event_requirements {
@@ -451,24 +452,20 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
                 });
             }
         }
-        if let Some(registry) = effects {
-            for (index, name) in compiled.effects.iter().enumerate() {
-                if registry.get(name).is_none() {
-                    issues.push(StateTreeLinkIssue::MissingEffect {
-                        effect: name.clone(),
-                        span_start: first_effect_span(&compiled, EffectId(index as u32)),
-                    });
-                }
+        for (index, name) in compiled.effects.iter().enumerate() {
+            if effects.get(name).is_none() {
+                issues.push(StateTreeLinkIssue::MissingEffect {
+                    effect: name.clone(),
+                    span_start: first_effect_span(&compiled, EffectId(index as u32)),
+                });
             }
         }
-        if let Some(registry) = activities {
-            for activity in &compiled.activities {
-                if registry.get(&activity.name).is_none() {
-                    issues.push(StateTreeLinkIssue::MissingActivity {
-                        activity: activity.name.clone(),
-                        span_start: Some(activity.span_start as usize),
-                    });
-                }
+        for activity in &compiled.activities {
+            if activities.get(&activity.name).is_none() {
+                issues.push(StateTreeLinkIssue::MissingActivity {
+                    activity: activity.name.clone(),
+                    span_start: Some(activity.span_start as usize),
+                });
             }
         }
         if !issues.is_empty() {
@@ -484,12 +481,16 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
             .collect();
         let linked_effects = compiled
             .effect_names()
-            .map(|name| effects.and_then(|effects| effects.get(name)))
+            .map(|name| effects.get(name).expect("effects were validated"))
             .collect();
         let linked_activities = compiled
             .activities
             .iter()
-            .map(|activity| activities.and_then(|registry| registry.get(&activity.name)))
+            .map(|activity| {
+                activities
+                    .get(&activity.name)
+                    .expect("activities were validated")
+            })
             .collect();
         Ok(Self {
             compiled,
@@ -503,14 +504,12 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
         self.external_events.get(index)
     }
 
-    pub fn effect(&self, effect: EffectId) -> Option<&Arc<dyn RegisteredEffect<D>>> {
-        self.effects.get(effect.index()).and_then(Option::as_ref)
+    pub fn effect(&self, effect: EffectId) -> &Arc<dyn RegisteredEffect<D>> {
+        &self.effects[effect.index()]
     }
 
-    pub fn activity(&self, activity: ActivityId) -> Option<&Arc<dyn RegisteredActivity<D>>> {
-        self.activities
-            .get(activity.index())
-            .and_then(Option::as_ref)
+    pub fn activity(&self, activity: ActivityId) -> &Arc<dyn RegisteredActivity<D>> {
+        &self.activities[activity.index()]
     }
 }
 

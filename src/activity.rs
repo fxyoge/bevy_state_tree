@@ -20,78 +20,8 @@ use bevy_ecs::{
 use crate::{
     LuauValue, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
     StateTreeDomain, StateTreeEffectContext, StateTreeEffectError, StateTreeEventDataError,
-    StateTreeInstance,
-    definition::ActivityId,
-    event::{StateTreeEvent, StateTreeEventRef},
+    StateTreeInstance, definition::ActivityId,
 };
-
-/// Portable generation-safe token used by headless activity sinks.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct StateTreeHeadlessActivityToken {
-    pub(crate) runtime_id: u64,
-    pub(crate) activity: ActivityId,
-    pub(crate) generation: u64,
-}
-
-/// One portable activity start emitted by headless execution.
-pub struct StateTreeActivityRequest<'a, D: StateTreeDomain> {
-    id: &'a str,
-    name: &'a str,
-    token: StateTreeHeadlessActivityToken,
-    span_start: usize,
-    event_name: Option<&'a str>,
-    external_event: Option<StateTreeEventRef<'a, D>>,
-    data_names: &'a [Box<str>],
-    data: &'a [LuauValue],
-    arguments: &'a mut StateTreeActivityArgs,
-}
-
-impl<'a, D: StateTreeDomain> StateTreeActivityRequest<'a, D> {
-    pub fn id(&self) -> &str {
-        self.id
-    }
-    pub fn name(&self) -> &str {
-        self.name
-    }
-    pub fn token(&self) -> StateTreeHeadlessActivityToken {
-        self.token
-    }
-    pub fn span_start(&self) -> usize {
-        self.span_start
-    }
-    pub fn event_name(&self) -> Option<&str> {
-        self.event_name
-    }
-    pub fn external_event(&self) -> Option<StateTreeEventRef<'a, D>> {
-        self.external_event
-    }
-    pub fn event_ref(&self) -> Option<StateTreeEventRef<'a, D>> {
-        self.external_event
-    }
-    pub fn event<T: StateTreeEvent<D>>(&self) -> Option<&T> {
-        self.external_event
-            .and_then(StateTreeEventRef::payload::<T>)
-    }
-    /// Returns one instance-local datamodel value.
-    pub fn data(&self, name: &str) -> Option<&LuauValue> {
-        self.data_names
-            .iter()
-            .position(|candidate| candidate.as_ref() == name)
-            .and_then(|index| self.data.get(index))
-    }
-    pub fn arguments(&mut self) -> &mut StateTreeActivityArgs {
-        self.arguments
-    }
-}
-
-/// Receives starts and cancellations from a headless state-tree execution.
-pub trait StateTreeActivitySink<D: StateTreeDomain> {
-    fn start(
-        &mut self,
-        request: StateTreeActivityRequest<'_, D>,
-    ) -> Result<(), StateTreeActivityError>;
-    fn cancel(&mut self, token: StateTreeHeadlessActivityToken);
-}
 
 /// A typed long-running request owned by one active state.
 pub trait StateTreeActivity: Send + Sync + 'static {
@@ -201,38 +131,14 @@ pub(crate) trait RegisteredActivity<D: StateTreeDomain>: Send + Sync {
 
 pub(crate) trait RuntimeActivitySink<D: StateTreeDomain> {
     fn start(&mut self, request: RuntimeActivityStart<'_, D>) -> Result<(), StateTreeEffectError>;
-    fn cancel(
-        &mut self,
-        handler: Option<&Arc<dyn RegisteredActivity<D>>>,
-        token: ErasedActivityToken,
-    );
+    fn cancel(&mut self, handler: &Arc<dyn RegisteredActivity<D>>, token: ErasedActivityToken);
 }
 
 pub(crate) struct RuntimeActivityStart<'a, D: StateTreeDomain> {
-    pub id: &'a str,
-    pub name: &'a str,
-    pub handler: Option<&'a Arc<dyn RegisteredActivity<D>>>,
+    pub handler: &'a Arc<dyn RegisteredActivity<D>>,
     pub context: StateTreeEffectContext<'a, D>,
     pub arguments: StateTreeActivityArgs,
     pub token: ErasedActivityToken,
-    pub span_start: usize,
-}
-
-pub(crate) struct RejectActivities;
-
-impl<D: StateTreeDomain> RuntimeActivitySink<D> for RejectActivities {
-    fn start(&mut self, request: RuntimeActivityStart<'_, D>) -> Result<(), StateTreeEffectError> {
-        Err(StateTreeEffectError::new(format!(
-            "activity `{}` requires an activity sink",
-            request.name
-        )))
-    }
-    fn cancel(
-        &mut self,
-        _handler: Option<&Arc<dyn RegisteredActivity<D>>>,
-        _token: ErasedActivityToken,
-    ) {
-    }
 }
 
 pub(crate) struct BevyActivitySink<'a, 'w, 's> {
@@ -241,69 +147,15 @@ pub(crate) struct BevyActivitySink<'a, 'w, 's> {
 
 impl<D: StateTreeDomain> RuntimeActivitySink<D> for BevyActivitySink<'_, '_, '_> {
     fn start(&mut self, request: RuntimeActivityStart<'_, D>) -> Result<(), StateTreeEffectError> {
-        request
-            .handler
-            .ok_or_else(|| {
-                StateTreeEffectError::new(format!(
-                    "activity `{name}` is not registered for this domain",
-                    name = request.name
-                ))
-            })?
-            .start(
-                request.context,
-                request.arguments,
-                request.token,
-                self.commands,
-            )
+        request.handler.start(
+            request.context,
+            request.arguments,
+            request.token,
+            self.commands,
+        )
     }
-    fn cancel(
-        &mut self,
-        handler: Option<&Arc<dyn RegisteredActivity<D>>>,
-        token: ErasedActivityToken,
-    ) {
-        if let Some(handler) = handler {
-            handler.cancel(token, self.commands);
-        }
-    }
-}
-
-pub(crate) struct HeadlessActivitySink<'a, S: ?Sized> {
-    pub sink: &'a mut S,
-}
-
-impl<D, S> RuntimeActivitySink<D> for HeadlessActivitySink<'_, S>
-where
-    D: StateTreeDomain,
-    S: StateTreeActivitySink<D> + ?Sized,
-{
-    fn start(&mut self, request: RuntimeActivityStart<'_, D>) -> Result<(), StateTreeEffectError> {
-        let mut arguments = request.arguments;
-        self.sink.start(StateTreeActivityRequest {
-            id: request.id,
-            name: request.name,
-            token: StateTreeHeadlessActivityToken {
-                runtime_id: request.token.runtime_id,
-                activity: request.token.activity,
-                generation: request.token.generation,
-            },
-            span_start: request.span_start,
-            event_name: request.context.event_name,
-            external_event: request.context.external_event,
-            data_names: request.context.data_names,
-            data: request.context.data,
-            arguments: &mut arguments,
-        })
-    }
-    fn cancel(
-        &mut self,
-        _handler: Option<&Arc<dyn RegisteredActivity<D>>>,
-        token: ErasedActivityToken,
-    ) {
-        self.sink.cancel(StateTreeHeadlessActivityToken {
-            runtime_id: token.runtime_id,
-            activity: token.activity,
-            generation: token.generation,
-        });
+    fn cancel(&mut self, handler: &Arc<dyn RegisteredActivity<D>>, token: ErasedActivityToken) {
+        handler.cancel(token, self.commands);
     }
 }
 
@@ -380,14 +232,12 @@ where
 #[derive(Resource)]
 pub(crate) struct StateTreeActivityRegistry<D: StateTreeDomain> {
     activities: HashMap<Box<str>, Arc<dyn RegisteredActivity<D>>>,
-    revision: u64,
 }
 
 impl<D: StateTreeDomain> Default for StateTreeActivityRegistry<D> {
     fn default() -> Self {
         Self {
             activities: HashMap::new(),
-            revision: 0,
         }
     }
 }
@@ -395,9 +245,6 @@ impl<D: StateTreeDomain> Default for StateTreeActivityRegistry<D> {
 impl<D: StateTreeDomain> StateTreeActivityRegistry<D> {
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredActivity<D>>> {
         self.activities.get(name).cloned()
-    }
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
     }
 }
 
@@ -552,5 +399,4 @@ where
             marker: PhantomData,
         }),
     );
-    registry.revision = registry.revision.wrapping_add(1);
 }

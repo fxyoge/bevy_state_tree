@@ -14,7 +14,7 @@ use bevy_ecs::{
 use bevy_state_tree::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeActivity,
     StateTreeActivityDefinition, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
-    StateTreeActivityToken, StateTreeAppExt, StateTreeBuilder, StateTreeDefinition,
+    StateTreeActivityToken, StateTreeBuilder, StateTreeConfig, StateTreeDefinition,
     StateTreeDomain, StateTreeEvent, StateTreeInstance, StateTreePlugin, StateTreeSet,
     StateTreeTransition,
 };
@@ -31,7 +31,21 @@ pub struct AiUpdate;
 
 pub struct Simulation;
 
-impl StateTreeDomain for Simulation {}
+impl StateTreeDomain for Simulation {
+    fn configure(config: &mut StateTreeConfig<'_, Self>) {
+        config
+            .event::<Tick>()
+            .event::<EntityTick>()
+            .event::<Ignored>()
+            .effect::<BenchmarkEffect, _>("benchmark", |_context, arguments| {
+                let _: i64 = arguments.take("amount")?;
+                Ok(BenchmarkEffect)
+            })
+            .activity::<BenchmarkActivity, _>("benchmark", |_context, _arguments| {
+                Ok(BenchmarkActivity)
+            });
+    }
+}
 
 #[derive(Event, StateTreeEvent)]
 #[state_tree(domain = Simulation, name = "tick", broadcast)]
@@ -106,9 +120,6 @@ impl BenchmarkApp {
         ))
         .init_schedule(AiUpdate)
         .add_plugins(StateTreePlugin::<Simulation>::new(AiUpdate))
-        .register_state_tree_event::<Simulation, Tick>()
-        .register_state_tree_event::<Simulation, EntityTick>()
-        .register_state_tree_event::<Simulation, Ignored>()
         .insert_resource(QueuedEvent::None)
         .add_systems(
             AiUpdate,
@@ -151,26 +162,14 @@ impl BenchmarkApp {
     }
 
     pub fn register_benchmark_effect(&mut self) {
-        self.app
-            .register_state_tree_effect::<Simulation, BenchmarkEffect, _>(
-                "benchmark",
-                |_context, arguments| {
-                    let _: i64 = arguments.take("amount")?;
-                    Ok(BenchmarkEffect)
-                },
-            )
-            .add_systems(
-                AiUpdate,
-                clear_benchmark_effects.in_set(StateTreeSet::HandleEffects),
-            );
+        self.app.add_systems(
+            AiUpdate,
+            clear_benchmark_effects.in_set(StateTreeSet::HandleEffects),
+        );
     }
 
     pub fn register_benchmark_activity(&mut self) {
         self.app
-            .register_state_tree_activity::<Simulation, BenchmarkActivity, _>(
-                "benchmark",
-                |_context, _arguments| Ok(BenchmarkActivity),
-            )
             .init_resource::<BenchmarkActivityTokens>()
             .add_systems(
                 AiUpdate,

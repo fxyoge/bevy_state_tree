@@ -43,23 +43,17 @@ runtime. Definitions generated in code remain supported through
 See [SCXML Support Policy](SCXML.md) for the Bevy-first compatibility scope and
 intentional differences from general-purpose SCXML processors.
 
-Project-owned SCXML fixtures under `tests/scxml` execute through the public
-headless runtime and are compared with deterministic semantic event logs. The
-same opt-in tracing API is available to applications without adding tracing
-work to the normal Bevy execution path.
+Project-owned SCXML fixtures under `tests/scxml` execute through a non-rendering
+Bevy `App` and are compared with deterministic semantic event logs.
 
-Each runtime domain is a marker type implementing `StateTreeDomain`. Its
-external event protocol is open during application setup: derive
-`StateTreeEvent` on each concrete payload and register each domain/payload pair
-with `app.register_state_tree_event::<D, E>()`. Payloads are entity-targeted by
-default; add `broadcast` for domain-wide events.
-
-The registry freezes on first protocol use. In Bevy, register every payload
-before the first state-tree schedule run or event write; duplicate or late
-registration through `StateTreeAppExt` panics. Linking resolves authored event
-descriptors against the frozen registered names and prelinks each event type to
-dense transition sets. Processing does not scan strings or Rust types for
-candidate transitions.
+Each runtime domain implements `StateTreeDomain::configure` and declares its
+complete event, effect, and activity protocol through `StateTreeConfig`.
+`StateTreePlugin` consumes that declaration automatically when it is installed;
+there is no application registration API or separate execution protocol.
+Payloads are entity-targeted by default; add `broadcast` for domain-wide events.
+Linking resolves authored names against the domain declaration and prelinks each
+event type to dense transition sets. Processing does not scan strings or Rust
+types for candidate transitions.
 
 Payloads can opt into Luau projection with `data = projector`. The projector is
 called only when an executed expression reads `_event.data`; its portable value
@@ -74,8 +68,6 @@ use bevy_time::TimePlugin;
 
 struct Simulation;
 
-impl StateTreeDomain for Simulation {}
-
 #[derive(EntityEvent, StateTreeEvent)]
 #[state_tree(domain = Simulation, name = "wake", data = wake_data)]
 struct Wake {
@@ -88,6 +80,12 @@ fn wake_data(_: &Wake) -> Result<LuauValue, StateTreeEventDataError> {
     ))
 }
 
+impl StateTreeDomain for Simulation {
+    fn configure(config: &mut StateTreeConfig<'_, Self>) {
+        config.event::<Wake>();
+    }
+}
+
 fn wake(mut events: EntityStateTreeEventWriter<Simulation>) {
     // In a real system this would be the entity whose tree should wake.
     let entity = Entity::PLACEHOLDER;
@@ -97,7 +95,6 @@ fn wake(mut events: EntityStateTreeEventWriter<Simulation>) {
 let mut app = App::new();
 app.add_plugins((TimePlugin, AssetPlugin::default()))
     .add_plugins(StateTreePlugin::<Simulation>::new(FixedUpdate))
-    .register_state_tree_event::<Simulation, Wake>()
     .add_systems(FixedUpdate, wake.in_set(StateTreeSet::QueueEvents));
 ```
 
@@ -123,7 +120,9 @@ Bevy's normal asset server and attach its handle to an entity:
 # use bevy_ecs::prelude::*;
 # use bevy_state_tree::prelude::*;
 # struct Simulation;
-# impl StateTreeDomain for Simulation {}
+# impl StateTreeDomain for Simulation {
+#     fn configure(_config: &mut StateTreeConfig<'_, Self>) {}
+# }
 fn spawn_controller(mut commands: Commands, assets: Res<AssetServer>) {
     let definition = assets.load("state_trees/enemy.scxml");
     commands.spawn(StateTreeInstance::<Simulation>::new(definition));
@@ -138,7 +137,9 @@ initial state entry actions, guards, effects, or activities:
 # use bevy_asset::Handle;
 # use bevy_state_tree::prelude::*;
 # struct Simulation;
-# impl StateTreeDomain for Simulation {}
+# impl StateTreeDomain for Simulation {
+#     fn configure(_config: &mut StateTreeConfig<'_, Self>) {}
+# }
 # let definition = Handle::<StateTreeDefinition>::default();
 let initial_data = StateTreeDataOverrides::try_new([
     ("health", LuauValue::Integer(100)),
@@ -208,9 +209,7 @@ deadline are selected as one transition cohort, while multiple overdue
 deadlines are processed chronologically so an earlier transition can cancel a
 later timeout.
 
-Headless execution advances its explicit clock with
-`StateTreeExecution::advance_time` and the corresponding traced or effect-sink
-variants. Bevy execution reads `Time`, so `TimePlugin` must be installed before
+Execution reads Bevy `Time`, so `TimePlugin` must be installed before
 `StateTreePlugin`. Due timeouts run in `StateTreeSet::ProcessTimers`, before
 `QueueEvents`, `ProcessActivityOutcomes`, and `ProcessEvents`; a timeout
 therefore wins over an external event delivered in the same schedule run when
@@ -256,45 +255,16 @@ Asset replacement is not currently applied to running instances. They retain
 the definition against which they initialized; new and pending instances use
 the replacement asset.
 
-Definitions are linked against each domain's typed event protocol, effect
-registry, and activity registry before initialization. An unmatched event
-descriptor or unregistered effect or activity leaves the instance pending and
-adds a queryable `StateTreeLinkFailure<D>` component. Replacing the asset or
-registering a missing effect or activity retries linking without changing
-successfully running instances.
+Definitions are linked against each domain's complete typed declaration before
+initialization. An unmatched event descriptor or undeclared effect or activity
+leaves the instance pending and adds a queryable `StateTreeLinkFailure<D>`
+component. Replacing the asset retries linking without changing successfully
+running instances; domain declarations are immutable after plugin installation.
 
-Headless execution builds and freezes the same protocol explicitly, then passes
-it to `StateTreeExecution`:
-
-```rust,no_run
-use std::num::NonZeroUsize;
-use bevy_ecs::event::Event;
-use bevy_state_tree::prelude::*;
-
-struct Simulation;
-impl StateTreeDomain for Simulation {}
-
-#[derive(Event, StateTreeEvent)]
-#[state_tree(domain = Simulation, name = "tick", broadcast)]
-struct Tick;
-
-# fn run(definition: &StateTreeDefinition) -> Result<(), StateTreeLinkError> {
-let mut events = StateTreeEventRegistry::<Simulation>::new();
-events.register::<Tick>().expect("register tick before freeze");
-let protocol = events.freeze();
-let mut execution = StateTreeExecution::<Simulation>::new(
-    definition,
-    protocol,
-    NonZeroUsize::new(1024).unwrap(),
-)?;
-execution.process_event(&Tick, NonZeroUsize::new(1024).unwrap());
-# Ok(())
-# }
-```
-
-`StateTreeEventRegistry::freeze` is idempotent and returns a cheaply cloneable
-immutable protocol. Registration after it freezes returns
-`StateTreeEventRegistrationError::Frozen`.
+For deterministic inspection, install `StateTreeTracePlugin::<D>::default()`
+and read `StateTreeTraceLog<D>` from the App world. Logs are keyed by entity.
+Without the trace plugin, macrosteps use the no-trace engine specialization: no
+trace record is allocated, formatted, or locked.
 
 The complete domain schedule order is `ProcessTimers`, `QueueEvents`,
 `ProcessActivityOutcomes`, `Initialize`, `ProcessEvents`, `HandleActivities`,
@@ -324,19 +294,15 @@ Bevy-specific executable content uses the `urn:bevy-state-tree` namespace:
 </scxml>
 ```
 
-Register each authored name with `StateTreeAppExt::register_state_tree_effect`.
-The constructor consumes named `StateTreeEffectArgs` and returns one concrete
+Declare each authored name with `StateTreeConfig::effect` in the domain's
+`configure` implementation. The constructor consumes named
+`StateTreeEffectArgs` and returns one concrete
 Bevy `Message`. Messages are available to systems in `StateTreeSet::HandleEffects`.
 Construction follows statechart action order, but message delivery order between
 parallel instances is unspecified. Constructor, argument, and payload projection
 errors fault only the affected instance. A constructor can recover its concrete
 trigger payload with `context.event::<Wake>()`; internal events and other
-external payload types return `None`. Headless callers use
-`StateTreeExecution::{new,process_event}_with_sink` to receive portable requests.
-Headless constructors return `Result` because the definition must still link to
-the execution's typed event protocol. `StateTreeExecution::new_with_initial_data`
-and the corresponding sink and traced variants apply the same per-instance
-override semantics.
+external payload types return `None`.
 
 ## Typed Activities
 
@@ -370,12 +336,8 @@ outcomes are ignored.
 Output and error independently project portable Luau `_event.data`; projection
 errors fault the target instance. The generated `done.activity.*` and
 `error.activity.*` events are internal events: they remain inside the instance,
-but can be handled with normal authored event descriptors. Headless execution uses
-`StateTreeActivitySink`, `new_with_activity_sink`,
-`process_event_with_activity_sink`, and manual `complete_activity` /
-`fail_activity` methods. Charts containing both effects and activities should
-use the explicit `*_with_sinks` constructor, event, timer, and outcome methods
-to supply both sinks for every macrostep. The crate does not prescribe futures
+but can be handled with normal authored event descriptors. Activities are
+declared with `StateTreeConfig::activity`; the crate does not prescribe futures
 or tasks.
 
 ## Semantic Tests

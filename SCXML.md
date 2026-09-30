@@ -25,8 +25,8 @@ column; compiler diagnostics retain the asset path and byte position.
 Asset loading is domain-independent. It validates authored SCXML and produces
 the same immutable runtime representation as `StateTreeBuilder::build`, but it
 does not resolve external events, typed effects, or typed activities. Those
-checks depend on a domain's frozen event protocol and registries and occur when
-a `StateTreeInstance` initializes. A source can load successfully and still
+checks depend on the domain declaration consumed by `StateTreePlugin` and occur
+when a `StateTreeInstance` initializes. A source can load successfully and still
 leave an instance pending with `StateTreeLinkFailure<D>` for a particular
 domain.
 
@@ -36,18 +36,14 @@ path as file-loaded definitions.
 
 ## Events
 
-Each state-tree domain is a marker type implementing `StateTreeDomain`. Its
-external event protocol is open during setup: each concrete payload derives
-`StateTreeEvent` with its domain and authored name, then Bevy applications call
-`app.register_state_tree_event::<D, E>()`. Entity payloads also derive
+Each state-tree domain implements `StateTreeDomain::configure`. Every concrete
+payload derives `StateTreeEvent` with its domain and authored name, then the
+domain declares it with `StateTreeConfig::event`. Entity payloads also derive
 `EntityEvent`; broadcast payloads derive Bevy `Event` and use the
 `#[state_tree(..., broadcast)]` option.
 
-The registry freezes on first protocol use, including the first state-tree
-schedule run or event write. All payloads must therefore be registered before
-execution; duplicate or late application registration panics. Headless callers
-instead register payloads in `StateTreeEventRegistry<D>`, call `freeze`, and pass
-the resulting `StateTreeEventProtocol<D>` to `StateTreeExecution`.
+`StateTreePlugin` consumes the complete declaration during installation. There
+is no mutable application registration API and no separate portable protocol.
 
 Authored descriptors are checked against registered authored names when a
 definition is linked. Descriptor matching retains SCXML prefix and wildcard
@@ -231,12 +227,8 @@ external payload; it returns `None` for internal events or another payload type.
 
 Effects are constructed in SCXML action order. Publication across independently
 processed instances is unordered. A constructor, argument conversion, or
-unregistered-effect error faults the affected instance; actions already run in
-that macrostep are not rolled back. Headless execution can provide a
-`StateTreeEffectSink`; without one, encountering an effect faults the execution.
-Definitions containing both effects and activities use the explicit headless
-`*_with_sinks` methods so initialization, events, timers, and activity outcomes
-receive both sinks.
+unregistered-effect error prevents linking; actions already run before a runtime
+constructor or conversion error are not rolled back.
 
 SCXML `<send>` remains unsupported and is not an alias for typed effects.
 
@@ -278,8 +270,10 @@ concurrent writer order is unspecified, like entity event ingress.
 
 ## Semantic Traces
 
-The public opt-in trace API records transition sets, state exit attempts and
-commits, actions, entries, configurations, and status changes in deterministic
-semantic order. It does not expose task scheduling or speculative transition
-selection. Project-owned SCXML fixtures and checked-in `.trace` files exercise
-the parser, compiler, and headless runtime as one black box.
+The opt-in `StateTreeTracePlugin<D>` records transition sets, state exit attempts
+and commits, actions, entries, configurations, and status changes in
+deterministic semantic order. `StateTreeTraceLog<D>` exposes per-entity event
+logs. Tracing does not expose task scheduling or speculative transition
+selection, and the normal App path performs no per-record work when the plugin
+is absent. Project-owned SCXML fixtures and checked-in `.trace` files exercise
+the parser, compiler, and non-rendering Bevy App runtime as one black box.

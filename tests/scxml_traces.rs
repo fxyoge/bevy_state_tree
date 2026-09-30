@@ -1,17 +1,34 @@
 use std::{collections::BTreeSet, fs, num::NonZeroUsize, path::Path};
 
-use bevy_ecs::event::Event;
-use bevy_state_tree::{
-    InstanceStatus, StateTreeDomain, StateTreeEvent, StateTreeEventLog, StateTreeEventRegistry,
-    StateTreeExecution, scxml,
+use bevy_app::{App, Update};
+use bevy_asset::{AssetPlugin, Assets};
+use bevy_ecs::{
+    event::Event,
+    system::{In, RunSystemOnce},
 };
+use bevy_state_tree::{
+    BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, InstanceStatus, StateTreeConfig,
+    StateTreeDefinition, StateTreeDomain, StateTreeEvent, StateTreeInstance, StateTreePlugin,
+    StateTreeSettings, StateTreeTraceLog, StateTreeTracePlugin, scxml,
+};
+use bevy_time::TimePlugin;
 
 const CASES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/scxml");
 const MICROSTEP_LIMIT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 struct HarnessDomain;
 
-impl StateTreeDomain for HarnessDomain {}
+impl StateTreeDomain for HarnessDomain {
+    fn configure(config: &mut StateTreeConfig<'_, Self>) {
+        config
+            .event::<A>()
+            .event::<AB>()
+            .event::<Advance>()
+            .event::<Finish>()
+            .event::<Reset>()
+            .event::<Tick>();
+    }
+}
 
 #[derive(Event, StateTreeEvent)]
 #[state_tree(domain = HarnessDomain, name = "a", broadcast)]
@@ -39,22 +56,6 @@ struct Tick;
 
 #[test]
 fn scxml_cases_match_their_semantic_traces() {
-    let mut registry = StateTreeEventRegistry::<HarnessDomain>::new();
-    registry
-        .register::<A>()
-        .unwrap()
-        .register::<AB>()
-        .unwrap()
-        .register::<Advance>()
-        .unwrap()
-        .register::<Finish>()
-        .unwrap()
-        .register::<Reset>()
-        .unwrap()
-        .register::<Tick>()
-        .unwrap();
-    let protocol = registry.freeze();
-
     let root = Path::new(CASES);
     let manifest_path = root.join("manifest.txt");
     let expected_cases: BTreeSet<_> = fs::read_to_string(&manifest_path)
@@ -126,14 +127,23 @@ fn scxml_cases_match_their_semantic_traces() {
             }
         };
 
-        let mut log = StateTreeEventLog::new();
-        let mut execution = StateTreeExecution::<HarnessDomain>::new_traced(
-            &definition,
-            protocol.clone(),
-            MICROSTEP_LIMIT,
-            &mut log,
-        )
-        .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            TimePlugin,
+            AssetPlugin::default(),
+            StateTreeTracePlugin::<HarnessDomain>::default(),
+            StateTreePlugin::<HarnessDomain>::new(Update),
+        ));
+        app.insert_resource(StateTreeSettings::<HarnessDomain>::new(MICROSTEP_LIMIT));
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(definition);
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<HarnessDomain>::new(handle))
+            .id();
+        app.update();
         let events_path = case.with_extension("events");
         if events_path.exists() {
             let events = fs::read_to_string(&events_path).expect("read SCXML case events");
@@ -142,24 +152,27 @@ fn scxml_cases_match_their_semantic_traces() {
                 if name.is_empty() || name.starts_with('#') {
                     continue;
                 }
-                if execution.status() != &InstanceStatus::Running {
+                let status = app
+                    .world()
+                    .get::<StateTreeInstance<HarnessDomain>>(entity)
+                    .unwrap()
+                    .status();
+                if status != &InstanceStatus::Running {
                     failures.push(format!(
                         "{}:{}: event {name:?} follows terminal status {:?}",
                         events_path.display(),
                         line_index + 1,
-                        execution.status()
+                        status
                     ));
                     break;
                 }
                 match name {
-                    "a" => execution.process_event_traced(&A, MICROSTEP_LIMIT, &mut log),
-                    "a.b" => execution.process_event_traced(&AB, MICROSTEP_LIMIT, &mut log),
-                    "advance" => {
-                        execution.process_event_traced(&Advance, MICROSTEP_LIMIT, &mut log)
-                    }
-                    "finish" => execution.process_event_traced(&Finish, MICROSTEP_LIMIT, &mut log),
-                    "reset" => execution.process_event_traced(&Reset, MICROSTEP_LIMIT, &mut log),
-                    "tick" => execution.process_event_traced(&Tick, MICROSTEP_LIMIT, &mut log),
+                    "a" => queue(&mut app, A),
+                    "a.b" => queue(&mut app, AB),
+                    "advance" => queue(&mut app, Advance),
+                    "finish" => queue(&mut app, Finish),
+                    "reset" => queue(&mut app, Reset),
+                    "tick" => queue(&mut app, Tick),
                     _ => {
                         failures.push(format!(
                             "{}:{}: undeclared harness event {name:?}",
@@ -168,10 +181,15 @@ fn scxml_cases_match_their_semantic_traces() {
                         ));
                         continue;
                     }
-                };
+                }
             }
         }
 
+        let log = app
+            .world()
+            .resource::<StateTreeTraceLog<HarnessDomain>>()
+            .get(entity)
+            .unwrap();
         let expected = fs::read_to_string(&trace_path).expect("read expected SCXML trace");
         if expected != log.as_str() {
             failures.push(format!(
@@ -188,4 +206,18 @@ fn scxml_cases_match_their_semantic_traces() {
             failures.join("\n\n")
         );
     }
+}
+
+fn queue<E: BroadcastStateTreeEvent<HarnessDomain>>(app: &mut App, event: E) {
+    app.world_mut()
+        .run_system_once_with(queue_event::<E>, event)
+        .unwrap();
+    app.update();
+}
+
+fn queue_event<E: BroadcastStateTreeEvent<HarnessDomain>>(
+    In(event): In<E>,
+    mut writer: BroadcastStateTreeEventWriter<HarnessDomain>,
+) {
+    writer.write(event);
 }

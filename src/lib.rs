@@ -27,6 +27,7 @@
 extern crate self as bevy_state_tree;
 
 mod activity;
+mod config;
 mod definition;
 mod effect;
 mod event;
@@ -35,9 +36,13 @@ mod luau;
 mod plugin;
 mod trace;
 
+#[cfg(test)]
+mod test_harness;
+
 pub mod scxml;
 
 pub use bevy_state_tree_macros::StateTreeEvent;
+pub use config::StateTreeConfig;
 pub use definition::{
     BuildError, HistoryId, StateId, StateTreeAction, StateTreeActivityDefinition,
     StateTreeArgument, StateTreeBuilder, StateTreeData, StateTreeDefinition,
@@ -46,27 +51,27 @@ pub use definition::{
 };
 pub use effect::{
     FromStateTreeValue, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
-    StateTreeAppExt, StateTreeArgs, StateTreeContext, StateTreeEffectArgs, StateTreeEffectContext,
-    StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
+    StateTreeArgs, StateTreeContext, StateTreeEffectArgs, StateTreeEffectContext,
+    StateTreeEffectError,
 };
 pub use event::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEvent,
-    StateTreeEventDataError, StateTreeEventProtocol, StateTreeEventRef,
-    StateTreeEventRegistrationError, StateTreeEventRegistry,
+    StateTreeEventDataError, StateTreeEventRef,
 };
 pub use instance::{
     DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeDataOverrideError,
-    StateTreeDataOverrides, StateTreeExecution, StateTreeInstance,
+    StateTreeDataOverrides, StateTreeInstance,
 };
 pub use luau::LuauValue;
 pub use plugin::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeLinkFailure,
     StateTreePlugin, StateTreeSet, StateTreeSettings,
 };
-pub use trace::{
-    NoStateTreeTrace, StateTreeEventLog, StateTreeHistoryResolution, StateTreeTrace,
-    StateTreeTraceRecord, StateTreeTraceTrigger,
+pub(crate) use trace::{
+    NoStateTreeTrace, StateTreeHistoryResolution, StateTreeTrace, StateTreeTraceRecord,
+    StateTreeTraceTrigger,
 };
+pub use trace::{StateTreeEventLog, StateTreeTraceLog, StateTreeTracePlugin};
 
 /// Common state-tree imports.
 pub mod prelude {
@@ -76,21 +81,17 @@ pub mod prelude {
         InstanceStatus, LuauValue, RuntimeFault, StateId, StateTreeAction, StateTreeActivity,
         StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityDefinition,
         StateTreeActivityError, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
-        StateTreeActivityRequest, StateTreeActivitySink, StateTreeActivityToken, StateTreeAppExt,
-        StateTreeArgs, StateTreeArgument, StateTreeBuilder, StateTreeContext, StateTreeData,
-        StateTreeDataOverrideError, StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain,
-        StateTreeEffectArgs, StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
-        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEvent, StateTreeEventDataError,
-        StateTreeEventLog, StateTreeEventProtocol, StateTreeEventRef,
-        StateTreeEventRegistrationError, StateTreeEventRegistry, StateTreeExecution,
-        StateTreeHeadlessActivityToken, StateTreeHistoryResolution, StateTreeInstance,
+        StateTreeActivityToken, StateTreeArgs, StateTreeArgument, StateTreeBuilder,
+        StateTreeConfig, StateTreeContext, StateTreeData, StateTreeDataOverrideError,
+        StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain, StateTreeEffectArgs,
+        StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError, StateTreeEvent,
+        StateTreeEventDataError, StateTreeEventLog, StateTreeEventRef, StateTreeInstance,
         StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin,
-        StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTrace, StateTreeTraceRecord,
-        StateTreeTraceTrigger, StateTreeTransition,
+        StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTraceLog, StateTreeTracePlugin,
+        StateTreeTransition,
     };
 }
 pub use activity::{
     StateTreeActivity, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
-    StateTreeActivityRequest, StateTreeActivitySink, StateTreeActivityToken,
-    StateTreeHeadlessActivityToken,
+    StateTreeActivityToken,
 };

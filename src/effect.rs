@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     LuauValue, StateTreeDomain,
-    event::{StateTreeAppEventRegistry, StateTreeEvent, StateTreeEventRef},
+    event::{StateTreeEvent, StateTreeEventRef},
 };
 
 /// An error while constructing a typed state-tree effect.
@@ -43,7 +43,7 @@ impl StateTreeEffectError {
 
 /// Immutable execution context supplied to a typed state-tree constructor.
 pub struct StateTreeContext<'a, D: StateTreeDomain> {
-    pub(crate) entity: Option<Entity>,
+    pub(crate) entity: Entity,
     pub(crate) event_name: Option<&'a str>,
     pub(crate) external_event: Option<StateTreeEventRef<'a, D>>,
     pub(crate) data_names: &'a [Box<str>],
@@ -51,8 +51,8 @@ pub struct StateTreeContext<'a, D: StateTreeDomain> {
 }
 
 impl<'a, D: StateTreeDomain> StateTreeContext<'a, D> {
-    /// Returns the Bevy entity running the tree, or `None` for headless execution.
-    pub fn entity(&self) -> Option<Entity> {
+    /// Returns the Bevy entity running the tree.
+    pub fn entity(&self) -> Entity {
         self.entity
     }
 
@@ -155,60 +155,6 @@ pub type StateTreeEffectArgs = StateTreeArgs;
 pub type StateTreeActivityArgs = StateTreeArgs;
 /// Activity constructors use the shared effect-construction error type.
 pub type StateTreeActivityError = StateTreeEffectError;
-
-/// One portable effect request emitted by headless execution.
-pub struct StateTreeEffectRequest<'a, D: StateTreeDomain> {
-    name: &'a str,
-    span_start: usize,
-    event_name: Option<&'a str>,
-    external_event: Option<StateTreeEventRef<'a, D>>,
-    data_names: &'a [Box<str>],
-    data: &'a [LuauValue],
-    arguments: &'a mut StateTreeEffectArgs,
-}
-
-impl<'a, D: StateTreeDomain> StateTreeEffectRequest<'a, D> {
-    pub fn name(&self) -> &str {
-        self.name
-    }
-
-    pub fn span_start(&self) -> usize {
-        self.span_start
-    }
-
-    pub fn event_name(&self) -> Option<&str> {
-        self.event_name
-    }
-
-    pub fn external_event(&self) -> Option<StateTreeEventRef<'a, D>> {
-        self.external_event
-    }
-
-    pub fn event_ref(&self) -> Option<StateTreeEventRef<'a, D>> {
-        self.external_event
-    }
-
-    pub fn event<T: StateTreeEvent<D>>(&self) -> Option<&T> {
-        self.external_event
-            .and_then(StateTreeEventRef::payload::<T>)
-    }
-
-    pub fn data(&self, name: &str) -> Option<&LuauValue> {
-        self.data_names
-            .iter()
-            .position(|candidate| candidate.as_ref() == name)
-            .and_then(|index| self.data.get(index))
-    }
-
-    pub fn arguments(&mut self) -> &mut StateTreeEffectArgs {
-        self.arguments
-    }
-}
-
-/// Receives effects from a headless state-tree execution.
-pub trait StateTreeEffectSink<D: StateTreeDomain> {
-    fn emit(&mut self, request: StateTreeEffectRequest<'_, D>) -> Result<(), StateTreeEffectError>;
-}
 
 /// Converts a portable Luau value into a Rust effect argument.
 pub trait FromStateTreeValue: Sized {
@@ -324,14 +270,12 @@ where
 #[derive(Resource)]
 pub(crate) struct StateTreeEffectRegistry<D: StateTreeDomain> {
     effects: HashMap<Box<str>, Arc<dyn RegisteredEffect<D>>>,
-    revision: u64,
 }
 
 impl<D: StateTreeDomain> Default for StateTreeEffectRegistry<D> {
     fn default() -> Self {
         Self {
             effects: HashMap::new(),
-            revision: 0,
         }
     }
 }
@@ -340,38 +284,15 @@ impl<D: StateTreeDomain> StateTreeEffectRegistry<D> {
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredEffect<D>>> {
         self.effects.get(name).cloned()
     }
-
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
 }
 
 pub(crate) trait RuntimeEffectSink<D: StateTreeDomain> {
     fn emit(
         &mut self,
-        name: &str,
-        handler: Option<&Arc<dyn RegisteredEffect<D>>>,
+        handler: &Arc<dyn RegisteredEffect<D>>,
         context: StateTreeEffectContext<'_, D>,
         arguments: StateTreeEffectArgs,
-        span_start: usize,
     ) -> Result<(), StateTreeEffectError>;
-}
-
-pub(crate) struct RejectEffects;
-
-impl<D: StateTreeDomain> RuntimeEffectSink<D> for RejectEffects {
-    fn emit(
-        &mut self,
-        name: &str,
-        _handler: Option<&Arc<dyn RegisteredEffect<D>>>,
-        _context: StateTreeEffectContext<'_, D>,
-        _arguments: StateTreeEffectArgs,
-        _span_start: usize,
-    ) -> Result<(), StateTreeEffectError> {
-        Err(StateTreeEffectError::new(format!(
-            "effect `{name}` requires an effect sink"
-        )))
-    }
 }
 
 pub(crate) struct BevyEffectSink<'a, 'w, 's> {
@@ -381,168 +302,41 @@ pub(crate) struct BevyEffectSink<'a, 'w, 's> {
 impl<D: StateTreeDomain> RuntimeEffectSink<D> for BevyEffectSink<'_, '_, '_> {
     fn emit(
         &mut self,
-        name: &str,
-        handler: Option<&Arc<dyn RegisteredEffect<D>>>,
+        handler: &Arc<dyn RegisteredEffect<D>>,
         context: StateTreeEffectContext<'_, D>,
         arguments: StateTreeEffectArgs,
-        _span_start: usize,
     ) -> Result<(), StateTreeEffectError> {
-        let Some(handler) = handler else {
-            return Err(StateTreeEffectError::new(format!(
-                "effect `{name}` is not registered for this domain"
-            )));
-        };
         handler.publish(context, arguments, self.commands)
     }
 }
 
-pub(crate) struct HeadlessEffectSink<'a, S: ?Sized> {
-    pub sink: &'a mut S,
-}
-
-impl<D, S> RuntimeEffectSink<D> for HeadlessEffectSink<'_, S>
+pub(crate) fn register_effect<D, M, F>(app: &mut App, name: Box<str>, constructor: F)
 where
     D: StateTreeDomain,
-    S: StateTreeEffectSink<D> + ?Sized,
+    M: Message,
+    F: Fn(
+            StateTreeEffectContext<'_, D>,
+            &mut StateTreeEffectArgs,
+        ) -> Result<M, StateTreeEffectError>
+        + Send
+        + Sync
+        + 'static,
 {
-    fn emit(
-        &mut self,
-        name: &str,
-        _handler: Option<&Arc<dyn RegisteredEffect<D>>>,
-        context: StateTreeEffectContext<'_, D>,
-        mut arguments: StateTreeEffectArgs,
-        span_start: usize,
-    ) -> Result<(), StateTreeEffectError> {
-        self.sink.emit(StateTreeEffectRequest {
-            name,
-            span_start,
-            event_name: context.event_name,
-            external_event: context.external_event,
-            data_names: context.data_names,
-            data: context.data,
-            arguments: &mut arguments,
-        })
-    }
-}
-
-/// Registers typed state-tree effects on a Bevy application.
-pub trait StateTreeAppExt {
-    fn register_state_tree_event<D, E>(&mut self) -> &mut Self
-    where
-        D: StateTreeDomain,
-        E: StateTreeEvent<D>;
-
-    fn register_state_tree_effect<D, M, F>(
-        &mut self,
-        name: impl Into<Box<str>>,
-        constructor: F,
-    ) -> &mut Self
-    where
-        D: StateTreeDomain,
-        M: Message,
-        F: Fn(
-                StateTreeEffectContext<'_, D>,
-                &mut StateTreeEffectArgs,
-            ) -> Result<M, StateTreeEffectError>
-            + Send
-            + Sync
-            + 'static;
-
-    fn register_state_tree_activity<D, A, F>(
-        &mut self,
-        name: impl Into<Box<str>>,
-        constructor: F,
-    ) -> &mut Self
-    where
-        D: StateTreeDomain,
-        A: crate::StateTreeActivity,
-        F: Fn(
-                StateTreeActivityContext<'_, D>,
-                &mut StateTreeActivityArgs,
-            ) -> Result<A, StateTreeActivityError>
-            + Send
-            + Sync
-            + 'static;
-}
-
-impl StateTreeAppExt for App {
-    fn register_state_tree_event<D, E>(&mut self) -> &mut Self
-    where
-        D: StateTreeDomain,
-        E: StateTreeEvent<D>,
-    {
-        self.init_resource::<StateTreeAppEventRegistry<D>>();
-        let result = {
-            let mut registry = self
-                .world_mut()
-                .resource_mut::<StateTreeAppEventRegistry<D>>();
-            registry.register::<E>()
-        };
-        if let Err(error) = result {
-            panic!(
-                "failed to register state-tree event `{}`: {error}",
-                std::any::type_name::<E>()
-            );
-        }
-        self
-    }
-
-    fn register_state_tree_effect<D, M, F>(
-        &mut self,
-        name: impl Into<Box<str>>,
-        constructor: F,
-    ) -> &mut Self
-    where
-        D: StateTreeDomain,
-        M: Message,
-        F: Fn(
-                StateTreeEffectContext<'_, D>,
-                &mut StateTreeEffectArgs,
-            ) -> Result<M, StateTreeEffectError>
-            + Send
-            + Sync
-            + 'static,
-    {
-        let name = name.into();
-        assert!(!name.is_empty(), "state-tree effect names cannot be empty");
-        self.add_message::<M>();
-        self.init_resource::<StateTreeEffectRegistry<D>>();
-        let registry = self
-            .world_mut()
-            .resource_mut::<StateTreeEffectRegistry<D>>()
-            .into_inner();
-        assert!(
-            !registry.effects.contains_key(&name),
-            "state-tree effect `{name}` was registered more than once"
-        );
-        registry.effects.insert(
-            name.clone(),
-            Arc::new(MessageEffect::<D, M, F> {
-                constructor,
-                marker: PhantomData,
-            }),
-        );
-        registry.revision = registry.revision.wrapping_add(1);
-        self
-    }
-
-    fn register_state_tree_activity<D, A, F>(
-        &mut self,
-        name: impl Into<Box<str>>,
-        constructor: F,
-    ) -> &mut Self
-    where
-        D: StateTreeDomain,
-        A: crate::StateTreeActivity,
-        F: Fn(
-                StateTreeActivityContext<'_, D>,
-                &mut StateTreeActivityArgs,
-            ) -> Result<A, StateTreeActivityError>
-            + Send
-            + Sync
-            + 'static,
-    {
-        crate::activity::register_activity::<D, A, F>(self, name.into(), constructor);
-        self
-    }
+    assert!(!name.is_empty(), "state-tree effect names cannot be empty");
+    app.add_message::<M>();
+    let registry = app
+        .world_mut()
+        .resource_mut::<StateTreeEffectRegistry<D>>()
+        .into_inner();
+    assert!(
+        !registry.effects.contains_key(&name),
+        "state-tree effect `{name}` was registered more than once"
+    );
+    registry.effects.insert(
+        name.clone(),
+        Arc::new(MessageEffect::<D, M, F> {
+            constructor,
+            marker: PhantomData,
+        }),
+    );
 }
