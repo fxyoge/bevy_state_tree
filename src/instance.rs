@@ -2759,7 +2759,9 @@ mod tests {
     use bevy_asset::Handle;
 
     use super::*;
-    use crate::{StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeTransition};
+    use crate::{
+        StateTreeAction, StateTreeBuilder, StateTreeData, StateTreeEventLog, StateTreeTransition,
+    };
 
     struct TestDomain;
 
@@ -2946,6 +2948,107 @@ mod tests {
     }
 
     #[test]
+    fn external_self_transition_exits_and_reenters_its_source() {
+        let mut builder = StateTreeBuilder::new("external-self-transition");
+        builder
+            .luau_datamodel([
+                StateTreeData::new("entries").with_initializer("0"),
+                StateTreeData::new("exits").with_initializer("0"),
+            ])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        builder.initial(root, active).unwrap();
+        builder
+            .entry_actions(active, [StateTreeAction::assign("entries", "entries + 1")])
+            .unwrap();
+        builder
+            .exit_actions(active, [StateTreeAction::assign("exits", "exits + 1")])
+            .unwrap();
+        builder
+            .add_transition(active, StateTreeTransition::on("advance").target(active))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "active"]
+        );
+        assert_eq!(instance.data("entries"), Some(&LuauValue::Integer(2)));
+        assert_eq!(instance.data("exits"), Some(&LuauValue::Integer(1)));
+    }
+
+    #[test]
+    fn external_ancestor_transition_reenters_its_initial_configuration() {
+        let mut builder = StateTreeBuilder::new("external-ancestor-transition");
+        builder
+            .luau_datamodel([
+                StateTreeData::new("parent_entries").with_initializer("0"),
+                StateTreeData::new("parent_exits").with_initializer("0"),
+                StateTreeData::new("child_entries").with_initializer("0"),
+                StateTreeData::new("child_exits").with_initializer("0"),
+            ])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let parent = builder.compound("parent", root).unwrap();
+        let child = builder.atomic("child", parent).unwrap();
+        builder.initial(root, parent).unwrap();
+        builder.initial(parent, child).unwrap();
+        builder
+            .entry_actions(
+                parent,
+                [StateTreeAction::assign(
+                    "parent_entries",
+                    "parent_entries + 1",
+                )],
+            )
+            .unwrap();
+        builder
+            .exit_actions(
+                parent,
+                [StateTreeAction::assign("parent_exits", "parent_exits + 1")],
+            )
+            .unwrap();
+        builder
+            .entry_actions(
+                child,
+                [StateTreeAction::assign(
+                    "child_entries",
+                    "child_entries + 1",
+                )],
+            )
+            .unwrap();
+        builder
+            .exit_actions(
+                child,
+                [StateTreeAction::assign("child_exits", "child_exits + 1")],
+            )
+            .unwrap();
+        builder
+            .add_transition(child, StateTreeTransition::on("advance").target(parent))
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "parent", "child"]
+        );
+        assert_eq!(
+            instance.data("parent_entries"),
+            Some(&LuauValue::Integer(2))
+        );
+        assert_eq!(instance.data("parent_exits"), Some(&LuauValue::Integer(1)));
+        assert_eq!(instance.data("child_entries"), Some(&LuauValue::Integer(2)));
+        assert_eq!(instance.data("child_exits"), Some(&LuauValue::Integer(1)));
+    }
+
+    #[test]
     fn one_event_runs_eventless_transitions_until_stable() {
         let mut builder = StateTreeBuilder::new("stabilize");
         let root = builder.compound_root("root").unwrap();
@@ -2972,6 +3075,46 @@ mod tests {
         assert_eq!(
             instance.active_state_names().collect::<Vec<_>>(),
             ["root", "stable"]
+        );
+    }
+
+    #[test]
+    fn eventless_transition_precedes_a_queued_internal_event() {
+        let mut builder = StateTreeBuilder::new("eventless-before-internal");
+        let root = builder.compound_root("root").unwrap();
+        let idle = builder.atomic("idle", root).unwrap();
+        let choice = builder.atomic("choice", root).unwrap();
+        let eventless_winner = builder.atomic("eventless-winner", root).unwrap();
+        let internal_winner = builder.atomic("internal-winner", root).unwrap();
+        builder.initial(root, idle).unwrap();
+        builder
+            .add_transition(
+                idle,
+                StateTreeTransition::on("advance")
+                    .target(choice)
+                    .actions([StateTreeAction::raise("continue")]),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                choice,
+                StateTreeTransition::eventless().target(eventless_winner),
+            )
+            .unwrap();
+        builder
+            .add_transition(
+                choice,
+                StateTreeTransition::on("continue").target(internal_winner),
+            )
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let mut instance = instance(&definition, 64);
+
+        process_event(&mut instance, &TestEvents::Advance, 64);
+
+        assert_eq!(
+            instance.active_state_names().collect::<Vec<_>>(),
+            ["root", "eventless-winner"]
         );
     }
 
@@ -3387,12 +3530,26 @@ mod tests {
                 StateTreeTransition::after(Duration::from_secs(1)).target(right_elapsed),
             )
             .unwrap();
-        let mut execution = execution(&builder.build().unwrap());
+        let definition = builder.build().unwrap();
+        let mut trace = StateTreeEventLog::new();
+        let mut execution = StateTreeExecution::<TestEvents>::new_traced(
+            &definition,
+            NonZeroUsize::new(64).unwrap(),
+            &mut trace,
+        )
+        .unwrap();
 
-        assert!(advance(&mut execution, Duration::from_secs(1)));
+        assert!(execution.advance_time_traced(
+            Duration::from_secs(1),
+            NonZeroUsize::new(64).unwrap(),
+            &mut trace,
+        ));
         let active = execution.active_state_names().collect::<Vec<_>>();
         assert!(active.contains(&"left-elapsed"));
         assert!(active.contains(&"right-elapsed"));
+        assert_eq!(trace.as_str().matches("macrostep timer\n").count(), 1);
+        assert!(trace.as_str().contains("transition \"left-waiting\"\n"));
+        assert!(trace.as_str().contains("transition \"right-waiting\"\n"));
     }
 
     #[test]
