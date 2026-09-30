@@ -139,6 +139,13 @@ content. Initializers run in document order, and assignments preserve their
 order relative to `<raise>` actions. Local datamodels, scripts, and the other
 SCXML executable-content elements remain unsupported.
 
+Applications may supply instance-local `StateTreeDataOverrides`. All authored
+initializers run first, then overrides are applied before the initial state
+configuration is entered. Duplicate override names are rejected when the set is
+constructed. An override whose name is absent from the linked definition faults
+only that instance before any state entry; no additional SCXML syntax is
+introduced.
+
 Each instance stores only portable nil, boolean, number, string, sequence, and
 string-keyed record values. Functions, userdata, threads, sparse or mixed-key
 tables, and shared or cyclic table graphs cannot be persisted. Instances never

@@ -36,6 +36,41 @@ use crate::{
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Immutable instance-local values applied after authored datamodel initializers.
+#[derive(Clone, Debug, Default)]
+pub struct StateTreeDataOverrides {
+    values: Arc<[(Box<str>, LuauValue)]>,
+}
+
+impl StateTreeDataOverrides {
+    /// Creates overrides while rejecting duplicate authored data names.
+    pub fn try_new<I, N>(values: I) -> Result<Self, StateTreeDataOverrideError>
+    where
+        I: IntoIterator<Item = (N, LuauValue)>,
+        N: Into<Box<str>>,
+    {
+        let mut collected = Vec::<(Box<str>, LuauValue)>::new();
+        for (name, value) in values {
+            let name = name.into();
+            if collected.iter().any(|(candidate, _)| candidate == &name) {
+                return Err(StateTreeDataOverrideError::DuplicateName { name });
+            }
+            collected.push((name, value));
+        }
+        Ok(Self {
+            values: collected.into(),
+        })
+    }
+}
+
+/// Invalid instance-local initial datamodel configuration.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum StateTreeDataOverrideError {
+    /// One authored data name was supplied more than once.
+    #[error("initial datamodel override `{name}` is duplicated")]
+    DuplicateName { name: Box<str> },
+}
+
 enum Trigger<'a, E> {
     Eventless(Option<&'a str>, Option<&'a E>, Option<&'a LuauValue>),
     Internal(EventId, Option<&'a LuauValue>),
@@ -154,7 +189,27 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         definition: &StateTreeDefinition,
         microstep_limit: NonZeroUsize,
     ) -> Result<Self, StateTreeLinkError> {
-        Self::new_traced(definition, microstep_limit, &mut NoStateTreeTrace)
+        Self::new_with_initial_data(
+            definition,
+            microstep_limit,
+            StateTreeDataOverrides::default(),
+        )
+    }
+
+    /// Links and initializes a definition with instance-local initial data.
+    pub fn new_with_initial_data(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+    ) -> Result<Self, StateTreeLinkError> {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
+            &mut RejectEffects,
+            &mut RejectActivities,
+            &mut NoStateTreeTrace,
+        )
     }
 
     /// Links and initializes a definition while delivering effects to `sink`.
@@ -163,7 +218,29 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         microstep_limit: NonZeroUsize,
         sink: &mut S,
     ) -> Result<Self, StateTreeLinkError> {
-        Self::new_traced_with_sink(definition, microstep_limit, sink, &mut NoStateTreeTrace)
+        Self::new_with_initial_data_and_sink(
+            definition,
+            microstep_limit,
+            StateTreeDataOverrides::default(),
+            sink,
+        )
+    }
+
+    /// Links and initializes with initial data while delivering effects to `sink`.
+    pub fn new_with_initial_data_and_sink<S: StateTreeEffectSink<E> + ?Sized>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        sink: &mut S,
+    ) -> Result<Self, StateTreeLinkError> {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
+            &mut HeadlessEffectSink { sink },
+            &mut RejectActivities,
+            &mut NoStateTreeTrace,
+        )
     }
 
     /// Links and initializes a definition while delivering activity starts.
@@ -172,27 +249,29 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         microstep_limit: NonZeroUsize,
         sink: &mut S,
     ) -> Result<Self, StateTreeLinkError> {
-        let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
-            Arc::clone(&definition.compiled),
-            None,
-            None,
-        )?);
-        let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize_traced(
-            linked,
-            microstep_limit.get(),
-            None,
+        Self::new_with_initial_data_and_activity_sink(
+            definition,
+            microstep_limit,
+            StateTreeDataOverrides::default(),
+            sink,
+        )
+    }
+
+    /// Links and initializes with initial data while delivering activity starts.
+    pub fn new_with_initial_data_and_activity_sink<S: StateTreeActivitySink<E> + ?Sized>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        sink: &mut S,
+    ) -> Result<Self, StateTreeLinkError> {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
             &mut RejectEffects,
             &mut HeadlessActivitySink { sink },
             &mut NoStateTreeTrace,
-        );
-        let mut execution = Self {
-            instance,
-            now: Duration::ZERO,
-            timers: Vec::new(),
-        };
-        execution.apply_timer_updates();
-        Ok(execution)
+        )
     }
 
     /// Links and initializes while delivering both effects and activity lifecycle changes.
@@ -206,11 +285,33 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         ES: StateTreeEffectSink<E> + ?Sized,
         AS: StateTreeActivitySink<E> + ?Sized,
     {
-        Self::new_traced_with_sinks(
+        Self::new_with_initial_data_and_sinks(
             definition,
             microstep_limit,
+            StateTreeDataOverrides::default(),
             effects,
             activities,
+        )
+    }
+
+    /// Links and initializes with initial data and both output sinks.
+    pub fn new_with_initial_data_and_sinks<ES, AS>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        effects: &mut ES,
+        activities: &mut AS,
+    ) -> Result<Self, StateTreeLinkError>
+    where
+        ES: StateTreeEffectSink<E> + ?Sized,
+        AS: StateTreeActivitySink<E> + ?Sized,
+    {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
+            &mut HeadlessEffectSink { sink: effects },
+            &mut HeadlessActivitySink { sink: activities },
             &mut NoStateTreeTrace,
         )
     }
@@ -228,27 +329,38 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         AS: StateTreeActivitySink<E> + ?Sized,
         T: StateTreeTrace + ?Sized,
     {
-        let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
-            Arc::clone(&definition.compiled),
-            None,
-            None,
-        )?);
-        let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize_traced(
-            linked,
-            microstep_limit.get(),
-            None,
+        Self::new_traced_with_initial_data_and_sinks(
+            definition,
+            microstep_limit,
+            StateTreeDataOverrides::default(),
+            effects,
+            activities,
+            trace,
+        )
+    }
+
+    /// Links and initializes with initial data, both output sinks, and tracing.
+    pub fn new_traced_with_initial_data_and_sinks<ES, AS, T>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        effects: &mut ES,
+        activities: &mut AS,
+        trace: &mut T,
+    ) -> Result<Self, StateTreeLinkError>
+    where
+        ES: StateTreeEffectSink<E> + ?Sized,
+        AS: StateTreeActivitySink<E> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
             &mut HeadlessEffectSink { sink: effects },
             &mut HeadlessActivitySink { sink: activities },
             trace,
-        );
-        let mut execution = Self {
-            instance,
-            now: Duration::ZERO,
-            timers: Vec::new(),
-        };
-        execution.apply_timer_updates();
-        Ok(execution)
+        )
     }
 
     /// Links and initializes while delivering activities and semantic traces.
@@ -261,27 +373,34 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         sink: &mut S,
         trace: &mut T,
     ) -> Result<Self, StateTreeLinkError> {
-        let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
-            Arc::clone(&definition.compiled),
-            None,
-            None,
-        )?);
-        let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize_traced(
-            linked,
-            microstep_limit.get(),
-            None,
+        Self::new_traced_with_initial_data_and_activity_sink(
+            definition,
+            microstep_limit,
+            StateTreeDataOverrides::default(),
+            sink,
+            trace,
+        )
+    }
+
+    /// Links and initializes with initial data, activity delivery, and tracing.
+    pub fn new_traced_with_initial_data_and_activity_sink<
+        S: StateTreeActivitySink<E> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        sink: &mut S,
+        trace: &mut T,
+    ) -> Result<Self, StateTreeLinkError> {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
             &mut RejectEffects,
             &mut HeadlessActivitySink { sink },
             trace,
-        );
-        let mut execution = Self {
-            instance,
-            now: Duration::ZERO,
-            timers: Vec::new(),
-        };
-        execution.apply_timer_updates();
-        Ok(execution)
+        )
     }
 
     /// Links and initializes a definition while writing its semantic trace.
@@ -290,27 +409,29 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         microstep_limit: NonZeroUsize,
         trace: &mut T,
     ) -> Result<Self, StateTreeLinkError> {
-        let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
-            Arc::clone(&definition.compiled),
-            None,
-            None,
-        )?);
-        let mut instance = StateTreeInstance::new(Handle::default());
-        instance.initialize_traced(
-            linked,
-            microstep_limit.get(),
-            None,
+        Self::new_traced_with_initial_data(
+            definition,
+            microstep_limit,
+            StateTreeDataOverrides::default(),
+            trace,
+        )
+    }
+
+    /// Links and initializes with initial data while writing its semantic trace.
+    pub fn new_traced_with_initial_data<T: StateTreeTrace + ?Sized>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        trace: &mut T,
+    ) -> Result<Self, StateTreeLinkError> {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
             &mut RejectEffects,
             &mut RejectActivities,
             trace,
-        );
-        let mut execution = Self {
-            instance,
-            now: Duration::ZERO,
-            timers: Vec::new(),
-        };
-        execution.apply_timer_updates();
-        Ok(execution)
+        )
     }
 
     /// Links and initializes a definition while delivering effects and tracing execution.
@@ -320,18 +441,62 @@ impl<E: StateTreeEvents> StateTreeExecution<E> {
         sink: &mut S,
         trace: &mut T,
     ) -> Result<Self, StateTreeLinkError> {
+        Self::new_traced_with_initial_data_and_sink(
+            definition,
+            microstep_limit,
+            StateTreeDataOverrides::default(),
+            sink,
+            trace,
+        )
+    }
+
+    /// Links and initializes with initial data, effect delivery, and tracing.
+    pub fn new_traced_with_initial_data_and_sink<
+        S: StateTreeEffectSink<E> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        sink: &mut S,
+        trace: &mut T,
+    ) -> Result<Self, StateTreeLinkError> {
+        Self::new_inner(
+            definition,
+            microstep_limit,
+            initial_data,
+            &mut HeadlessEffectSink { sink },
+            &mut RejectActivities,
+            trace,
+        )
+    }
+
+    fn new_inner<S, A, T>(
+        definition: &StateTreeDefinition,
+        microstep_limit: NonZeroUsize,
+        initial_data: StateTreeDataOverrides,
+        effects: &mut S,
+        activities: &mut A,
+        trace: &mut T,
+    ) -> Result<Self, StateTreeLinkError>
+    where
+        S: RuntimeEffectSink<HeadlessDomain<E>> + ?Sized,
+        A: RuntimeActivitySink<HeadlessDomain<E>> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    {
         let linked = Arc::new(LinkedDefinition::<HeadlessDomain<E>>::new(
             Arc::clone(&definition.compiled),
             None,
             None,
         )?);
-        let mut instance = StateTreeInstance::new(Handle::default());
+        let mut instance =
+            StateTreeInstance::new_with_initial_data(Handle::default(), initial_data);
         instance.initialize_traced(
             linked,
             microstep_limit.get(),
             None,
-            &mut HeadlessEffectSink { sink },
-            &mut RejectActivities,
+            effects,
+            activities,
             trace,
         );
         let mut execution = Self {
@@ -901,7 +1066,7 @@ pub enum InstanceStatus {
     /// The root and reached final state remain active for inspection. Completion
     /// is not an implicit teardown, so the final state's exit actions do not run.
     Complete,
-    /// Execution stopped because the definition could not stabilize.
+    /// Execution stopped because initialization or a macrostep failed.
     ///
     /// Faulted instances ignore subsequent events. Remove this component and
     /// insert a new [`StateTreeInstance`] to restart execution.
@@ -940,6 +1105,8 @@ pub enum RuntimeFault {
         activity: Box<str>,
         message: Box<str>,
     },
+    /// An instance supplied an initial value for data absent from its definition.
+    UnknownDataOverride { name: Box<str> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -975,6 +1142,7 @@ pub struct StateTreeInstance<D: StateTreeDomain> {
     timers: Vec<TimerSlot>,
     activities: Option<Box<[ActivitySlot]>>,
     timer_updates: Vec<TimerUpdate>,
+    initial_data: StateTreeDataOverrides,
     data: Vec<LuauValue>,
     status: InstanceStatus,
     marker: PhantomData<fn() -> D>,
@@ -1028,6 +1196,14 @@ fn release_event_inbox<D: StateTreeDomain>(mut world: DeferredWorld, context: Ho
 impl<D: StateTreeDomain> StateTreeInstance<D> {
     /// Creates an instance waiting for its definition asset.
     pub fn new(definition: Handle<StateTreeDefinition>) -> Self {
+        Self::new_with_initial_data(definition, StateTreeDataOverrides::default())
+    }
+
+    /// Creates an instance with values applied after authored datamodel initializers.
+    pub fn new_with_initial_data(
+        definition: Handle<StateTreeDefinition>,
+        initial_data: StateTreeDataOverrides,
+    ) -> Self {
         Self {
             runtime_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             definition,
@@ -1039,6 +1215,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             timers: Vec::new(),
             activities: None,
             timer_updates: Vec::new(),
+            initial_data,
             data: Vec::new(),
             status: InstanceStatus::Pending,
             marker: PhantomData,
@@ -2397,6 +2574,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
         let Some(datamodel) = &compiled.datamodel else {
+            if let Some((name, _)) = self.initial_data.values.first() {
+                return Err(RuntimeFault::UnknownDataOverride { name: name.clone() });
+            }
             return Ok(());
         };
         self.data.resize(datamodel.names.len(), LuauValue::Nil);
@@ -2412,6 +2592,23 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 None,
                 DatamodelOperation::Initialize,
             )?;
+            trace.record(StateTreeTraceRecord::DataAssigned {
+                data: &datamodel.names[index],
+                value: &self.data[index],
+            });
+        }
+        for (name, _) in self.initial_data.values.iter() {
+            if !datamodel.names.iter().any(|candidate| candidate == name) {
+                return Err(RuntimeFault::UnknownDataOverride { name: name.clone() });
+            }
+        }
+        for (name, value) in self.initial_data.values.iter() {
+            let index = datamodel
+                .names
+                .iter()
+                .position(|candidate| candidate == name)
+                .expect("initial data names were validated");
+            self.data[index] = value.clone();
             trace.record(StateTreeTraceRecord::DataAssigned {
                 data: &datamodel.names[index],
                 value: &self.data[index],
@@ -2829,6 +3026,141 @@ mod tests {
         let instance = instance(&definition, 8);
 
         assert!(instance.activities.is_none());
+    }
+
+    #[test]
+    fn initial_data_rejects_duplicate_names() {
+        let result = StateTreeDataOverrides::try_new([
+            ("value", LuauValue::Integer(1)),
+            ("value", LuauValue::Integer(2)),
+        ]);
+
+        assert_eq!(
+            result.unwrap_err(),
+            StateTreeDataOverrideError::DuplicateName {
+                name: "value".into()
+            }
+        );
+    }
+
+    #[test]
+    fn initial_data_overrides_authored_defaults_before_state_entry() {
+        let mut builder = StateTreeBuilder::new("initial-data");
+        builder
+            .luau_datamodel([
+                StateTreeData::new("seed").with_initializer("1"),
+                StateTreeData::new("observed").with_initializer("0"),
+            ])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        builder.initial(root, active).unwrap();
+        builder
+            .entry_actions(active, [StateTreeAction::assign("observed", "seed")])
+            .unwrap();
+        let definition = builder.build().unwrap();
+        let initial_data =
+            StateTreeDataOverrides::try_new([("seed", LuauValue::Integer(7))]).unwrap();
+
+        let execution = StateTreeExecution::<TestEvents>::new_with_initial_data(
+            &definition,
+            NonZeroUsize::new(64).unwrap(),
+            initial_data,
+        )
+        .unwrap();
+
+        assert_eq!(execution.status(), &InstanceStatus::Running);
+        assert_eq!(execution.data("seed"), Some(&LuauValue::Integer(7)));
+        assert_eq!(execution.data("observed"), Some(&LuauValue::Integer(7)));
+    }
+
+    #[test]
+    fn initial_data_is_retained_by_pending_bevy_instances() {
+        let mut builder = StateTreeBuilder::new("bevy-initial-data");
+        builder
+            .luau_datamodel([StateTreeData::new("value").with_initializer("1")])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        builder.initial(root, active).unwrap();
+        let definition = builder.build().unwrap();
+        let initial_data =
+            StateTreeDataOverrides::try_new([("value", LuauValue::Integer(9))]).unwrap();
+        let mut instance =
+            StateTreeInstance::<TestDomain>::new_with_initial_data(Handle::default(), initial_data);
+
+        instance.initialize(
+            Arc::new(
+                LinkedDefinition::<TestDomain>::new(Arc::clone(&definition.compiled), None, None)
+                    .unwrap(),
+            ),
+            64,
+            None,
+            &mut RejectEffects,
+            &mut RejectActivities,
+        );
+
+        assert_eq!(instance.status(), &InstanceStatus::Running);
+        assert_eq!(instance.data("value"), Some(&LuauValue::Integer(9)));
+    }
+
+    #[test]
+    fn unknown_initial_data_faults_before_entering_states() {
+        let mut builder = StateTreeBuilder::new("unknown-initial-data");
+        builder
+            .luau_datamodel([StateTreeData::new("known").with_initializer("1")])
+            .unwrap();
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        builder.initial(root, active).unwrap();
+        let definition = builder.build().unwrap();
+        let initial_data = StateTreeDataOverrides::try_new([
+            ("known", LuauValue::Integer(2)),
+            ("missing", LuauValue::Integer(3)),
+        ])
+        .unwrap();
+
+        let execution = StateTreeExecution::<TestEvents>::new_with_initial_data(
+            &definition,
+            NonZeroUsize::new(64).unwrap(),
+            initial_data,
+        )
+        .unwrap();
+
+        assert_eq!(
+            execution.status(),
+            &InstanceStatus::Faulted(RuntimeFault::UnknownDataOverride {
+                name: "missing".into()
+            })
+        );
+        assert_eq!(execution.active_state_names().next(), None);
+        assert_eq!(execution.data("known"), Some(&LuauValue::Integer(1)));
+    }
+
+    #[test]
+    fn initial_data_requires_a_luau_datamodel() {
+        let mut builder = StateTreeBuilder::new("missing-datamodel");
+        let root = builder.compound_root("root").unwrap();
+        let active = builder.atomic("active", root).unwrap();
+        builder.initial(root, active).unwrap();
+        let definition = builder.build().unwrap();
+        let initial_data =
+            StateTreeDataOverrides::try_new([("value", LuauValue::Integer(1))]).unwrap();
+
+        let execution = StateTreeExecution::<TestEvents>::new_with_initial_data(
+            &definition,
+            NonZeroUsize::new(64).unwrap(),
+            initial_data,
+        )
+        .unwrap();
+
+        assert_eq!(
+            execution.status(),
+            &InstanceStatus::Faulted(RuntimeFault::UnknownDataOverride {
+                name: "value".into()
+            })
+        );
+        assert_eq!(execution.active_state_names().next(), None);
     }
 
     fn advance(execution: &mut StateTreeExecution<TestEvents>, duration: Duration) -> bool {

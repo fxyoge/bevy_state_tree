@@ -126,6 +126,36 @@ fn spawn_controller(mut commands: Commands, assets: Res<AssetServer>) {
 }
 ```
 
+Definitions can be shared while supplying instance-local initial datamodel
+values. Authored initializers run first, then overrides are applied before any
+initial state entry actions, guards, effects, or activities:
+
+```rust,no_run
+# use bevy_asset::Handle;
+# use bevy_state_tree::prelude::*;
+# struct Simulation;
+# enum SimulationEvents {}
+# impl StateTreeEvents for SimulationEvents {
+#     const AUTHORED_NAMES: &'static [&'static str] = &[];
+#     fn event_index(&self) -> usize { match *self {} }
+# }
+# impl StateTreeDomain for Simulation { type Event = SimulationEvents; }
+# let definition = Handle::<StateTreeDefinition>::default();
+let initial_data = StateTreeDataOverrides::try_new([
+    ("health", LuauValue::Integer(100)),
+    ("speed", LuauValue::Number(4.5)),
+])?;
+let instance = StateTreeInstance::<Simulation>::new_with_initial_data(
+    definition,
+    initial_data,
+);
+# Ok::<(), StateTreeDataOverrideError>(())
+```
+
+Duplicate names are rejected when constructing the override set. A name absent
+from the linked definition, including any override on a definition without a
+Luau datamodel, faults that instance before it enters its initial states.
+
 Programmatically generated definitions use the same asset store:
 
 ```rust,no_run
@@ -239,7 +269,9 @@ parallel instances is unspecified. Constructor, argument, and payload projection
 errors fault only the affected instance. Headless callers use
 `StateTreeExecution::{new,process_event}_with_sink` to receive portable requests.
 Headless constructors return `Result` because the definition must still link to
-the execution's typed event protocol.
+the execution's typed event protocol. `StateTreeExecution::new_with_initial_data`
+and the corresponding sink and traced variants apply the same per-instance
+override semantics.
 
 ## Typed Activities
 

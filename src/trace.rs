@@ -246,6 +246,9 @@ fn write_fault(output: &mut String, fault: &RuntimeFault) {
         RuntimeFault::ActivityDataProjection { activity, .. } => {
             write!(output, "activity-data {activity:?}").unwrap()
         }
+        RuntimeFault::UnknownDataOverride { name } => {
+            write!(output, "unknown-data-override {name:?}").unwrap()
+        }
     }
 }
 

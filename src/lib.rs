@@ -53,7 +53,8 @@ pub use event::{
     StateTreeEventPayload, StateTreeEvents,
 };
 pub use instance::{
-    DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeExecution, StateTreeInstance,
+    DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeDataOverrideError,
+    StateTreeDataOverrides, StateTreeExecution, StateTreeInstance,
 };
 pub use luau::LuauValue;
 pub use plugin::{
@@ -75,12 +76,13 @@ pub mod prelude {
         StateTreeActivityError, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
         StateTreeActivityRequest, StateTreeActivitySink, StateTreeActivityToken, StateTreeAppExt,
         StateTreeArgs, StateTreeArgument, StateTreeBuilder, StateTreeContext, StateTreeData,
-        StateTreeDefinition, StateTreeDomain, StateTreeEffectArgs, StateTreeEffectArgument,
-        StateTreeEffectContext, StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
-        StateTreeEventDataError, StateTreeEventLog, StateTreeEventPayload, StateTreeEvents,
-        StateTreeExecution, StateTreeHeadlessActivityToken, StateTreeInstance, StateTreeLinkError,
-        StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin, StateTreeSet, StateTreeSettings,
-        StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, StateTreeTransition,
+        StateTreeDataOverrideError, StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain,
+        StateTreeEffectArgs, StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
+        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEventDataError, StateTreeEventLog,
+        StateTreeEventPayload, StateTreeEvents, StateTreeExecution, StateTreeHeadlessActivityToken,
+        StateTreeInstance, StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue,
+        StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTrace, StateTreeTraceRecord,
+        StateTreeTraceTrigger, StateTreeTransition,
     };
 }
 pub use activity::{
