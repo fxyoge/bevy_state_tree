@@ -1,26 +1,60 @@
 use std::{collections::BTreeSet, fs, num::NonZeroUsize, path::Path};
 
+use bevy_ecs::event::Event;
 use bevy_state_tree::{
-    InstanceStatus, StateTreeEventLog, StateTreeEvents, StateTreeExecution, scxml,
+    InstanceStatus, StateTreeDomain, StateTreeEvent, StateTreeEventLog, StateTreeEventRegistry,
+    StateTreeExecution, scxml,
 };
 
 const CASES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/scxml");
 const MICROSTEP_LIMIT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
-#[derive(Clone, Copy)]
-struct HarnessEvent(usize);
+struct HarnessDomain;
 
-impl StateTreeEvents for HarnessEvent {
-    const AUTHORED_NAMES: &'static [&'static str] =
-        &["a", "a.b", "advance", "finish", "reset", "tick"];
+impl StateTreeDomain for HarnessDomain {}
 
-    fn event_index(&self) -> usize {
-        self.0
-    }
-}
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = HarnessDomain, name = "a", broadcast)]
+struct A;
+
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = HarnessDomain, name = "a.b", broadcast)]
+struct AB;
+
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = HarnessDomain, name = "advance", broadcast)]
+struct Advance;
+
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = HarnessDomain, name = "finish", broadcast)]
+struct Finish;
+
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = HarnessDomain, name = "reset", broadcast)]
+struct Reset;
+
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = HarnessDomain, name = "tick", broadcast)]
+struct Tick;
 
 #[test]
 fn scxml_cases_match_their_semantic_traces() {
+    let mut registry = StateTreeEventRegistry::<HarnessDomain>::new();
+    registry
+        .register::<A>()
+        .unwrap()
+        .register::<AB>()
+        .unwrap()
+        .register::<Advance>()
+        .unwrap()
+        .register::<Finish>()
+        .unwrap()
+        .register::<Reset>()
+        .unwrap()
+        .register::<Tick>()
+        .unwrap();
+    let protocol = registry.freeze();
+
     let root = Path::new(CASES);
     let manifest_path = root.join("manifest.txt");
     let expected_cases: BTreeSet<_> = fs::read_to_string(&manifest_path)
@@ -93,9 +127,13 @@ fn scxml_cases_match_their_semantic_traces() {
         };
 
         let mut log = StateTreeEventLog::new();
-        let mut execution =
-            StateTreeExecution::<HarnessEvent>::new_traced(&definition, MICROSTEP_LIMIT, &mut log)
-                .unwrap();
+        let mut execution = StateTreeExecution::<HarnessDomain>::new_traced(
+            &definition,
+            protocol.clone(),
+            MICROSTEP_LIMIT,
+            &mut log,
+        )
+        .unwrap();
         let events_path = case.with_extension("events");
         if events_path.exists() {
             let events = fs::read_to_string(&events_path).expect("read SCXML case events");
@@ -104,17 +142,6 @@ fn scxml_cases_match_their_semantic_traces() {
                 if name.is_empty() || name.starts_with('#') {
                     continue;
                 }
-                let Some(index) = HarnessEvent::AUTHORED_NAMES
-                    .iter()
-                    .position(|candidate| *candidate == name)
-                else {
-                    failures.push(format!(
-                        "{}:{}: undeclared harness event {name:?}",
-                        events_path.display(),
-                        line_index + 1
-                    ));
-                    continue;
-                };
                 if execution.status() != &InstanceStatus::Running {
                     failures.push(format!(
                         "{}:{}: event {name:?} follows terminal status {:?}",
@@ -124,7 +151,24 @@ fn scxml_cases_match_their_semantic_traces() {
                     ));
                     break;
                 }
-                execution.process_event_traced(&HarnessEvent(index), MICROSTEP_LIMIT, &mut log);
+                match name {
+                    "a" => execution.process_event_traced(&A, MICROSTEP_LIMIT, &mut log),
+                    "a.b" => execution.process_event_traced(&AB, MICROSTEP_LIMIT, &mut log),
+                    "advance" => {
+                        execution.process_event_traced(&Advance, MICROSTEP_LIMIT, &mut log)
+                    }
+                    "finish" => execution.process_event_traced(&Finish, MICROSTEP_LIMIT, &mut log),
+                    "reset" => execution.process_event_traced(&Reset, MICROSTEP_LIMIT, &mut log),
+                    "tick" => execution.process_event_traced(&Tick, MICROSTEP_LIMIT, &mut log),
+                    _ => {
+                        failures.push(format!(
+                            "{}:{}: undeclared harness event {name:?}",
+                            events_path.display(),
+                            line_index + 1
+                        ));
+                        continue;
+                    }
+                };
             }
         }
 

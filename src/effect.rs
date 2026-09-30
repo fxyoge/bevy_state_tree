@@ -4,7 +4,10 @@ use bevy_app::App;
 use bevy_ecs::{entity::Entity, message::Message, prelude::Resource, system::ParallelCommands};
 use thiserror::Error;
 
-use crate::{LuauValue, StateTreeDomain, StateTreeEvents};
+use crate::{
+    LuauValue, StateTreeDomain,
+    event::{StateTreeAppEventRegistry, StateTreeEvent, StateTreeEventRef},
+};
 
 /// An error while constructing a typed state-tree effect.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -42,7 +45,7 @@ impl StateTreeEffectError {
 pub struct StateTreeContext<'a, D: StateTreeDomain> {
     pub(crate) entity: Option<Entity>,
     pub(crate) event_name: Option<&'a str>,
-    pub(crate) external_event: Option<&'a D::Event>,
+    pub(crate) external_event: Option<StateTreeEventRef<'a, D>>,
     pub(crate) data_names: &'a [Box<str>],
     pub(crate) data: &'a [LuauValue],
 }
@@ -59,8 +62,14 @@ impl<'a, D: StateTreeDomain> StateTreeContext<'a, D> {
     }
 
     /// Returns the current external event, if this action is executing in its context.
-    pub fn external_event(&self) -> Option<&D::Event> {
+    pub fn external_event(&self) -> Option<StateTreeEventRef<'a, D>> {
         self.external_event
+    }
+
+    /// Borrows the current external event when it contains `T`.
+    pub fn event<T: StateTreeEvent<D>>(&self) -> Option<&T> {
+        self.external_event
+            .and_then(StateTreeEventRef::payload::<T>)
     }
 
     /// Returns one instance-local datamodel value.
@@ -148,17 +157,17 @@ pub type StateTreeActivityArgs = StateTreeArgs;
 pub type StateTreeActivityError = StateTreeEffectError;
 
 /// One portable effect request emitted by headless execution.
-pub struct StateTreeEffectRequest<'a, E: StateTreeEvents> {
+pub struct StateTreeEffectRequest<'a, D: StateTreeDomain> {
     name: &'a str,
     span_start: usize,
     event_name: Option<&'a str>,
-    external_event: Option<&'a E>,
+    external_event: Option<StateTreeEventRef<'a, D>>,
     data_names: &'a [Box<str>],
     data: &'a [LuauValue],
     arguments: &'a mut StateTreeEffectArgs,
 }
 
-impl<'a, E: StateTreeEvents> StateTreeEffectRequest<'a, E> {
+impl<'a, D: StateTreeDomain> StateTreeEffectRequest<'a, D> {
     pub fn name(&self) -> &str {
         self.name
     }
@@ -171,8 +180,17 @@ impl<'a, E: StateTreeEvents> StateTreeEffectRequest<'a, E> {
         self.event_name
     }
 
-    pub fn external_event(&self) -> Option<&E> {
+    pub fn external_event(&self) -> Option<StateTreeEventRef<'a, D>> {
         self.external_event
+    }
+
+    pub fn event_ref(&self) -> Option<StateTreeEventRef<'a, D>> {
+        self.external_event
+    }
+
+    pub fn event<T: StateTreeEvent<D>>(&self) -> Option<&T> {
+        self.external_event
+            .and_then(StateTreeEventRef::payload::<T>)
     }
 
     pub fn data(&self, name: &str) -> Option<&LuauValue> {
@@ -188,8 +206,8 @@ impl<'a, E: StateTreeEvents> StateTreeEffectRequest<'a, E> {
 }
 
 /// Receives effects from a headless state-tree execution.
-pub trait StateTreeEffectSink<E: StateTreeEvents> {
-    fn emit(&mut self, request: StateTreeEffectRequest<'_, E>) -> Result<(), StateTreeEffectError>;
+pub trait StateTreeEffectSink<D: StateTreeDomain> {
+    fn emit(&mut self, request: StateTreeEffectRequest<'_, D>) -> Result<(), StateTreeEffectError>;
 }
 
 /// Converts a portable Luau value into a Rust effect argument.
@@ -385,7 +403,7 @@ pub(crate) struct HeadlessEffectSink<'a, S: ?Sized> {
 impl<D, S> RuntimeEffectSink<D> for HeadlessEffectSink<'_, S>
 where
     D: StateTreeDomain,
-    S: StateTreeEffectSink<D::Event> + ?Sized,
+    S: StateTreeEffectSink<D> + ?Sized,
 {
     fn emit(
         &mut self,
@@ -409,6 +427,11 @@ where
 
 /// Registers typed state-tree effects on a Bevy application.
 pub trait StateTreeAppExt {
+    fn register_state_tree_event<D, E>(&mut self) -> &mut Self
+    where
+        D: StateTreeDomain,
+        E: StateTreeEvent<D>;
+
     fn register_state_tree_effect<D, M, F>(
         &mut self,
         name: impl Into<Box<str>>,
@@ -443,6 +466,27 @@ pub trait StateTreeAppExt {
 }
 
 impl StateTreeAppExt for App {
+    fn register_state_tree_event<D, E>(&mut self) -> &mut Self
+    where
+        D: StateTreeDomain,
+        E: StateTreeEvent<D>,
+    {
+        self.init_resource::<StateTreeAppEventRegistry<D>>();
+        let result = {
+            let mut registry = self
+                .world_mut()
+                .resource_mut::<StateTreeAppEventRegistry<D>>();
+            registry.register::<E>()
+        };
+        if let Err(error) = result {
+            panic!(
+                "failed to register state-tree event `{}`: {error}",
+                std::any::type_name::<E>()
+            );
+        }
+        self
+    }
+
     fn register_state_tree_effect<D, M, F>(
         &mut self,
         name: impl Into<Box<str>>,
@@ -467,16 +511,16 @@ impl StateTreeAppExt for App {
             .world_mut()
             .resource_mut::<StateTreeEffectRegistry<D>>()
             .into_inner();
-        let previous = registry.effects.insert(
+        assert!(
+            !registry.effects.contains_key(&name),
+            "state-tree effect `{name}` was registered more than once"
+        );
+        registry.effects.insert(
             name.clone(),
             Arc::new(MessageEffect::<D, M, F> {
                 constructor,
                 marker: PhantomData,
             }),
-        );
-        assert!(
-            previous.is_none(),
-            "state-tree effect `{name}` was registered more than once"
         );
         registry.revision = registry.revision.wrapping_add(1);
         self

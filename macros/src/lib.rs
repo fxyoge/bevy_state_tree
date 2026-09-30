@@ -1,168 +1,73 @@
-use std::collections::HashSet;
-
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
-use quote::{ToTokens, format_ident, quote};
-use syn::{
-    Attribute, Data, DeriveInput, Error, Fields, LitStr, Path, parse_macro_input, spanned::Spanned,
-};
+use quote::{format_ident, quote};
+use syn::{Data, DeriveInput, Error, LitStr, Path, parse_macro_input, spanned::Spanned};
 
-#[proc_macro_derive(StateTreeEvents, attributes(state_tree))]
-/// Declares a domain's closed set of external state-tree events.
-pub fn derive_state_tree_events(input: TokenStream) -> TokenStream {
-    expand_state_tree_events(parse_macro_input!(input as DeriveInput))
+#[proc_macro_derive(StateTreeEvent, attributes(state_tree))]
+/// Declares one external event payload for a state-tree domain.
+pub fn derive_state_tree_event(input: TokenStream) -> TokenStream {
+    expand_state_tree_event(parse_macro_input!(input as DeriveInput))
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
 
-fn expand_state_tree_events(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
-    expand_state_tree_events_with_runtime(input, runtime_crate()?)
+fn expand_state_tree_event(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    expand_state_tree_event_with_runtime(input, runtime_crate()?)
 }
 
-fn expand_state_tree_events_with_runtime(
+fn expand_state_tree_event_with_runtime(
     input: DeriveInput,
     runtime: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if !input.generics.params.is_empty() {
         return Err(Error::new(
             input.generics.span(),
-            "state-tree event enums cannot be generic",
+            "state-tree event payloads cannot be generic",
         ));
     }
-
-    let domain = parse_domain(&input.attrs)?;
-    let Data::Enum(data) = &input.data else {
+    if !matches!(input.data, Data::Struct(_) | Data::Enum(_)) {
         return Err(Error::new(
             input.span(),
-            "StateTreeEvents can only be derived for an enum",
-        ));
-    };
-    if data.variants.is_empty() {
-        return Err(Error::new(
-            input.span(),
-            "a state-tree event enum must contain at least one event",
+            "StateTreeEvent can only be derived for a struct or enum",
         ));
     }
 
-    let enum_name = &input.ident;
-    let mut payloads = HashSet::new();
-    let mut name_arms = Vec::new();
-    let mut index_arms = Vec::new();
-    let mut data_arms = Vec::new();
-    let mut authored_names = Vec::new();
-    let mut payload_impls = Vec::new();
-    let mut conversion_impls = Vec::new();
-    let mut route_impls = Vec::new();
-
-    for (index, variant) in data.variants.iter().enumerate() {
-        let (authored_name, broadcast, data) = parse_variant(&variant.attrs, variant.span())?;
-        let Fields::Unnamed(fields) = &variant.fields else {
-            return Err(Error::new(
-                variant.fields.span(),
-                "state-tree event variants must contain one unnamed payload",
-            ));
-        };
-        if fields.unnamed.len() != 1 {
-            return Err(Error::new(
-                fields.span(),
-                "state-tree event variants must contain exactly one payload",
-            ));
-        }
-        let payload = &fields.unnamed[0].ty;
-        let payload_key = payload.to_token_stream().to_string();
-        if !payloads.insert(payload_key) {
-            return Err(Error::new(
-                payload.span(),
-                "a payload type can appear only once in a state-tree event enum",
-            ));
-        }
-
-        let variant_name = &variant.ident;
-        name_arms.push(quote! {
-            Self::#variant_name(_) => #authored_name
-        });
-        index_arms.push(quote! {
-            Self::#variant_name(_) => #index
-        });
-        data_arms.push(if let Some(projector) = data {
-            quote! {
-                Self::#variant_name(payload) => #projector(payload).map(::core::option::Option::Some)
-            }
-        } else {
-            quote! {
-                Self::#variant_name(_) => ::core::result::Result::Ok(::core::option::Option::None)
-            }
-        });
-        authored_names.push(authored_name.clone());
-        payload_impls.push(quote! {
-            impl #runtime::StateTreeEventPayload<#enum_name> for #payload {
-                const AUTHORED_NAME: &'static str = #authored_name;
-
-                fn into_state_tree_event(self) -> #enum_name {
-                    #enum_name::#variant_name(self)
-                }
-
-                fn payload(event: &#enum_name) -> ::core::option::Option<&Self> {
-                    match event {
-                        #enum_name::#variant_name(payload) => ::core::option::Option::Some(payload),
-                        _ => ::core::option::Option::None,
-                    }
-                }
-            }
-        });
-        conversion_impls.push(quote! {
-            impl ::core::convert::From<#payload> for #enum_name {
-                fn from(payload: #payload) -> Self {
-                    Self::#variant_name(payload)
-                }
-            }
-        });
-        if broadcast {
-            route_impls.push(quote! {
-                impl #runtime::BroadcastStateTreeEvent<#enum_name> for #payload {}
-            });
-        } else {
-            route_impls.push(quote! {
-                impl #runtime::EntityStateTreeEvent<#enum_name> for #payload {}
-            });
-        }
-    }
-
-    Ok(quote! {
-        impl #runtime::StateTreeEvents for #enum_name {
-            const AUTHORED_NAMES: &'static [&'static str] = &[#(#authored_names),*];
-
-            fn event_index(&self) -> usize {
-                match self {
-                    #(#index_arms),*
-                }
-            }
-
-            fn authored_name(&self) -> &'static str {
-                match self {
-                    #(#name_arms),*
-                }
-            }
-
+    let options = parse_options(&input)?;
+    let payload = &input.ident;
+    let domain = options.domain;
+    let authored_name = options.name;
+    let event_data = if let Some(projector) = options.data {
+        quote! {
             fn event_data(
                 &self,
             ) -> ::core::result::Result<
                 ::core::option::Option<#runtime::LuauValue>,
                 #runtime::StateTreeEventDataError,
             > {
-                match self {
-                    #(#data_arms),*
-                }
+                #projector(self).map(::core::option::Option::Some)
             }
         }
+    } else {
+        quote! {}
+    };
+    let routing_impl = if options.broadcast {
+        quote! {
+            impl #runtime::BroadcastStateTreeEvent<#domain> for #payload {}
+        }
+    } else {
+        quote! {
+            impl #runtime::EntityStateTreeEvent<#domain> for #payload {}
+        }
+    };
 
-        impl #runtime::StateTreeDomain for #domain {
-            type Event = #enum_name;
+    Ok(quote! {
+        impl #runtime::StateTreeEvent<#domain> for #payload {
+            const AUTHORED_NAME: &'static str = #authored_name;
+
+            #event_data
         }
 
-        #(#payload_impls)*
-        #(#conversion_impls)*
-        #(#route_impls)*
+        #routing_impl
     })
 }
 
@@ -177,12 +82,32 @@ fn runtime_crate() -> syn::Result<proc_macro2::TokenStream> {
     }
 }
 
-fn parse_domain(attributes: &[Attribute]) -> syn::Result<Path> {
+struct Options {
+    domain: Path,
+    name: LitStr,
+    broadcast: bool,
+    data: Option<Path>,
+}
+
+fn parse_options(input: &DeriveInput) -> syn::Result<Options> {
     let mut domain = None;
-    for attribute in attributes
+    let mut name = None;
+    let mut broadcast = false;
+    let mut data = None;
+    let mut found = false;
+
+    for attribute in input
+        .attrs
         .iter()
         .filter(|attribute| attribute.path().is_ident("state_tree"))
     {
+        if found {
+            return Err(Error::new(
+                attribute.span(),
+                "use one `state_tree` attribute per event payload",
+            ));
+        }
+        found = true;
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("domain") {
                 if domain.is_some() {
@@ -190,41 +115,7 @@ fn parse_domain(attributes: &[Attribute]) -> syn::Result<Path> {
                 }
                 domain = Some(meta.value()?.parse()?);
                 Ok(())
-            } else {
-                Err(meta.error("expected `domain = DomainType`"))
-            }
-        })?;
-    }
-    domain.ok_or_else(|| {
-        Error::new(
-            proc_macro2::Span::call_site(),
-            "missing `#[state_tree(domain = DomainType)]`",
-        )
-    })
-}
-
-fn parse_variant(
-    attributes: &[Attribute],
-    variant_span: proc_macro2::Span,
-) -> syn::Result<(LitStr, bool, Option<Path>)> {
-    let mut name = None;
-    let mut broadcast = false;
-    let mut data = None;
-    let mut found = false;
-
-    for attribute in attributes
-        .iter()
-        .filter(|attribute| attribute.path().is_ident("state_tree"))
-    {
-        if found {
-            return Err(Error::new(
-                attribute.span(),
-                "use one `state_tree` attribute per event variant",
-            ));
-        }
-        found = true;
-        attribute.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
+            } else if meta.path.is_ident("name") {
                 if name.is_some() {
                     return Err(meta.error("`name` was specified more than once"));
                 }
@@ -243,24 +134,34 @@ fn parse_variant(
                 data = Some(meta.value()?.parse()?);
                 Ok(())
             } else {
-                Err(meta.error("expected `name = \"...\"`, `broadcast`, or `data = path`"))
+                Err(meta.error(
+                    "expected `domain = DomainType`, `name = \"...\"`, `broadcast`, or `data = path`",
+                ))
             }
         })?;
     }
 
-    let name = name.ok_or_else(|| {
+    let domain = domain.ok_or_else(|| {
         Error::new(
-            variant_span,
-            "event variant requires `#[state_tree(name = \"...\")]`",
+            input.ident.span(),
+            "missing `domain` in `#[state_tree(...)]`",
         )
     })?;
+    let name = name
+        .ok_or_else(|| Error::new(input.ident.span(), "missing `name` in `#[state_tree(...)]`"))?;
     if name.value().is_empty() {
         return Err(Error::new(
             name.span(),
             "state-tree event name cannot be empty",
         ));
     }
-    Ok((name, broadcast, data))
+
+    Ok(Options {
+        domain,
+        name,
+        broadcast,
+        data,
+    })
 }
 
 #[cfg(test)]
@@ -268,63 +169,102 @@ mod tests {
     use quote::quote;
     use syn::{DeriveInput, parse_quote};
 
-    use super::expand_state_tree_events_with_runtime;
+    use super::expand_state_tree_event_with_runtime;
 
     fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
-        expand_state_tree_events_with_runtime(input, quote!(::bevy_state_tree))
+        expand_state_tree_event_with_runtime(input, quote!(::bevy_state_tree))
     }
 
     #[test]
-    fn expands_entity_and_broadcast_payloads() {
+    fn expands_entity_payload() {
         let input: DeriveInput = parse_quote! {
-            #[state_tree(domain = Simulation)]
-            enum Events {
-                #[state_tree(name = "damage")]
-                Damage(Damage),
-                #[state_tree(name = "reset", broadcast)]
-                Reset(Reset),
+            #[state_tree(domain = Simulation, name = "damage")]
+            struct Damage {
+                amount: u32,
             }
         };
 
         let output = expand(input).unwrap().to_string();
 
-        assert!(output.contains("EntityStateTreeEvent"));
-        assert!(output.contains("BroadcastStateTreeEvent"));
-        assert!(output.contains("AUTHORED_NAMES"));
-        assert!(output.contains("event_index"));
+        assert!(output.contains("StateTreeEvent < Simulation > for Damage"));
+        assert!(output.contains("EntityStateTreeEvent < Simulation > for Damage"));
+        assert!(output.contains("AUTHORED_NAME"));
         assert!(output.contains("damage"));
-        assert!(output.contains("reset"));
+        assert!(!output.contains("BroadcastStateTreeEvent"));
     }
 
     #[test]
-    fn rejects_duplicate_payload_types() {
+    fn expands_broadcast_payload_with_data_projector() {
         let input: DeriveInput = parse_quote! {
-            #[state_tree(domain = Simulation)]
-            enum Events {
-                #[state_tree(name = "first")]
-                First(Payload),
-                #[state_tree(name = "second")]
-                Second(Payload),
+            #[state_tree(
+                domain = Simulation,
+                name = "reset",
+                broadcast,
+                data = project_reset
+            )]
+            enum Reset {
+                Soft,
+                Hard,
+            }
+        };
+
+        let output = expand(input).unwrap().to_string();
+
+        assert!(output.contains("BroadcastStateTreeEvent < Simulation > for Reset"));
+        assert!(output.contains("project_reset (self)"));
+        assert!(output.contains("Option :: Some"));
+        assert!(!output.contains("EntityStateTreeEvent"));
+    }
+
+    #[test]
+    fn rejects_generic_payloads() {
+        let input: DeriveInput = parse_quote! {
+            #[state_tree(domain = Simulation, name = "payload")]
+            struct Payload<T>(T);
+        };
+
+        let error = expand(input).unwrap_err();
+
+        assert!(error.to_string().contains("cannot be generic"));
+    }
+
+    #[test]
+    fn rejects_unions() {
+        let input: DeriveInput = parse_quote! {
+            #[state_tree(domain = Simulation, name = "payload")]
+            union Payload {
+                integer: u32,
+                float: f32,
             }
         };
 
         let error = expand(input).unwrap_err();
 
-        assert!(error.to_string().contains("can appear only once"));
+        assert!(error.to_string().contains("struct or enum"));
     }
 
     #[test]
-    fn rejects_variants_without_one_tuple_payload() {
-        let input: DeriveInput = parse_quote! {
+    fn requires_domain_and_name() {
+        let missing_domain: DeriveInput = parse_quote! {
+            #[state_tree(name = "payload")]
+            struct Payload;
+        };
+        let missing_name: DeriveInput = parse_quote! {
             #[state_tree(domain = Simulation)]
-            enum Events {
-                #[state_tree(name = "damage")]
-                Damage { amount: u32 },
-            }
+            struct Payload;
         };
 
-        let error = expand(input).unwrap_err();
-
-        assert!(error.to_string().contains("one unnamed payload"));
+        assert!(
+            expand(missing_domain)
+                .unwrap_err()
+                .to_string()
+                .contains("missing `domain`")
+        );
+        assert!(
+            expand(missing_name)
+                .unwrap_err()
+                .to_string()
+                .contains("missing `name`")
+        );
     }
 }

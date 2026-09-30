@@ -1,3 +1,10 @@
+use std::{
+    any::{Any, TypeId, type_name},
+    collections::HashMap,
+    marker::PhantomData,
+    sync::{Arc, OnceLock},
+};
+
 use bevy_ecs::event::{EntityEvent, Event};
 use thiserror::Error;
 
@@ -18,79 +25,538 @@ impl StateTreeEventDataError {
     }
 }
 
-/// Identifies one independent state-tree runtime and its external event protocol.
-pub trait StateTreeDomain: Send + Sync + 'static {
-    /// Closed set of external events accepted by this domain.
-    type Event: StateTreeEvents;
-}
+/// Identifies one independent state-tree runtime.
+pub trait StateTreeDomain: Send + Sync + 'static {}
 
-/// A domain's closed set of external state-tree events.
+/// One external event payload accepted by a state-tree domain.
 ///
 /// Implementations are normally generated with
-/// [`StateTreeEvents`](macro@crate::StateTreeEvents).
-/// Each enum variant contains one concrete payload and carries a
-/// `#[state_tree(name = "...")]` attribute. Add `broadcast` to variants written
-/// through [`BroadcastStateTreeEventWriter`](crate::BroadcastStateTreeEventWriter),
-/// and `data = projector` to expose an opt-in portable Luau payload:
-///
-/// ```
-/// # use bevy_ecs::prelude::*;
-/// # use bevy_state_tree::prelude::*;
-/// struct Simulation;
-///
-/// #[derive(EntityEvent)]
-/// struct Damage {
-///     entity: Entity,
-///     amount: u32,
-/// }
-///
-/// #[derive(Event)]
-/// struct ResetAll;
-///
-/// #[derive(StateTreeEvents)]
-/// #[state_tree(domain = Simulation)]
-/// enum SimulationEvents {
-///     #[state_tree(name = "combat.damage")]
-///     Damage(Damage),
-///     #[state_tree(name = "simulation.reset", broadcast)]
-///     ResetAll(ResetAll),
-/// }
-/// ```
-pub trait StateTreeEvents: Send + Sync + 'static {
-    /// Authored event names in the same order as [`Self::event_index`].
-    const AUTHORED_NAMES: &'static [&'static str];
+/// [`StateTreeEvent`](macro@crate::StateTreeEvent).
+pub trait StateTreeEvent<D: StateTreeDomain>: Event {
+    /// The SCXML event name associated with this payload type.
+    const AUTHORED_NAME: &'static str;
 
-    /// Returns the stable variant index used by linked state-tree definitions.
-    fn event_index(&self) -> usize;
-
-    /// Returns the SCXML event name represented by this value.
-    fn authored_name(&self) -> &'static str {
-        Self::AUTHORED_NAMES[self.event_index()]
-    }
-
-    /// Projects this event's typed payload for Luau `_event.data` access.
+    /// Projects this event's typed payload for lazy Luau `_event.data` access.
     fn event_data(&self) -> Result<Option<LuauValue>, StateTreeEventDataError> {
         Ok(None)
     }
 }
 
-/// Associates one concrete payload type with a domain event variant.
-///
-/// Implementations are generated with [`StateTreeEvents`](macro@crate::StateTreeEvents) and
-/// provide the typed projection needed by planned guards and actions without runtime downcasting.
-pub trait StateTreeEventPayload<E: StateTreeEvents>: Event {
-    /// SCXML event name associated with this payload type.
-    const AUTHORED_NAME: &'static str;
+/// Marks a payload as an entity-targeted state-tree event in `D`.
+pub trait EntityStateTreeEvent<D: StateTreeDomain>: StateTreeEvent<D> + EntityEvent {}
 
-    /// Wraps this payload in its domain event variant.
-    fn into_state_tree_event(self) -> E;
+/// Marks a payload as a broadcast state-tree event in `D`.
+pub trait BroadcastStateTreeEvent<D: StateTreeDomain>: StateTreeEvent<D> {}
 
-    /// Borrows this payload when `event` contains its associated variant.
-    fn payload(event: &E) -> Option<&Self>;
+/// Invalid state-tree event protocol registration.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum StateTreeEventRegistrationError {
+    /// The same Rust payload type was registered more than once.
+    #[error("state-tree event payload type `{type_name}` is already registered")]
+    DuplicateType { type_name: &'static str },
+    /// Execution has already frozen this domain's event protocol.
+    #[error("the state-tree event protocol is already frozen")]
+    Frozen,
+    /// Authored event names must contain at least one character.
+    #[error("state-tree event payload type `{type_name}` has an empty authored name")]
+    EmptyName { type_name: &'static str },
 }
 
-/// Marks a payload as an entity-targeted event in `E`.
-pub trait EntityStateTreeEvent<E: StateTreeEvents>: StateTreeEventPayload<E> + EntityEvent {}
+/// Builds an open external event protocol for one state-tree domain.
+pub struct StateTreeEventRegistry<D: StateTreeDomain> {
+    entries: Vec<RegisteredEvent>,
+    type_ids: HashMap<TypeId, RegisteredEventId>,
+    frozen: OnceLock<StateTreeEventProtocol<D>>,
+    marker: PhantomData<fn() -> D>,
+}
 
-/// Marks a payload as a broadcast event in `E`.
-pub trait BroadcastStateTreeEvent<E: StateTreeEvents>: StateTreeEventPayload<E> {}
+#[derive(bevy_ecs::prelude::Resource)]
+pub(crate) struct StateTreeAppEventRegistry<D: StateTreeDomain>(StateTreeEventRegistry<D>);
+
+impl<D: StateTreeDomain> Default for StateTreeAppEventRegistry<D> {
+    fn default() -> Self {
+        Self(StateTreeEventRegistry::new())
+    }
+}
+
+impl<D: StateTreeDomain> StateTreeAppEventRegistry<D> {
+    pub(crate) fn register<E>(&mut self) -> Result<(), StateTreeEventRegistrationError>
+    where
+        E: StateTreeEvent<D>,
+    {
+        self.0.register::<E>().map(|_| ())
+    }
+
+    pub(crate) fn protocol(&self) -> &StateTreeEventProtocol<D> {
+        self.0.protocol()
+    }
+}
+
+impl<D: StateTreeDomain> Default for StateTreeEventRegistry<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
+    /// Creates an empty event protocol builder.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            type_ids: HashMap::new(),
+            frozen: OnceLock::new(),
+            marker: PhantomData,
+        }
+    }
+
+    /// Registers one concrete event payload in insertion order.
+    pub fn register<E>(&mut self) -> Result<&mut Self, StateTreeEventRegistrationError>
+    where
+        E: StateTreeEvent<D>,
+    {
+        if self.frozen.get().is_some() {
+            return Err(StateTreeEventRegistrationError::Frozen);
+        }
+        if E::AUTHORED_NAME.is_empty() {
+            return Err(StateTreeEventRegistrationError::EmptyName {
+                type_name: type_name::<E>(),
+            });
+        }
+        let type_id = TypeId::of::<E>();
+        if self.type_ids.contains_key(&type_id) {
+            return Err(StateTreeEventRegistrationError::DuplicateType {
+                type_name: type_name::<E>(),
+            });
+        }
+
+        let id = RegisteredEventId(self.entries.len());
+        self.type_ids.insert(type_id, id);
+        self.entries.push(RegisteredEvent {
+            id,
+            type_id,
+            authored_name: E::AUTHORED_NAME,
+            event_data: project_event_data::<D, E>,
+        });
+        Ok(self)
+    }
+
+    /// Freezes this builder into an immutable, cheaply cloneable protocol.
+    pub fn freeze(&self) -> StateTreeEventProtocol<D> {
+        self.protocol().clone()
+    }
+
+    pub(crate) fn protocol(&self) -> &StateTreeEventProtocol<D> {
+        self.frozen.get_or_init(|| {
+            let authored_names = self
+                .entries
+                .iter()
+                .map(|entry| entry.authored_name)
+                .collect();
+            StateTreeEventProtocol {
+                inner: Arc::new(StateTreeEventProtocolInner {
+                    entries: self.entries.clone().into(),
+                    authored_names,
+                    type_ids: self.type_ids.clone(),
+                }),
+                marker: PhantomData,
+            }
+        })
+    }
+}
+
+/// An immutable external event protocol for one state-tree domain.
+pub struct StateTreeEventProtocol<D: StateTreeDomain> {
+    inner: Arc<StateTreeEventProtocolInner>,
+    marker: PhantomData<fn() -> D>,
+}
+
+impl<D: StateTreeDomain> Clone for StateTreeEventProtocol<D> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<D: StateTreeDomain> StateTreeEventProtocol<D> {
+    pub(crate) fn registered_event_id(&self, type_id: TypeId) -> Option<RegisteredEventId> {
+        self.inner.type_ids.get(&type_id).copied()
+    }
+
+    pub(crate) fn authored_names(&self) -> &[&'static str] {
+        &self.inner.authored_names
+    }
+
+    pub(crate) fn entry(&self, id: RegisteredEventId) -> &RegisteredEvent {
+        &self.inner.entries[id.index()]
+    }
+
+    pub(crate) fn queue<E>(&self, payload: E) -> Option<QueuedStateTreeEvent<D>>
+    where
+        E: StateTreeEvent<D>,
+    {
+        let id = self.registered_event_id(TypeId::of::<E>())?;
+        Some(QueuedStateTreeEvent::new(id, payload))
+    }
+
+    pub(crate) fn event_ref<'a>(
+        &'a self,
+        event: &'a QueuedStateTreeEvent<D>,
+    ) -> StateTreeEventRef<'a, D> {
+        let entry = self.entry(event.id);
+        debug_assert_eq!(entry.type_id, event.payload.as_ref().type_id());
+        StateTreeEventRef {
+            entry,
+            payload: event.payload.as_ref(),
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn borrowed_event<'a, E>(&'a self, event: &'a E) -> Option<StateTreeEventRef<'a, D>>
+    where
+        E: StateTreeEvent<D>,
+    {
+        let id = self.registered_event_id(TypeId::of::<E>())?;
+        Some(StateTreeEventRef {
+            entry: self.entry(id),
+            payload: event,
+            marker: PhantomData,
+        })
+    }
+}
+
+struct StateTreeEventProtocolInner {
+    entries: Box<[RegisteredEvent]>,
+    authored_names: Box<[&'static str]>,
+    type_ids: HashMap<TypeId, RegisteredEventId>,
+}
+
+/// A typed borrowed view of one queued state-tree event.
+pub struct StateTreeEventRef<'a, D: StateTreeDomain> {
+    entry: &'a RegisteredEvent,
+    payload: &'a (dyn Any + Send + Sync),
+    marker: PhantomData<fn() -> D>,
+}
+
+impl<D: StateTreeDomain> Clone for StateTreeEventRef<'_, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D: StateTreeDomain> Copy for StateTreeEventRef<'_, D> {}
+
+impl<'a, D: StateTreeDomain> StateTreeEventRef<'a, D> {
+    /// Returns the event name used by authored state-tree definitions.
+    pub fn authored_name(self) -> &'static str {
+        self.entry.authored_name
+    }
+
+    /// Borrows the payload when this event contains `T`.
+    pub fn payload<T: StateTreeEvent<D>>(self) -> Option<&'a T> {
+        self.payload.downcast_ref()
+    }
+
+    /// Returns whether this event contains a `T` payload.
+    pub fn is<T: StateTreeEvent<D>>(self) -> bool {
+        self.payload.is::<T>()
+    }
+
+    pub(crate) fn event_data(self) -> Result<Option<LuauValue>, StateTreeEventDataError> {
+        (self.entry.event_data)(self.payload)
+    }
+
+    pub(crate) fn registered_event_id(self) -> RegisteredEventId {
+        self.entry.id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RegisteredEventId(usize);
+
+impl RegisteredEventId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RegisteredEvent {
+    id: RegisteredEventId,
+    type_id: TypeId,
+    authored_name: &'static str,
+    event_data: EventDataProjector,
+}
+
+/// The ownership strategy is deliberately private. `event_storage` benchmarks
+/// show the allocation cost directly; a 16-byte inline prototype increased the
+/// queue stride and did not improve end-to-end entity-event throughput.
+pub(crate) struct QueuedStateTreeEvent<D: StateTreeDomain> {
+    id: RegisteredEventId,
+    payload: Box<dyn Any + Send + Sync>,
+    marker: PhantomData<fn() -> D>,
+}
+
+impl<D: StateTreeDomain> QueuedStateTreeEvent<D> {
+    pub(crate) fn new<E: StateTreeEvent<D>>(id: RegisteredEventId, payload: E) -> Self {
+        Self {
+            id,
+            payload: Box::new(payload),
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn view<'a>(
+        &'a self,
+        protocol: &'a StateTreeEventProtocol<D>,
+    ) -> StateTreeEventRef<'a, D> {
+        protocol.event_ref(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project<T: StateTreeEvent<D>>(&self) -> Option<&T> {
+        self.payload.downcast_ref()
+    }
+}
+
+type EventDataProjector =
+    fn(&(dyn Any + Send + Sync)) -> Result<Option<LuauValue>, StateTreeEventDataError>;
+
+fn project_event_data<D, E>(
+    payload: &(dyn Any + Send + Sync),
+) -> Result<Option<LuauValue>, StateTreeEventDataError>
+where
+    D: StateTreeDomain,
+    E: StateTreeEvent<D>,
+{
+    let payload = payload.downcast_ref::<E>().ok_or_else(|| {
+        StateTreeEventDataError::new(format!(
+            "registered event payload did not contain `{}`",
+            type_name::<E>()
+        ))
+    })?;
+    payload.event_data()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        any::{TypeId, type_name},
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use bevy_app::App;
+    use bevy_ecs::event::Event;
+
+    use super::*;
+    use crate::StateTreeAppExt;
+
+    struct TestDomain;
+
+    impl StateTreeDomain for TestDomain {}
+
+    #[derive(Event)]
+    struct First(u32);
+
+    impl StateTreeEvent<TestDomain> for First {
+        const AUTHORED_NAME: &'static str = "first";
+    }
+
+    #[derive(Event)]
+    struct Second(&'static str);
+
+    impl StateTreeEvent<TestDomain> for Second {
+        const AUTHORED_NAME: &'static str = "second";
+    }
+
+    #[derive(Event)]
+    struct SameName;
+
+    impl StateTreeEvent<TestDomain> for SameName {
+        const AUTHORED_NAME: &'static str = "first";
+    }
+
+    #[derive(Event)]
+    struct Unregistered;
+
+    impl StateTreeEvent<TestDomain> for Unregistered {
+        const AUTHORED_NAME: &'static str = "unregistered";
+    }
+
+    #[derive(Event)]
+    struct EmptyName;
+
+    impl StateTreeEvent<TestDomain> for EmptyName {
+        const AUTHORED_NAME: &'static str = "";
+    }
+
+    static PROJECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Event)]
+    struct Projected(i64);
+
+    impl StateTreeEvent<TestDomain> for Projected {
+        const AUTHORED_NAME: &'static str = "projected";
+
+        fn event_data(&self) -> Result<Option<LuauValue>, StateTreeEventDataError> {
+            PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(LuauValue::Integer(self.0)))
+        }
+    }
+
+    #[test]
+    fn registration_order_produces_dense_usable_dispatch() {
+        let mut registry = StateTreeEventRegistry::<TestDomain>::new();
+        registry
+            .register::<First>()
+            .unwrap()
+            .register::<Second>()
+            .unwrap();
+        let protocol = registry.freeze();
+
+        assert_eq!(protocol.authored_names(), &["first", "second"]);
+        assert_eq!(
+            protocol.registered_event_id(TypeId::of::<First>()),
+            Some(RegisteredEventId(0))
+        );
+        assert_eq!(
+            protocol.registered_event_id(TypeId::of::<Second>()),
+            Some(RegisteredEventId(1))
+        );
+
+        let first = protocol.queue(First(7)).unwrap();
+        let second = protocol.queue(Second("payload")).unwrap();
+        let first = first.view(&protocol);
+        let second = second.view(&protocol);
+        assert_eq!(first.registered_event_id().index(), 0);
+        assert_eq!(first.payload::<First>().unwrap().0, 7);
+        assert_eq!(second.registered_event_id().index(), 1);
+        assert_eq!(second.payload::<Second>().unwrap().0, "payload");
+    }
+
+    #[test]
+    fn duplicate_rust_type_is_rejected() {
+        let mut registry = StateTreeEventRegistry::<TestDomain>::new();
+        registry.register::<First>().unwrap();
+
+        assert_eq!(
+            registry.register::<First>().err().unwrap(),
+            StateTreeEventRegistrationError::DuplicateType {
+                type_name: type_name::<First>(),
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_authored_names_are_allowed() {
+        let mut registry = StateTreeEventRegistry::<TestDomain>::new();
+        registry
+            .register::<First>()
+            .unwrap()
+            .register::<SameName>()
+            .unwrap();
+
+        let protocol = registry.freeze();
+        assert_eq!(protocol.authored_names(), &["first", "first"]);
+        assert_eq!(
+            protocol.registered_event_id(TypeId::of::<SameName>()),
+            Some(RegisteredEventId(1))
+        );
+    }
+
+    #[test]
+    fn freeze_is_idempotent_cloneable_and_rejects_registration() {
+        let mut registry = StateTreeEventRegistry::<TestDomain>::new();
+        registry.register::<First>().unwrap();
+
+        let first = registry.freeze();
+        let second = registry.freeze();
+        let cloned = first.clone();
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+        assert!(Arc::ptr_eq(&first.inner, &cloned.inner));
+        assert_eq!(
+            registry.register::<Second>().err().unwrap(),
+            StateTreeEventRegistrationError::Frozen
+        );
+    }
+
+    #[test]
+    fn empty_manual_authored_name_is_rejected() {
+        let mut registry = StateTreeEventRegistry::<TestDomain>::new();
+
+        assert_eq!(
+            registry.register::<EmptyName>().err().unwrap(),
+            StateTreeEventRegistrationError::EmptyName {
+                type_name: type_name::<EmptyName>(),
+            }
+        );
+    }
+
+    #[test]
+    fn borrowed_typed_views_downcast_correctly() {
+        let mut registry = StateTreeEventRegistry::<TestDomain>::new();
+        registry
+            .register::<First>()
+            .unwrap()
+            .register::<Second>()
+            .unwrap();
+        let protocol = registry.freeze();
+        let payload = First(42);
+
+        let view = protocol.borrowed_event(&payload).unwrap();
+        assert_eq!(view.authored_name(), "first");
+        assert!(view.is::<First>());
+        assert!(!view.is::<Second>());
+        assert_eq!(view.payload::<First>().unwrap().0, 42);
+        assert!(view.payload::<Second>().is_none());
+    }
+
+    #[test]
+    fn unregistered_lookup_and_queue_are_rejected() {
+        let protocol = StateTreeEventRegistry::<TestDomain>::new().freeze();
+        let payload = Unregistered;
+
+        assert_eq!(
+            protocol.registered_event_id(TypeId::of::<Unregistered>()),
+            None
+        );
+        assert!(protocol.borrowed_event(&payload).is_none());
+        assert!(protocol.queue(payload).is_none());
+    }
+
+    #[test]
+    fn event_data_projector_is_lazy() {
+        PROJECTIONS.store(0, Ordering::Relaxed);
+        let mut registry = StateTreeEventRegistry::<TestDomain>::new();
+        registry.register::<Projected>().unwrap();
+        let protocol = registry.freeze();
+        let queued = protocol.queue(Projected(23)).unwrap();
+        let view = queued.view(&protocol);
+
+        assert_eq!(PROJECTIONS.load(Ordering::Relaxed), 0);
+        assert_eq!(view.authored_name(), "projected");
+        assert!(view.is::<Projected>());
+        assert_eq!(PROJECTIONS.load(Ordering::Relaxed), 0);
+        assert_eq!(view.event_data().unwrap(), Some(LuauValue::Integer(23)));
+        assert_eq!(PROJECTIONS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn app_registration_after_freeze_panics() {
+        let mut app = App::new();
+        app.register_state_tree_event::<TestDomain, First>();
+        app.world()
+            .resource::<StateTreeAppEventRegistry<TestDomain>>()
+            .protocol();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            app.register_state_tree_event::<TestDomain, Second>();
+        }));
+        assert!(result.is_err());
+    }
+}

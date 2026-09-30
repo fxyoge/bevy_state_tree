@@ -20,7 +20,9 @@ use bevy_ecs::{
 use crate::{
     LuauValue, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
     StateTreeDomain, StateTreeEffectContext, StateTreeEffectError, StateTreeEventDataError,
-    StateTreeInstance, definition::ActivityId,
+    StateTreeInstance,
+    definition::ActivityId,
+    event::{StateTreeEvent, StateTreeEventRef},
 };
 
 /// Portable generation-safe token used by headless activity sinks.
@@ -32,19 +34,19 @@ pub struct StateTreeHeadlessActivityToken {
 }
 
 /// One portable activity start emitted by headless execution.
-pub struct StateTreeActivityRequest<'a, E: crate::StateTreeEvents> {
+pub struct StateTreeActivityRequest<'a, D: StateTreeDomain> {
     id: &'a str,
     name: &'a str,
     token: StateTreeHeadlessActivityToken,
     span_start: usize,
     event_name: Option<&'a str>,
-    external_event: Option<&'a E>,
+    external_event: Option<StateTreeEventRef<'a, D>>,
     data_names: &'a [Box<str>],
     data: &'a [LuauValue],
     arguments: &'a mut StateTreeActivityArgs,
 }
 
-impl<'a, E: crate::StateTreeEvents> StateTreeActivityRequest<'a, E> {
+impl<'a, D: StateTreeDomain> StateTreeActivityRequest<'a, D> {
     pub fn id(&self) -> &str {
         self.id
     }
@@ -60,8 +62,15 @@ impl<'a, E: crate::StateTreeEvents> StateTreeActivityRequest<'a, E> {
     pub fn event_name(&self) -> Option<&str> {
         self.event_name
     }
-    pub fn external_event(&self) -> Option<&E> {
+    pub fn external_event(&self) -> Option<StateTreeEventRef<'a, D>> {
         self.external_event
+    }
+    pub fn event_ref(&self) -> Option<StateTreeEventRef<'a, D>> {
+        self.external_event
+    }
+    pub fn event<T: StateTreeEvent<D>>(&self) -> Option<&T> {
+        self.external_event
+            .and_then(StateTreeEventRef::payload::<T>)
     }
     /// Returns one instance-local datamodel value.
     pub fn data(&self, name: &str) -> Option<&LuauValue> {
@@ -76,10 +85,10 @@ impl<'a, E: crate::StateTreeEvents> StateTreeActivityRequest<'a, E> {
 }
 
 /// Receives starts and cancellations from a headless state-tree execution.
-pub trait StateTreeActivitySink<E: crate::StateTreeEvents> {
+pub trait StateTreeActivitySink<D: StateTreeDomain> {
     fn start(
         &mut self,
-        request: StateTreeActivityRequest<'_, E>,
+        request: StateTreeActivityRequest<'_, D>,
     ) -> Result<(), StateTreeActivityError>;
     fn cancel(&mut self, token: StateTreeHeadlessActivityToken);
 }
@@ -262,13 +271,12 @@ pub(crate) struct HeadlessActivitySink<'a, S: ?Sized> {
     pub sink: &'a mut S,
 }
 
-impl<E: crate::StateTreeEvents, S: StateTreeActivitySink<E> + ?Sized>
-    RuntimeActivitySink<crate::instance::HeadlessDomain<E>> for HeadlessActivitySink<'_, S>
+impl<D, S> RuntimeActivitySink<D> for HeadlessActivitySink<'_, S>
+where
+    D: StateTreeDomain,
+    S: StateTreeActivitySink<D> + ?Sized,
 {
-    fn start(
-        &mut self,
-        request: RuntimeActivityStart<'_, crate::instance::HeadlessDomain<E>>,
-    ) -> Result<(), StateTreeEffectError> {
+    fn start(&mut self, request: RuntimeActivityStart<'_, D>) -> Result<(), StateTreeEffectError> {
         let mut arguments = request.arguments;
         self.sink.start(StateTreeActivityRequest {
             id: request.id,
@@ -288,7 +296,7 @@ impl<E: crate::StateTreeEvents, S: StateTreeActivitySink<E> + ?Sized>
     }
     fn cancel(
         &mut self,
-        _handler: Option<&Arc<dyn RegisteredActivity<crate::instance::HeadlessDomain<E>>>>,
+        _handler: Option<&Arc<dyn RegisteredActivity<D>>>,
         token: ErasedActivityToken,
     ) {
         self.sink.cancel(StateTreeHeadlessActivityToken {
@@ -533,16 +541,16 @@ where
     let mut registry = app
         .world_mut()
         .resource_mut::<StateTreeActivityRegistry<D>>();
-    let previous = registry.activities.insert(
+    assert!(
+        !registry.activities.contains_key(&name),
+        "state-tree activity `{name}` was registered more than once"
+    );
+    registry.activities.insert(
         name.clone(),
         Arc::new(TypedActivity::<D, A, F> {
             constructor,
             marker: PhantomData,
         }),
-    );
-    assert!(
-        previous.is_none(),
-        "state-tree activity `{name}` was registered more than once"
     );
     registry.revision = registry.revision.wrapping_add(1);
 }

@@ -15,7 +15,8 @@ use bevy_state_tree::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeActivity,
     StateTreeActivityDefinition, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
     StateTreeActivityToken, StateTreeAppExt, StateTreeBuilder, StateTreeDefinition,
-    StateTreeEvents, StateTreeInstance, StateTreePlugin, StateTreeSet, StateTreeTransition,
+    StateTreeDomain, StateTreeEvent, StateTreeInstance, StateTreePlugin, StateTreeSet,
+    StateTreeTransition,
 };
 use bevy_tasks::{AsyncComputeTaskPool, IoTaskPool, TaskPoolBuilder};
 use bevy_time::{Time, TimePlugin};
@@ -30,15 +31,20 @@ pub struct AiUpdate;
 
 pub struct Simulation;
 
-#[derive(Event)]
+impl StateTreeDomain for Simulation {}
+
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = Simulation, name = "tick", broadcast)]
 pub struct Tick;
 
-#[derive(EntityEvent)]
+#[derive(EntityEvent, StateTreeEvent)]
+#[state_tree(domain = Simulation, name = "tick.entity")]
 pub struct EntityTick {
     entity: Entity,
 }
 
-#[derive(Event)]
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = Simulation, name = "ignored", broadcast)]
 pub struct Ignored;
 
 #[derive(Message)]
@@ -53,17 +59,6 @@ impl StateTreeActivity for BenchmarkActivity {
 
 #[derive(Resource, Default)]
 struct BenchmarkActivityTokens(Vec<StateTreeActivityToken<Simulation, BenchmarkActivity>>);
-
-#[derive(StateTreeEvents)]
-#[state_tree(domain = Simulation)]
-pub enum Events {
-    #[state_tree(name = "tick", broadcast)]
-    Tick(Tick),
-    #[state_tree(name = "tick.entity")]
-    EntityTick(EntityTick),
-    #[state_tree(name = "ignored", broadcast)]
-    Ignored(Ignored),
-}
 
 #[derive(Clone, Copy)]
 pub enum Executor {
@@ -111,6 +106,9 @@ impl BenchmarkApp {
         ))
         .init_schedule(AiUpdate)
         .add_plugins(StateTreePlugin::<Simulation>::new(AiUpdate))
+        .register_state_tree_event::<Simulation, Tick>()
+        .register_state_tree_event::<Simulation, EntityTick>()
+        .register_state_tree_event::<Simulation, Ignored>()
         .insert_resource(QueuedEvent::None)
         .add_systems(
             AiUpdate,

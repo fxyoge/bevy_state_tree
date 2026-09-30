@@ -25,7 +25,7 @@ column; compiler diagnostics retain the asset path and byte position.
 Asset loading is domain-independent. It validates authored SCXML and produces
 the same immutable runtime representation as `StateTreeBuilder::build`, but it
 does not resolve external events, typed effects, or typed activities. Those
-checks depend on a domain's `StateTreeEvents` protocol and registries and occur when
+checks depend on a domain's frozen event protocol and registries and occur when
 a `StateTreeInstance` initializes. A source can load successfully and still
 leave an instance pending with `StateTreeLinkFailure<D>` for a particular
 domain.
@@ -36,13 +36,28 @@ path as file-loaded definitions.
 
 ## Events
 
-External events belong to a closed Rust protocol declared with
-`#[derive(StateTreeEvents)]`. Authored event descriptors are resolved against
-that protocol when a definition is linked to a state-tree domain. Typed Rust
-payloads remain intact through queueing and execution; the runtime does not
-dispatch arbitrary string events.
+Each state-tree domain is a marker type implementing `StateTreeDomain`. Its
+external event protocol is open during setup: each concrete payload derives
+`StateTreeEvent` with its domain and authored name, then Bevy applications call
+`app.register_state_tree_event::<D, E>()`. Entity payloads also derive
+`EntityEvent`; broadcast payloads derive Bevy `Event` and use the
+`#[state_tree(..., broadcast)]` option.
 
-An event variant may opt into Luau payload access with
+The registry freezes on first protocol use, including the first state-tree
+schedule run or event write. All payloads must therefore be registered before
+execution; duplicate or late application registration panics. Headless callers
+instead register payloads in `StateTreeEventRegistry<D>`, call `freeze`, and pass
+the resulting `StateTreeEventProtocol<D>` to `StateTreeExecution`.
+
+Authored descriptors are checked against registered authored names when a
+definition is linked. Descriptor matching retains SCXML prefix and wildcard
+semantics; linking precomputes dense transition sets for each registered event,
+so macrosteps do not perform dynamic string matching. Typed Rust payloads remain
+intact through queueing and execution, and typed constructors can inspect the
+current payload with `context.event::<T>()`. The runtime does not accept an
+unregistered arbitrary string as an external event.
+
+An event payload may opt into Luau payload access with
 `#[state_tree(name = "...", data = projector)]`. The projector accepts a shared
 reference to the concrete payload and returns
 `Result<LuauValue, StateTreeEventDataError>`. It runs lazily only when an
@@ -149,7 +164,7 @@ payload, target URI, I/O processor, and private timer semantics do not map
 cleanly to Bevy's typed events, entities, schedules, and time resources. In
 particular, `event="damage"` cannot construct an application-defined Rust value
 such as `Damage { entity, amount }` without adding a second dynamic event system
-that bypasses the domain's `StateTreeEvents` protocol.
+that bypasses the domain's registered event protocol.
 
 State trees receive external events through `EntityStateTreeEventWriter` and
 `BroadcastStateTreeEventWriter`. Future state-tree outputs should likewise use
@@ -185,8 +200,8 @@ fresh authored environment for each evaluation; scripts cannot access Bevy's
 event or accepted activity outcome. Activity data remains available through
 eventless follow-up for that outcome, then is cleared before any raised or
 completion internal event is consumed. It is absent for other internal events
-and unprojected variants. Other SCXML
-system variables are reserved but not yet implemented. Datamodel errors fault
+and unprojected payloads. Other SCXML system variables are reserved but not yet
+implemented. Datamodel errors fault
 the instance rather than raising SCXML `error.execution` events. ECMAScript is
 not a planned built-in datamodel.
 
@@ -211,6 +226,8 @@ constructor receives the entity, current external event, datamodel view, and
 evaluated named arguments, and returns a concrete Bevy `Message`. The runtime
 publishes that message through deferred commands. Systems ordered in
 `StateTreeSet::HandleEffects` observe messages after state-tree processing.
+The constructor can use `context.event::<T>()` to borrow a matching concrete
+external payload; it returns `None` for internal events or another payload type.
 
 Effects are constructed in SCXML action order. Publication across independently
 processed instances is unordered. A constructor, argument conversion, or

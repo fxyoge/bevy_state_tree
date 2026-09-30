@@ -48,10 +48,18 @@ headless runtime and are compared with deterministic semantic event logs. The
 same opt-in tracing API is available to applications without adding tracing
 work to the normal Bevy execution path.
 
-Each runtime domain owns a closed external event protocol. Tuple variants keep
-the original Rust payload intact through queueing and execution, while the
-derive generates event-name matching and writer conversions. Variants are
-entity-targeted by default; mark domain-wide events with `broadcast`.
+Each runtime domain is a marker type implementing `StateTreeDomain`. Its
+external event protocol is open during application setup: derive
+`StateTreeEvent` on each concrete payload and register each domain/payload pair
+with `app.register_state_tree_event::<D, E>()`. Payloads are entity-targeted by
+default; add `broadcast` for domain-wide events.
+
+The registry freezes on first protocol use. In Bevy, register every payload
+before the first state-tree schedule run or event write; duplicate or late
+registration through `StateTreeAppExt` panics. Linking resolves authored event
+descriptors against the frozen registered names and prelinks each event type to
+dense transition sets. Processing does not scan strings or Rust types for
+candidate transitions.
 
 Payloads can opt into Luau projection with `data = projector`. The projector is
 called only when an executed expression reads `_event.data`; its portable value
@@ -66,7 +74,10 @@ use bevy_time::TimePlugin;
 
 struct Simulation;
 
-#[derive(EntityEvent)]
+impl StateTreeDomain for Simulation {}
+
+#[derive(EntityEvent, StateTreeEvent)]
+#[state_tree(domain = Simulation, name = "wake", data = wake_data)]
 struct Wake {
     entity: Entity,
 }
@@ -75,13 +86,6 @@ fn wake_data(_: &Wake) -> Result<LuauValue, StateTreeEventDataError> {
     Ok(LuauValue::Record(
         [(Box::from("urgent"), LuauValue::Boolean(true))].into(),
     ))
-}
-
-#[derive(StateTreeEvents)]
-#[state_tree(domain = Simulation)]
-enum SimulationEvents {
-    #[state_tree(name = "wake", data = wake_data)]
-    Wake(Wake),
 }
 
 fn wake(mut events: EntityStateTreeEventWriter<Simulation>) {
@@ -93,13 +97,17 @@ fn wake(mut events: EntityStateTreeEventWriter<Simulation>) {
 let mut app = App::new();
 app.add_plugins((TimePlugin, AssetPlugin::default()))
     .add_plugins(StateTreePlugin::<Simulation>::new(FixedUpdate))
+    .register_state_tree_event::<Simulation, Wake>()
     .add_systems(FixedUpdate, wake.in_set(StateTreeSet::QueueEvents));
 ```
 
 Each state-tree instance observes its own ordered event stream. Entity events
 for different instances have no relative order and those instances are
 processed in parallel. Broadcast events are merged into each instance's stream
-at the point where they were written.
+at the point where they were written. Private boxed ownership currently adds one
+payload allocation per queued external event. A broadcast payload allocates once
+and is shared across recipients. Storage remains opaque so measured workloads
+can guide future optimization without changing the public event API.
 
 Instances that initialize before event processing receive events queued during
 that schedule run. Instances still waiting for their definition asset receive
@@ -115,12 +123,7 @@ Bevy's normal asset server and attach its handle to an entity:
 # use bevy_ecs::prelude::*;
 # use bevy_state_tree::prelude::*;
 # struct Simulation;
-# enum SimulationEvents {}
-# impl StateTreeEvents for SimulationEvents {
-#     const AUTHORED_NAMES: &'static [&'static str] = &[];
-#     fn event_index(&self) -> usize { match *self {} }
-# }
-# impl StateTreeDomain for Simulation { type Event = SimulationEvents; }
+# impl StateTreeDomain for Simulation {}
 fn spawn_controller(mut commands: Commands, assets: Res<AssetServer>) {
     let definition = assets.load("state_trees/enemy.scxml");
     commands.spawn(StateTreeInstance::<Simulation>::new(definition));
@@ -135,12 +138,7 @@ initial state entry actions, guards, effects, or activities:
 # use bevy_asset::Handle;
 # use bevy_state_tree::prelude::*;
 # struct Simulation;
-# enum SimulationEvents {}
-# impl StateTreeEvents for SimulationEvents {
-#     const AUTHORED_NAMES: &'static [&'static str] = &[];
-#     fn event_index(&self) -> usize { match *self {} }
-# }
-# impl StateTreeDomain for Simulation { type Event = SimulationEvents; }
+# impl StateTreeDomain for Simulation {}
 # let definition = Handle::<StateTreeDefinition>::default();
 let initial_data = StateTreeDataOverrides::try_new([
     ("health", LuauValue::Integer(100)),
@@ -265,6 +263,39 @@ adds a queryable `StateTreeLinkFailure<D>` component. Replacing the asset or
 registering a missing effect or activity retries linking without changing
 successfully running instances.
 
+Headless execution builds and freezes the same protocol explicitly, then passes
+it to `StateTreeExecution`:
+
+```rust,no_run
+use std::num::NonZeroUsize;
+use bevy_ecs::event::Event;
+use bevy_state_tree::prelude::*;
+
+struct Simulation;
+impl StateTreeDomain for Simulation {}
+
+#[derive(Event, StateTreeEvent)]
+#[state_tree(domain = Simulation, name = "tick", broadcast)]
+struct Tick;
+
+# fn run(definition: &StateTreeDefinition) -> Result<(), StateTreeLinkError> {
+let mut events = StateTreeEventRegistry::<Simulation>::new();
+events.register::<Tick>().expect("register tick before freeze");
+let protocol = events.freeze();
+let mut execution = StateTreeExecution::<Simulation>::new(
+    definition,
+    protocol,
+    NonZeroUsize::new(1024).unwrap(),
+)?;
+execution.process_event(&Tick, NonZeroUsize::new(1024).unwrap());
+# Ok(())
+# }
+```
+
+`StateTreeEventRegistry::freeze` is idempotent and returns a cheaply cloneable
+immutable protocol. Registration after it freezes returns
+`StateTreeEventRegistrationError::Frozen`.
+
 The complete domain schedule order is `ProcessTimers`, `QueueEvents`,
 `ProcessActivityOutcomes`, `Initialize`, `ProcessEvents`, `HandleActivities`,
 then `HandleEffects`. Statechart actions can construct effect messages before
@@ -298,7 +329,9 @@ The constructor consumes named `StateTreeEffectArgs` and returns one concrete
 Bevy `Message`. Messages are available to systems in `StateTreeSet::HandleEffects`.
 Construction follows statechart action order, but message delivery order between
 parallel instances is unspecified. Constructor, argument, and payload projection
-errors fault only the affected instance. Headless callers use
+errors fault only the affected instance. A constructor can recover its concrete
+trigger payload with `context.event::<Wake>()`; internal events and other
+external payload types return `None`. Headless callers use
 `StateTreeExecution::{new,process_event}_with_sink` to receive portable requests.
 Headless constructors return `Result` because the definition must still link to
 the execution's typed event protocol. `StateTreeExecution::new_with_initial_data`
@@ -349,14 +382,16 @@ or tasks.
 
 Each case named in `tests/scxml/manifest.txt` has a project-owned `.scxml`
 source and `.trace` golden log. An optional `.events` sidecar supplies one
-external authored event name per line from the harness's closed event protocol.
-The corpus runner reports every mismatch together so adding cases requires no
-case-specific Rust assertions.
+external authored event name per line from the harness's registered event
+protocol. The corpus runner reports every mismatch together so adding cases
+requires no case-specific Rust assertions.
 
 ## Benchmarks
 
-Run `just bench` for both throughput and allocation profiles, or use
-`just _bench-execution` and `just _bench-allocation` separately. Throughput
+Run `just bench` for the complete suite, or use `just _bench-execution` and
+`just _bench-allocation` for the runtime profiles. `cargo bench --bench
+event_storage` compares compact, padded, selectively boxed, and registered
+erased queue representations across small and 256-byte payloads. Throughput
 cases cover broadcast processing across as many as one million independent
 trees, sparse entity events in a population of 100,000, initialization, activity
 initialization and outcome processing, deep re-entry, transition scanning,

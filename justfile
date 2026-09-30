@@ -13,8 +13,12 @@ _test-lib:
   cargo test
 
 bench: \
+  _bench-event-storage \
   _bench-execution \
   _bench-allocation
+
+_bench-event-storage:
+  cargo bench --bench event_storage
 
 _bench-execution:
   cargo bench --bench execution

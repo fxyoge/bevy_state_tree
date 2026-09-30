@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::activity::{RegisteredActivity, StateTreeActivityRegistry};
 use crate::effect::{RegisteredEffect, StateTreeEffectRegistry};
 use crate::{
-    StateTreeDomain, StateTreeEvents,
+    StateTreeDomain, StateTreeEventProtocol,
     luau::{CompiledLuauExpression, compile_expression},
 };
 
@@ -421,13 +421,15 @@ impl<D: StateTreeDomain> std::fmt::Debug for LinkedDefinition<D> {
 impl<D: StateTreeDomain> LinkedDefinition<D> {
     pub fn new(
         compiled: Arc<CompiledDefinition>,
+        events: &StateTreeEventProtocol<D>,
         effects: Option<&StateTreeEffectRegistry<D>>,
         activities: Option<&StateTreeActivityRegistry<D>>,
     ) -> Result<Self, StateTreeLinkError> {
         let mut issues = Vec::new();
         for requirement in &compiled.event_requirements {
             let pattern = &compiled.events[requirement.event.index()];
-            let matches_external = D::Event::AUTHORED_NAMES
+            let matches_external = events
+                .authored_names()
                 .iter()
                 .any(|name| event_pattern_matches(pattern, name));
             let matches_internal = compiled.internal_events.iter().any(|event| {
@@ -475,7 +477,8 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
                 issues: issues.into_boxed_slice(),
             });
         }
-        let external_events = D::Event::AUTHORED_NAMES
+        let external_events = events
+            .authored_names()
             .iter()
             .map(|name| EventSet::for_name(&compiled.events, name))
             .collect();

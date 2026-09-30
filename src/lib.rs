@@ -1,8 +1,8 @@
 //! Asset-backed hierarchical statecharts for Bevy.
 //!
 //! State tree definitions are immutable assets shared by any number of
-//! entity-local instances. Each domain declares its closed external event
-//! protocol with [`StateTreeEvents`](macro@StateTreeEvents).
+//! entity-local instances. Plugins register typed external events into each
+//! domain's protocol before execution begins.
 //!
 //! # Event ordering
 //!
@@ -37,7 +37,7 @@ mod trace;
 
 pub mod scxml;
 
-pub use bevy_state_tree_macros::StateTreeEvents;
+pub use bevy_state_tree_macros::StateTreeEvent;
 pub use definition::{
     BuildError, HistoryId, StateId, StateTreeAction, StateTreeActivityDefinition,
     StateTreeArgument, StateTreeBuilder, StateTreeData, StateTreeDefinition,
@@ -50,8 +50,9 @@ pub use effect::{
     StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
 };
 pub use event::{
-    BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEventDataError,
-    StateTreeEventPayload, StateTreeEvents,
+    BroadcastStateTreeEvent, EntityStateTreeEvent, StateTreeDomain, StateTreeEvent,
+    StateTreeEventDataError, StateTreeEventProtocol, StateTreeEventRef,
+    StateTreeEventRegistrationError, StateTreeEventRegistry,
 };
 pub use instance::{
     DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeDataOverrideError,
@@ -79,11 +80,13 @@ pub mod prelude {
         StateTreeArgs, StateTreeArgument, StateTreeBuilder, StateTreeContext, StateTreeData,
         StateTreeDataOverrideError, StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain,
         StateTreeEffectArgs, StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
-        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEventDataError, StateTreeEventLog,
-        StateTreeEventPayload, StateTreeEvents, StateTreeExecution, StateTreeHeadlessActivityToken,
-        StateTreeHistoryResolution, StateTreeInstance, StateTreeLinkError, StateTreeLinkFailure,
-        StateTreeLinkIssue, StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTarget,
-        StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, StateTreeTransition,
+        StateTreeEffectRequest, StateTreeEffectSink, StateTreeEvent, StateTreeEventDataError,
+        StateTreeEventLog, StateTreeEventProtocol, StateTreeEventRef,
+        StateTreeEventRegistrationError, StateTreeEventRegistry, StateTreeExecution,
+        StateTreeHeadlessActivityToken, StateTreeHistoryResolution, StateTreeInstance,
+        StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin,
+        StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTrace, StateTreeTraceRecord,
+        StateTreeTraceTrigger, StateTreeTransition,
     };
 }
 pub use activity::{

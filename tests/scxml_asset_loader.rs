@@ -9,19 +9,7 @@ struct StateTreeUpdate;
 
 struct TestDomain;
 
-enum TestEvents {}
-
-impl StateTreeEvents for TestEvents {
-    const AUTHORED_NAMES: &'static [&'static str] = &[];
-
-    fn event_index(&self) -> usize {
-        match *self {}
-    }
-}
-
-impl StateTreeDomain for TestDomain {
-    type Event = TestEvents;
-}
+impl StateTreeDomain for TestDomain {}
 
 fn test_app() -> App {
     let mut app = App::new();

@@ -1,11 +1,14 @@
 use std::any::Any;
 
 use divan::{
-    Bencher,
+    AllocProfiler, Bencher,
     counter::{BytesCount, ItemsCount},
 };
 
 const COUNTS: &[usize] = &[32, 1_024];
+
+#[global_allocator]
+static ALLOC: AllocProfiler = AllocProfiler::system();
 
 fn main() {
     divan::main();
@@ -19,6 +22,7 @@ enum InlineClosed {
 }
 
 #[allow(dead_code)]
+#[allow(clippy::large_enum_variant)]
 enum PaddedClosed {
     Unit,
     Scalar(u64),

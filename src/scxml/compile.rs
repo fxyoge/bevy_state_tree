@@ -1275,20 +1275,19 @@ mod tests {
     use crate::scxml;
     use crate::{
         DatamodelOperation, InstanceStatus, LuauValue, RuntimeFault, StateTreeActivityRequest,
-        StateTreeActivitySink, StateTreeEffectError, StateTreeEffectRequest, StateTreeEffectSink,
-        StateTreeEvents, StateTreeExecution, StateTreeHeadlessActivityToken,
+        StateTreeActivitySink, StateTreeDomain, StateTreeEffectError, StateTreeEffectRequest,
+        StateTreeEffectSink, StateTreeEventRegistry, StateTreeExecution,
+        StateTreeHeadlessActivityToken,
     };
 
     const NS: &str = super::super::SCXML_NAMESPACE;
 
-    enum NoEvents {}
+    struct NoEventsDomain;
 
-    impl StateTreeEvents for NoEvents {
-        const AUTHORED_NAMES: &'static [&'static str] = &[];
+    impl StateTreeDomain for NoEventsDomain {}
 
-        fn event_index(&self) -> usize {
-            match *self {}
-        }
+    fn no_events_protocol() -> crate::StateTreeEventProtocol<NoEventsDomain> {
+        StateTreeEventRegistry::new().freeze()
     }
 
     #[test]
@@ -1619,9 +1618,12 @@ mod tests {
         .unwrap();
         let definition = compile(&document).unwrap();
 
-        let execution =
-            StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
-                .unwrap();
+        let execution = StateTreeExecution::<NoEventsDomain>::new(
+            &definition,
+            no_events_protocol(),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(execution.status(), &InstanceStatus::Complete);
         assert_eq!(execution.active_state_names().last(), Some("pass"));
@@ -1638,9 +1640,13 @@ mod tests {
         .unwrap();
         let definition = compile(&document).unwrap();
 
-        let error = StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
-            .err()
-            .unwrap();
+        let error = StateTreeExecution::<NoEventsDomain>::new(
+            &definition,
+            no_events_protocol(),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .err()
+        .unwrap();
 
         assert!(matches!(
             &error.issues()[0],
@@ -1665,9 +1671,12 @@ mod tests {
         .unwrap();
         let definition = compile(&document).unwrap();
 
-        let execution =
-            StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(8).unwrap())
-                .unwrap();
+        let execution = StateTreeExecution::<NoEventsDomain>::new(
+            &definition,
+            no_events_protocol(),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(execution.status(), &InstanceStatus::Complete);
         assert_eq!(
@@ -1677,19 +1686,24 @@ mod tests {
         assert_eq!(execution.data("exited"), Some(&LuauValue::Boolean(false)));
     }
 
-    fn execute(source: &str) -> StateTreeExecution<NoEvents> {
+    fn execute(source: &str) -> StateTreeExecution<NoEventsDomain> {
         let document = scxml::parse("raises.scxml", source).unwrap();
         let definition = compile(&document).unwrap();
-        StateTreeExecution::<NoEvents>::new(&definition, NonZeroUsize::new(32).unwrap()).unwrap()
+        StateTreeExecution::<NoEventsDomain>::new(
+            &definition,
+            no_events_protocol(),
+            NonZeroUsize::new(32).unwrap(),
+        )
+        .unwrap()
     }
 
     #[derive(Default)]
     struct RecordingEffects(Vec<(String, i64)>);
 
-    impl StateTreeEffectSink<NoEvents> for RecordingEffects {
+    impl StateTreeEffectSink<NoEventsDomain> for RecordingEffects {
         fn emit(
             &mut self,
-            mut request: StateTreeEffectRequest<'_, NoEvents>,
+            mut request: StateTreeEffectRequest<'_, NoEventsDomain>,
         ) -> Result<(), StateTreeEffectError> {
             let value = request.arguments().take::<i64>("value")?;
             self.0.push((request.name().to_owned(), value));
@@ -1711,8 +1725,9 @@ mod tests {
         let definition = compile(&document).unwrap();
         let mut effects = RecordingEffects::default();
 
-        let execution = StateTreeExecution::<NoEvents>::new_with_sink(
+        let execution = StateTreeExecution::<NoEventsDomain>::new_with_sink(
             &definition,
+            no_events_protocol(),
             NonZeroUsize::new(8).unwrap(),
             &mut effects,
         )
@@ -1734,10 +1749,10 @@ mod tests {
         cancellations: Vec<StateTreeHeadlessActivityToken>,
     }
 
-    impl<E: StateTreeEvents> StateTreeActivitySink<E> for RecordingActivities {
+    impl<D: StateTreeDomain> StateTreeActivitySink<D> for RecordingActivities {
         fn start(
             &mut self,
-            mut request: StateTreeActivityRequest<'_, E>,
+            mut request: StateTreeActivityRequest<'_, D>,
         ) -> Result<(), StateTreeEffectError> {
             let value = request
                 .arguments()
@@ -1859,8 +1874,9 @@ mod tests {
         );
         let definition = compile(&scxml::parse("activity.scxml", &source).unwrap()).unwrap();
         let mut sink = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
             &definition,
+            no_events_protocol(),
             NonZeroUsize::new(8).unwrap(),
             &mut sink,
         )
@@ -1917,8 +1933,9 @@ mod tests {
         );
         let definition = compile(&scxml::parse("payload-scope.scxml", &source).unwrap()).unwrap();
         let mut sink = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
             &definition,
+            no_events_protocol(),
             NonZeroUsize::new(8).unwrap(),
             &mut sink,
         )
@@ -1952,8 +1969,9 @@ mod tests {
         let definition = compile(&scxml::parse("mixed-sinks.scxml", &source).unwrap()).unwrap();
         let mut effects = RecordingEffects::default();
         let mut activities = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<NoEvents>::new_with_sinks(
+        let mut execution = StateTreeExecution::<NoEventsDomain>::new_with_sinks(
             &definition,
+            no_events_protocol(),
             NonZeroUsize::new(8).unwrap(),
             &mut effects,
             &mut activities,
@@ -1982,14 +2000,18 @@ mod tests {
         assert_eq!(execution.active_state_names().last(), Some("next"));
     }
 
-    enum ReenterEvent {
-        Reenter,
-    }
-    impl StateTreeEvents for ReenterEvent {
-        const AUTHORED_NAMES: &'static [&'static str] = &["reenter"];
-        fn event_index(&self) -> usize {
-            0
-        }
+    struct ReenterDomain;
+
+    impl StateTreeDomain for ReenterDomain {}
+
+    #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
+    #[state_tree(domain = ReenterDomain, name = "reenter", broadcast)]
+    struct ReenterEvent;
+
+    fn reenter_protocol() -> crate::StateTreeEventProtocol<ReenterDomain> {
+        let mut registry = StateTreeEventRegistry::new();
+        registry.register::<ReenterEvent>().unwrap();
+        registry.freeze()
     }
 
     #[test]
@@ -2002,15 +2024,16 @@ mod tests {
         );
         let definition = compile(&scxml::parse("reentry.scxml", &source).unwrap()).unwrap();
         let mut sink = RecordingActivities::default();
-        let mut execution = StateTreeExecution::<ReenterEvent>::new_with_activity_sink(
+        let mut execution = StateTreeExecution::<ReenterDomain>::new_with_activity_sink(
             &definition,
+            reenter_protocol(),
             NonZeroUsize::new(8).unwrap(),
             &mut sink,
         )
         .unwrap();
         let first = sink.starts[0].3;
         assert!(execution.process_event_with_activity_sink(
-            &ReenterEvent::Reenter,
+            &ReenterEvent,
             NonZeroUsize::new(8).unwrap(),
             &mut sink
         ));
@@ -2055,8 +2078,9 @@ mod tests {
             .unwrap();
         let definition = builder.build().unwrap();
         let mut sink = RecordingActivities::default();
-        let execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+        let execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
             &definition,
+            no_events_protocol(),
             NonZeroUsize::new(8).unwrap(),
             &mut sink,
         )
@@ -2081,8 +2105,9 @@ mod tests {
         let definition =
             compile(&scxml::parse("parallel-activity.scxml", &source).unwrap()).unwrap();
         let mut sink = RecordingActivities::default();
-        let execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+        let execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
             &definition,
+            no_events_protocol(),
             NonZeroUsize::new(8).unwrap(),
             &mut sink,
         )
@@ -2111,8 +2136,9 @@ mod tests {
             .unwrap();
         let definition = builder.build().unwrap();
         let mut sink = RecordingActivities::default();
-        let execution = StateTreeExecution::<NoEvents>::new_with_activity_sink(
+        let execution = StateTreeExecution::<NoEventsDomain>::new_with_activity_sink(
             &definition,
+            no_events_protocol(),
             NonZeroUsize::new(1).unwrap(),
             &mut sink,
         )
@@ -2125,22 +2151,33 @@ mod tests {
         assert_eq!(sink.cancellations, [sink.starts[0].3, sink.starts[1].3]);
     }
 
+    struct PayloadDomain;
+
+    impl StateTreeDomain for PayloadDomain {}
+
+    #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
+    #[state_tree(
+        domain = PayloadDomain,
+        name = "payload",
+        broadcast,
+        data = payload_event_data
+    )]
     struct PayloadEvent {
         amount: i64,
     }
 
-    impl StateTreeEvents for PayloadEvent {
-        const AUTHORED_NAMES: &'static [&'static str] = &["payload"];
+    fn payload_event_data(
+        event: &PayloadEvent,
+    ) -> Result<LuauValue, crate::StateTreeEventDataError> {
+        Ok(LuauValue::Record(
+            [(Box::from("amount"), LuauValue::Integer(event.amount))].into(),
+        ))
+    }
 
-        fn event_index(&self) -> usize {
-            0
-        }
-
-        fn event_data(&self) -> Result<Option<LuauValue>, crate::StateTreeEventDataError> {
-            Ok(Some(LuauValue::Record(
-                [(Box::from("amount"), LuauValue::Integer(self.amount))].into(),
-            )))
-        }
+    fn payload_protocol() -> crate::StateTreeEventProtocol<PayloadDomain> {
+        let mut registry = StateTreeEventRegistry::new();
+        registry.register::<PayloadEvent>().unwrap();
+        registry.freeze()
     }
 
     #[test]
@@ -2156,9 +2193,12 @@ mod tests {
         );
         let document = scxml::parse("payload.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
-        let mut execution =
-            StateTreeExecution::<PayloadEvent>::new(&definition, NonZeroUsize::new(8).unwrap())
-                .unwrap();
+        let mut execution = StateTreeExecution::<PayloadDomain>::new(
+            &definition,
+            payload_protocol(),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
 
         assert!(
             execution.process_event(&PayloadEvent { amount: 7 }, NonZeroUsize::new(8).unwrap(),)
@@ -2166,20 +2206,29 @@ mod tests {
         assert_eq!(execution.active_state_names().last(), Some("pass"));
     }
 
-    enum FailedProjectionEvent {
-        Trigger,
+    struct FailedProjectionDomain;
+
+    impl StateTreeDomain for FailedProjectionDomain {}
+
+    #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
+    #[state_tree(
+        domain = FailedProjectionDomain,
+        name = "trigger",
+        broadcast,
+        data = failed_projection_event_data
+    )]
+    struct FailedProjectionEvent;
+
+    fn failed_projection_event_data(
+        _event: &FailedProjectionEvent,
+    ) -> Result<LuauValue, crate::StateTreeEventDataError> {
+        Err(crate::StateTreeEventDataError::new("projection failed"))
     }
 
-    impl StateTreeEvents for FailedProjectionEvent {
-        const AUTHORED_NAMES: &'static [&'static str] = &["trigger"];
-
-        fn event_index(&self) -> usize {
-            0
-        }
-
-        fn event_data(&self) -> Result<Option<LuauValue>, crate::StateTreeEventDataError> {
-            Err(crate::StateTreeEventDataError::new("projection failed"))
-        }
+    fn failed_projection_protocol() -> crate::StateTreeEventProtocol<FailedProjectionDomain> {
+        let mut registry = StateTreeEventRegistry::new();
+        registry.register::<FailedProjectionEvent>().unwrap();
+        registry.freeze()
     }
 
     #[test]
@@ -2192,16 +2241,14 @@ mod tests {
         );
         let document = scxml::parse("projection.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
-        let mut execution = StateTreeExecution::<FailedProjectionEvent>::new(
+        let mut execution = StateTreeExecution::<FailedProjectionDomain>::new(
             &definition,
+            failed_projection_protocol(),
             NonZeroUsize::new(8).unwrap(),
         )
         .unwrap();
 
-        assert!(execution.process_event(
-            &FailedProjectionEvent::Trigger,
-            NonZeroUsize::new(8).unwrap(),
-        ));
+        assert!(execution.process_event(&FailedProjectionEvent, NonZeroUsize::new(8).unwrap(),));
         assert!(matches!(
             execution.status(),
             InstanceStatus::Faulted(RuntimeFault::EventDataProjection { .. })
@@ -2218,16 +2265,14 @@ mod tests {
         );
         let document = scxml::parse("event-name.scxml", &source).unwrap();
         let definition = compile(&document).unwrap();
-        let mut execution = StateTreeExecution::<FailedProjectionEvent>::new(
+        let mut execution = StateTreeExecution::<FailedProjectionDomain>::new(
             &definition,
+            failed_projection_protocol(),
             NonZeroUsize::new(8).unwrap(),
         )
         .unwrap();
 
-        assert!(execution.process_event(
-            &FailedProjectionEvent::Trigger,
-            NonZeroUsize::new(8).unwrap(),
-        ));
+        assert!(execution.process_event(&FailedProjectionEvent, NonZeroUsize::new(8).unwrap(),));
         assert_eq!(execution.active_state_names().last(), Some("pass"));
     }
 
@@ -2454,18 +2499,18 @@ mod tests {
         );
     }
 
-    enum CounterEvent {
-        Tick,
-    }
+    struct CounterDomain;
 
-    impl StateTreeEvents for CounterEvent {
-        const AUTHORED_NAMES: &'static [&'static str] = &["tick"];
+    impl StateTreeDomain for CounterDomain {}
 
-        fn event_index(&self) -> usize {
-            match self {
-                Self::Tick => 0,
-            }
-        }
+    #[derive(bevy_ecs::event::Event, crate::StateTreeEvent)]
+    #[state_tree(domain = CounterDomain, name = "tick", broadcast)]
+    struct CounterEvent;
+
+    fn counter_protocol() -> crate::StateTreeEventProtocol<CounterDomain> {
+        let mut registry = StateTreeEventRegistry::new();
+        registry.register::<CounterEvent>().unwrap();
+        registry.freeze()
     }
 
     #[test]
@@ -2485,20 +2530,26 @@ mod tests {
         )
         .unwrap();
         let definition = compile(&document).unwrap();
-        let mut first =
-            StateTreeExecution::<CounterEvent>::new(&definition, NonZeroUsize::new(8).unwrap())
-                .unwrap();
-        let second =
-            StateTreeExecution::<CounterEvent>::new(&definition, NonZeroUsize::new(8).unwrap())
-                .unwrap();
+        let mut first = StateTreeExecution::<CounterDomain>::new(
+            &definition,
+            counter_protocol(),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
+        let second = StateTreeExecution::<CounterDomain>::new(
+            &definition,
+            counter_protocol(),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
 
-        assert!(first.process_event(&CounterEvent::Tick, NonZeroUsize::new(8).unwrap()));
+        assert!(first.process_event(&CounterEvent, NonZeroUsize::new(8).unwrap()));
 
         assert_eq!(first.data("count"), Some(&LuauValue::Integer(1)));
         assert_eq!(second.data("count"), Some(&LuauValue::Integer(0)));
 
         let first = std::thread::spawn(move || {
-            assert!(first.process_event(&CounterEvent::Tick, NonZeroUsize::new(8).unwrap()));
+            assert!(first.process_event(&CounterEvent, NonZeroUsize::new(8).unwrap()));
             first
         })
         .join()

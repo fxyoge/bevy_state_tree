@@ -26,13 +26,14 @@ use bevy_utils::Parallel;
 
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
-    StateTreeDomain, StateTreeInstance, StateTreeLinkError,
+    StateTreeDomain, StateTreeEventRef, StateTreeInstance, StateTreeLinkError,
     activity::{
         BevyActivitySink, StateTreeActivityInbox, StateTreeActivityIngress,
         StateTreeActivityRegistry,
     },
     definition::{CompiledDefinition, LinkedDefinition},
     effect::{BevyEffectSink, StateTreeEffectRegistry},
+    event::{QueuedStateTreeEvent, StateTreeAppEventRegistry},
     instance::{PendingStateTree, TimerToken, TimerUpdate},
     scxml::ScxmlLoader,
 };
@@ -136,6 +137,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
         }
 
         app.init_resource::<StateTreeEventIngress<D>>()
+            .init_resource::<StateTreeAppEventRegistry<D>>()
             .init_resource::<StateTreeTimers<D>>()
             .init_resource::<LinkedStateTreeDefinitions<D>>()
             .init_resource::<StateTreeEffectRegistry<D>>()
@@ -194,6 +196,7 @@ impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
     fn get_or_insert(
         &mut self,
         compiled: Arc<CompiledDefinition>,
+        events: &crate::StateTreeEventProtocol<D>,
         effects: &StateTreeEffectRegistry<D>,
         activities: &StateTreeActivityRegistry<D>,
     ) -> Result<Arc<LinkedDefinition<D>>, Arc<StateTreeLinkError>> {
@@ -216,7 +219,7 @@ impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
                 }
             }
         }
-        match LinkedDefinition::new(compiled, Some(effects), Some(activities)) {
+        match LinkedDefinition::new(compiled, events, Some(effects), Some(activities)) {
             Ok(linked) => {
                 let linked = Arc::new(linked);
                 self.definitions
@@ -256,7 +259,7 @@ struct EntityEventEntry<E> {
 
 #[derive(Component)]
 pub(crate) struct StateTreeEventInbox<D: StateTreeDomain> {
-    events: Mutex<Vec<EntityEventEntry<D::Event>>>,
+    events: Mutex<Vec<EntityEventEntry<QueuedStateTreeEvent<D>>>>,
     marker: PhantomData<fn() -> D>,
 }
 
@@ -280,7 +283,7 @@ impl<D: StateTreeDomain> StateTreeEventInbox<D> {
 
 #[derive(Resource)]
 struct StateTreeEventIngress<D: StateTreeDomain> {
-    broadcasts: Mutex<Vec<D::Event>>,
+    broadcasts: Mutex<Vec<QueuedStateTreeEvent<D>>>,
     dirty_entities: Mutex<EntityHashSet>,
     batch: AtomicU64,
     published_broadcasts: AtomicUsize,
@@ -398,6 +401,7 @@ where
     D: StateTreeDomain,
 {
     ingress: Res<'w, StateTreeEventIngress<D>>,
+    registry: Res<'w, StateTreeAppEventRegistry<D>>,
     inboxes: Query<
         'w,
         's,
@@ -415,8 +419,17 @@ where
     /// Queues `event` and returns whether its target has a state-tree instance.
     pub fn write<M>(&mut self, event: M) -> bool
     where
-        M: EntityStateTreeEvent<D::Event>,
+        M: EntityStateTreeEvent<D>,
     {
+        let protocol = self.registry.protocol();
+        let id = protocol
+            .registered_event_id(std::any::TypeId::of::<M>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "state-tree event `{}` is not registered",
+                    std::any::type_name::<M>()
+                )
+            });
         let target = event.event_target();
         let Ok((instance, inbox)) = self.inboxes.get(target) else {
             return false;
@@ -438,10 +451,11 @@ where
         let broadcasts_before = events
             .last()
             .map_or(published, |event| event.broadcasts_before.max(published));
+        let event = QueuedStateTreeEvent::new(id, event);
         events.push(EntityEventEntry {
             batch,
             instance,
-            event: event.into_state_tree_event(),
+            event,
             broadcasts_before,
         });
         drop(events);
@@ -469,6 +483,7 @@ where
     D: StateTreeDomain,
 {
     ingress: Res<'w, StateTreeEventIngress<D>>,
+    registry: Res<'w, StateTreeAppEventRegistry<D>>,
 }
 
 impl<D> BroadcastStateTreeEventWriter<'_, D>
@@ -478,14 +493,19 @@ where
     /// Queues `event` for broadcast.
     pub fn write<M>(&mut self, event: M)
     where
-        M: BroadcastStateTreeEvent<D::Event>,
+        M: BroadcastStateTreeEvent<D>,
     {
         let mut broadcasts = self
             .ingress
             .broadcasts
             .lock()
             .expect("state-tree broadcast inbox poisoned");
-        broadcasts.push(event.into_state_tree_event());
+        broadcasts.push(self.registry.protocol().queue(event).unwrap_or_else(|| {
+            panic!(
+                "state-tree event `{}` is not registered",
+                std::any::type_name::<M>()
+            )
+        }));
         self.ingress
             .published_broadcasts
             .store(broadcasts.len(), Ordering::Release);
@@ -503,15 +523,18 @@ type PendingStateTrees<'w, 's, D> = Query<
     With<PendingStateTree<D>>,
 >;
 
+type StateTreeRegistries<'w, D> = (
+    Res<'w, StateTreeAppEventRegistry<D>>,
+    Res<'w, StateTreeEffectRegistry<D>>,
+    Res<'w, StateTreeActivityRegistry<D>>,
+);
+
 fn initialize_pending<D: StateTreeDomain>(
     commands: ParallelCommands,
     definitions: Res<Assets<StateTreeDefinition>>,
     mut linked_definitions: ResMut<LinkedStateTreeDefinitions<D>>,
     timer_runtime: (Res<Time>, ResMut<StateTreeTimers<D>>),
-    registries: (
-        Res<StateTreeEffectRegistry<D>>,
-        Res<StateTreeActivityRegistry<D>>,
-    ),
+    registries: StateTreeRegistries<'_, D>,
     settings: Res<StateTreeSettings<D>>,
     mut instances: PendingStateTrees<'_, '_, D>,
 ) {
@@ -527,8 +550,9 @@ fn initialize_pending<D: StateTreeDomain>(
         };
         let linked = match linked_definitions.get_or_insert(
             definition.compiled.clone(),
-            &registries.0,
+            registries.0.protocol(),
             &registries.1,
+            &registries.2,
         ) {
             Ok(linked) => linked,
             Err(error) => {
@@ -771,11 +795,13 @@ fn process_activity_outcomes<D: StateTreeDomain>(
 fn process_events<D: StateTreeDomain>(
     commands: ParallelCommands,
     mut ingress: ResMut<StateTreeEventIngress<D>>,
+    registry: Res<StateTreeAppEventRegistry<D>>,
     time: Res<Time>,
     mut timers: ResMut<StateTreeTimers<D>>,
     settings: Res<StateTreeSettings<D>>,
     mut instances: StateTrees<'_, '_, D>,
 ) {
+    let protocol = registry.protocol();
     let ingress = &mut *ingress;
     let broadcasts = ingress
         .broadcasts
@@ -818,7 +844,7 @@ fn process_events<D: StateTreeDomain>(
                 while broadcast_cursor < event.broadcasts_before {
                     process_external_event(
                         &mut instance,
-                        &broadcasts[broadcast_cursor],
+                        broadcasts[broadcast_cursor].view(protocol),
                         microstep_limit,
                         entity,
                         &commands,
@@ -827,7 +853,7 @@ fn process_events<D: StateTreeDomain>(
                 }
                 process_external_event(
                     &mut instance,
-                    &event.event,
+                    event.event.view(protocol),
                     microstep_limit,
                     entity,
                     &commands,
@@ -835,7 +861,13 @@ fn process_events<D: StateTreeDomain>(
             }
 
             for event in &broadcasts[broadcast_cursor..] {
-                process_external_event(&mut instance, event, microstep_limit, entity, &commands);
+                process_external_event(
+                    &mut instance,
+                    event.view(protocol),
+                    microstep_limit,
+                    entity,
+                    &commands,
+                );
             }
             stage_timer_updates(instance.bypass_change_detection(), entity, staged);
         };
@@ -866,7 +898,7 @@ fn process_events<D: StateTreeDomain>(
 
 fn process_external_event<D: StateTreeDomain>(
     instance: &mut Mut<'_, StateTreeInstance<D>>,
-    event: &D::Event,
+    event: StateTreeEventRef<'_, D>,
     microstep_limit: usize,
     entity: Entity,
     commands: &ParallelCommands<'_, '_>,
@@ -900,16 +932,16 @@ mod tests {
     use crate::{
         InstanceStatus, StateTreeActivity, StateTreeActivityDefinition, StateTreeActivityLifecycle,
         StateTreeActivityOutcomeWriter, StateTreeAppExt, StateTreeBuilder, StateTreeEffectError,
-        StateTreeEventPayload, StateTreeEvents, StateTreeTransition,
+        StateTreeEvent, StateTreeTransition,
     };
 
     struct Simulation;
 
     struct SecondarySimulation;
 
-    impl StateTreeDomain for SecondarySimulation {
-        type Event = SimulationEvents;
-    }
+    impl StateTreeDomain for Simulation {}
+
+    impl StateTreeDomain for SecondarySimulation {}
 
     struct FindPath;
 
@@ -1104,24 +1136,54 @@ mod tests {
         builder.build().unwrap()
     }
 
-    #[derive(EntityEvent)]
+    #[derive(EntityEvent, crate::StateTreeEvent)]
+    #[state_tree(domain = Simulation, name = "advance", data = project_advance)]
     struct Advance {
         entity: Entity,
         steps: u32,
     }
 
-    #[derive(EntityEvent)]
+    #[derive(EntityEvent, crate::StateTreeEvent)]
+    #[state_tree(domain = Simulation, name = "unregistered")]
+    struct Unregistered {
+        entity: Entity,
+    }
+
+    #[derive(EntityEvent, crate::StateTreeEvent)]
+    #[state_tree(domain = Simulation, name = "reset")]
     struct Reset {
         entity: Entity,
     }
 
-    #[derive(Event)]
+    #[derive(Event, crate::StateTreeEvent)]
+    #[state_tree(domain = Simulation, name = "reset", broadcast)]
     struct ResetAll {
         reason: u32,
     }
 
-    #[derive(Event)]
+    #[derive(Event, crate::StateTreeEvent)]
+    #[state_tree(domain = Simulation, name = "advance", broadcast)]
     struct AdvanceAll;
+
+    #[derive(EntityEvent, crate::StateTreeEvent)]
+    #[state_tree(domain = SecondarySimulation, name = "advance")]
+    struct SecondaryAdvance {
+        entity: Entity,
+    }
+
+    #[derive(EntityEvent, crate::StateTreeEvent)]
+    #[state_tree(domain = SecondarySimulation, name = "reset")]
+    struct SecondaryReset {
+        entity: Entity,
+    }
+
+    #[derive(Event, crate::StateTreeEvent)]
+    #[state_tree(domain = SecondarySimulation, name = "reset", broadcast)]
+    struct SecondaryResetAll;
+
+    #[derive(Event, crate::StateTreeEvent)]
+    #[state_tree(domain = SecondarySimulation, name = "advance", broadcast)]
+    struct SecondaryAdvanceAll;
 
     fn project_advance(
         event: &Advance,
@@ -1133,19 +1195,6 @@ mod tests {
             )]
             .into(),
         ))
-    }
-
-    #[derive(crate::StateTreeEvents)]
-    #[state_tree(domain = Simulation)]
-    enum SimulationEvents {
-        #[state_tree(name = "advance", data = project_advance)]
-        Advance(Advance),
-        #[state_tree(name = "reset")]
-        Reset(Reset),
-        #[state_tree(name = "reset", broadcast)]
-        ResetAll(ResetAll),
-        #[state_tree(name = "advance", broadcast)]
-        AdvanceAll(AdvanceAll),
     }
 
     #[derive(Resource, Default)]
@@ -1214,7 +1263,22 @@ mod tests {
             },
             StateTreePlugin::<Simulation>::new(Update),
         ));
+        register_simulation_events(&mut app);
         app
+    }
+
+    fn register_simulation_events(app: &mut App) {
+        app.register_state_tree_event::<Simulation, Advance>()
+            .register_state_tree_event::<Simulation, Reset>()
+            .register_state_tree_event::<Simulation, ResetAll>()
+            .register_state_tree_event::<Simulation, AdvanceAll>();
+    }
+
+    fn register_secondary_simulation_events(app: &mut App) {
+        app.register_state_tree_event::<SecondarySimulation, SecondaryAdvance>()
+            .register_state_tree_event::<SecondarySimulation, SecondaryReset>()
+            .register_state_tree_event::<SecondarySimulation, SecondaryResetAll>()
+            .register_state_tree_event::<SecondarySimulation, SecondaryAdvanceAll>();
     }
 
     fn activity_app() -> App {
@@ -1250,6 +1314,8 @@ mod tests {
             app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
             app.add_plugins(StateTreePlugin::<SecondarySimulation>::new(Update));
         }
+        register_simulation_events(&mut app);
+        register_secondary_simulation_events(&mut app);
         app.register_state_tree_activity::<Simulation, FindPath, _>(
             "find_path",
             |_context, _arguments| Ok(FindPath),
@@ -1796,6 +1862,7 @@ mod tests {
             .add(definition());
 
         app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
+        register_simulation_events(&mut app);
 
         assert!(
             app.world()
@@ -1806,10 +1873,10 @@ mod tests {
 
     #[test]
     fn derived_events_project_opt_in_luau_data() {
-        let event = SimulationEvents::Advance(Advance {
+        let event = Advance {
             entity: Entity::PLACEHOLDER,
             steps: 9,
-        });
+        };
 
         assert_eq!(
             event.event_data().unwrap(),
@@ -2033,6 +2100,20 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "is not registered")]
+    fn unregistered_entity_events_panic_even_when_the_target_is_absent() {
+        let mut app = app();
+
+        app.world_mut()
+            .run_system_once(|mut events: EntityStateTreeEventWriter<Simulation>| {
+                events.write(Unregistered {
+                    entity: Entity::PLACEHOLDER,
+                });
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn entity_event_payload_is_retained_in_the_inbox() {
         let mut app = app();
         let handle = app
@@ -2056,7 +2137,7 @@ mod tests {
             .get::<StateTreeEventInbox<Simulation>>(entity)
             .unwrap();
         let events = inbox.events.lock().unwrap();
-        let payload = Advance::payload(&events[0].event).unwrap();
+        let payload = events[0].event.project::<Advance>().unwrap();
         assert_eq!(payload.steps, 7);
     }
 
@@ -2097,7 +2178,7 @@ mod tests {
 
         let ingress = app.world().resource::<StateTreeEventIngress<Simulation>>();
         let broadcasts = ingress.broadcasts.lock().unwrap();
-        let payload = ResetAll::payload(&broadcasts[0]).unwrap();
+        let payload = broadcasts[0].project::<ResetAll>().unwrap();
         assert_eq!(payload.reason, 42);
     }
 
