@@ -35,6 +35,7 @@ mod event;
 mod instance;
 mod luau;
 mod plugin;
+mod spawn_activity;
 mod trace;
 
 #[cfg(test)]

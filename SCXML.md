@@ -268,6 +268,14 @@ Luau `_event.data`; projection failure faults the instance. Every accepted
 outcome is a separate macrostep. Per-instance writer order is retained while
 concurrent writer order is unspecified, like entity event ingress.
 
+`bst.spawn` is a built-in activity name in every domain and cannot be replaced
+by domain configuration. Its ordinary required `definition` string argument is
+passed to `AssetServer::load<StateTreeDefinition>`. Once available, the asset is
+run on a separate entity with logical activity ownership only (no `ChildOf`).
+Cancellation is silent and despawns a running child. Completion produces nil
+output; asset-load, runtime, link, and missing-child failures produce a string in
+`_event.data`. This is an activity integration, not an alias for `<invoke>`.
+
 ## Semantic Traces
 
 The opt-in `StateTreeTracePlugin<D>` records transition sets, state exit attempts

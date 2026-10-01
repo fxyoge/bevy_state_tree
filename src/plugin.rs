@@ -167,6 +167,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
                 ),
             );
 
+        crate::spawn_activity::register::<D>(app, self.schedule);
         D::configure(&mut crate::StateTreeConfig::new(app, self.schedule));
     }
 }

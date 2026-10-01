@@ -397,10 +397,14 @@ where
     let mut registry = app
         .world_mut()
         .resource_mut::<StateTreeActivityRegistry<D>>();
-    assert!(
-        !registry.activities.contains_key(&name),
-        "state-tree activity `{name}` was registered more than once"
-    );
+    if registry.activities.contains_key(&name) {
+        if name.as_ref() == "bst.spawn" {
+            panic!(
+                "state-tree activity `bst.spawn` is reserved for the built-in state-tree spawner"
+            );
+        }
+        panic!("state-tree activity `{name}` was registered more than once");
+    }
     registry.activities.insert(
         name.clone(),
         Arc::new(TypedActivity::<D, A, F> {

@@ -340,6 +340,21 @@ but can be handled with normal authored event descriptors. Activities are
 declared with `StateTreeConfig::activity`; the crate does not prescribe futures
 or tasks.
 
+Every domain also includes the reserved `bst.spawn` activity. It takes one
+required string argument, `definition`, loaded through `AssetServer`, and runs
+that definition as a separate `StateTreeInstance<D>` entity:
+
+```xml
+<bst:activity id="combat" name="bst.spawn">
+  <bst:arg name="definition" expr="'state_trees/combat.scxml'"/>
+</bst:activity>
+```
+
+The child is logically owned by the activity but is not an ECS child. Cancelling
+the activity despawns it. Child completion completes the activity; child faults,
+link failures, load failures, and unexpected despawning fail it. Output is nil,
+while failure `_event.data` is a diagnostic string.
+
 ## Global Bindings
 
 A global binding is an activity-backed subscription to one value derived from
