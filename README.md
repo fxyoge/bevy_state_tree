@@ -340,6 +340,67 @@ but can be handled with normal authored event descriptors. Activities are
 declared with `StateTreeConfig::activity`; the crate does not prescribe futures
 or tasks.
 
+## Global Bindings
+
+A global binding is an activity-backed subscription to one value derived from
+the Bevy world. Define the binding's value and event mapping:
+
+```rust
+#[derive(Clone)]
+struct TimberBinding;
+
+impl StateTreeBinding<UiDomain> for TimberBinding {
+    type Value = u64;
+    type Event = TimberChanged;
+
+    fn event(&self, entity: Entity, amount: &u64) -> TimberChanged {
+        TimberChanged {
+            entity,
+            amount: *amount,
+        }
+    }
+}
+
+fn timber_amount(domain: Res<ConstructionDomain>) -> u64 {
+    domain.stockpile().timber()
+}
+```
+
+Register the authored activity name and an ordinary no-input Bevy system that
+returns the complete current value:
+
+```rust
+config.global_binding(
+    "bind.timber",
+    |_context, _arguments| Ok(TimberBinding),
+    timber_amount,
+);
+```
+
+`global_binding` registers its associated event automatically. While the
+activity is active, the source system is sampled in `StateTreeSet::QueueEvents`.
+Each new listener receives the current value once. Existing listeners receive
+another event only when the returned value differs according to `PartialEq`.
+Values may be application structs, enums, strings, collections, or other
+semantic snapshots; the mechanism does not depend on Bevy change ticks.
+
+Event declarations are idempotent, so explicitly declaring the associated event
+before or after `global_binding` is also valid. A system that mutates the backing
+data in `QueueEvents` can order itself before
+`StateTreeBindingSet::<TimberBinding>::new()` when the new value must be visible
+to the same schedule run's sample.
+
+The source system is not run when there are no generation-valid listeners.
+Activity exit, fault, completion, instance removal, and instance replacement
+remove or invalidate listeners using the normal activity lifecycle. Since a
+new activity starts after `QueueEvents`, its initial binding event is sampled
+and delivered during the next run of the domain schedule.
+
+Global bindings intentionally represent one sampled value shared by every
+listener. Entity-dependent observations should use normal typed activities and
+events until a separate entity-binding API establishes suitable query and
+storage semantics.
+
 ## Semantic Tests
 
 Each case named in `tests/scxml/manifest.txt` has a project-owned `.scxml`

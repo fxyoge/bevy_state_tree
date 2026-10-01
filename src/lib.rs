@@ -27,6 +27,7 @@
 extern crate self as bevy_state_tree;
 
 mod activity;
+mod binding;
 mod config;
 mod definition;
 mod effect;
@@ -42,6 +43,7 @@ mod test_harness;
 pub mod scxml;
 
 pub use bevy_state_tree_macros::StateTreeEvent;
+pub use binding::{StateTreeBinding, StateTreeBindingSet};
 pub use config::StateTreeConfig;
 pub use definition::{
     BuildError, HistoryId, StateId, StateTreeAction, StateTreeActivityDefinition,
@@ -81,14 +83,14 @@ pub mod prelude {
         InstanceStatus, LuauValue, RuntimeFault, StateId, StateTreeAction, StateTreeActivity,
         StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityDefinition,
         StateTreeActivityError, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
-        StateTreeActivityToken, StateTreeArgs, StateTreeArgument, StateTreeBuilder,
-        StateTreeConfig, StateTreeContext, StateTreeData, StateTreeDataOverrideError,
-        StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain, StateTreeEffectArgs,
-        StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError, StateTreeEvent,
-        StateTreeEventDataError, StateTreeEventLog, StateTreeEventRef, StateTreeInstance,
-        StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin,
-        StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTraceLog, StateTreeTracePlugin,
-        StateTreeTransition,
+        StateTreeActivityToken, StateTreeArgs, StateTreeArgument, StateTreeBinding,
+        StateTreeBindingSet, StateTreeBuilder, StateTreeConfig, StateTreeContext, StateTreeData,
+        StateTreeDataOverrideError, StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain,
+        StateTreeEffectArgs, StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
+        StateTreeEvent, StateTreeEventDataError, StateTreeEventLog, StateTreeEventRef,
+        StateTreeInstance, StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue,
+        StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTraceLog,
+        StateTreeTracePlugin, StateTreeTransition,
     };
 }
 pub use activity::{

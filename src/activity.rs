@@ -102,6 +102,15 @@ impl<D, A> StateTreeActivityToken<D, A> {
     pub fn entity(self) -> Entity {
         self.entity
     }
+
+    pub(crate) fn erased(self) -> ErasedActivityToken {
+        ErasedActivityToken {
+            entity: self.entity,
+            runtime_id: self.runtime_id,
+            activity: self.activity,
+            generation: self.generation,
+        }
+    }
 }
 
 /// Typed lifecycle messages for one registered activity request type.

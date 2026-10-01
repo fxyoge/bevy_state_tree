@@ -91,6 +91,17 @@ impl<D: StateTreeDomain> StateTreeAppEventRegistry<D> {
     pub(crate) fn protocol(&self) -> &StateTreeEventProtocol<D> {
         self.0.protocol()
     }
+
+    pub(crate) fn ensure<E>(&mut self) -> Result<(), StateTreeEventRegistrationError>
+    where
+        E: StateTreeEvent<D>,
+    {
+        if self.0.type_ids.contains_key(&TypeId::of::<E>()) {
+            Ok(())
+        } else {
+            self.register::<E>()
+        }
+    }
 }
 
 impl<D: StateTreeDomain> Default for StateTreeEventRegistry<D> {
@@ -177,7 +188,24 @@ where
     let result = app
         .world_mut()
         .resource_mut::<StateTreeAppEventRegistry<D>>()
-        .register::<E>();
+        .ensure::<E>();
+    if let Err(error) = result {
+        panic!(
+            "failed to register state-tree event `{}`: {error}",
+            type_name::<E>()
+        );
+    }
+}
+
+pub(crate) fn ensure_event<D, E>(app: &mut App)
+where
+    D: StateTreeDomain,
+    E: StateTreeEvent<D>,
+{
+    let result = app
+        .world_mut()
+        .resource_mut::<StateTreeAppEventRegistry<D>>()
+        .ensure::<E>();
     if let Err(error) = result {
         panic!(
             "failed to register state-tree event `{}`: {error}",

@@ -2,11 +2,12 @@ use std::marker::PhantomData;
 
 use bevy_app::App;
 use bevy_ecs::message::Message;
+use bevy_ecs::{schedule::InternedScheduleLabel, system::IntoSystem};
 
 use crate::{
     StateTreeActivity, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
-    StateTreeDomain, StateTreeEffectArgs, StateTreeEffectContext, StateTreeEffectError,
-    StateTreeEvent,
+    StateTreeBinding, StateTreeDomain, StateTreeEffectArgs, StateTreeEffectContext,
+    StateTreeEffectError, StateTreeEvent,
 };
 
 /// Declares every typed event, effect, and activity in one state-tree domain.
@@ -16,13 +17,15 @@ use crate::{
 /// mutate a domain's protocol through another route.
 pub struct StateTreeConfig<'a, D: StateTreeDomain> {
     app: &'a mut App,
+    schedule: InternedScheduleLabel,
     marker: PhantomData<fn() -> D>,
 }
 
 impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
-    pub(crate) fn new(app: &'a mut App) -> Self {
+    pub(crate) fn new(app: &'a mut App, schedule: InternedScheduleLabel) -> Self {
         Self {
             app,
+            schedule,
             marker: PhantomData,
         }
     }
@@ -65,6 +68,39 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
             + 'static,
     {
         crate::activity::register_activity::<D, A, F>(self.app, name.into(), constructor);
+        self
+    }
+
+    /// Declares one lazily sampled global value binding.
+    ///
+    /// `source` is an ordinary no-input Bevy system and is not run when no
+    /// active activity listens to this binding. Each new listener receives the
+    /// current value once; existing listeners receive another event only when
+    /// the returned value changes according to [`PartialEq`].
+    pub fn global_binding<B, F, S, M>(
+        &mut self,
+        name: impl Into<Box<str>>,
+        constructor: F,
+        source: S,
+    ) -> &mut Self
+    where
+        B: StateTreeBinding<D>,
+        F: Fn(
+                StateTreeActivityContext<'_, D>,
+                &mut StateTreeActivityArgs,
+            ) -> Result<B, StateTreeActivityError>
+            + Send
+            + Sync
+            + 'static,
+        S: IntoSystem<(), B::Value, M> + 'static,
+    {
+        crate::binding::register_global_binding::<D, B, F, S, M>(
+            self.app,
+            self.schedule,
+            name.into(),
+            constructor,
+            source,
+        );
         self
     }
 }

@@ -167,7 +167,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
                 ),
             );
 
-        D::configure(&mut crate::StateTreeConfig::new(app));
+        D::configure(&mut crate::StateTreeConfig::new(app, self.schedule));
     }
 }
 
