@@ -274,7 +274,7 @@ impl LuauWorker {
                     {
                         return Ok(Value::Nil);
                     }
-                    globals.raw_get::<Value>(key)
+                    globals.get::<Value>(key)
                 })?,
         )?;
         environment.set_metatable(Some(metatable))?;
@@ -434,6 +434,16 @@ mod tests {
             let expression = compile_expression(source, false, 0).unwrap();
             assert!(expression.reads_event_data, "missed {source:?}");
         }
+    }
+
+    #[test]
+    fn evaluates_standard_string_functions() {
+        let expression = compile_expression("string.upper('ready')", false, 0).unwrap();
+
+        assert_eq!(
+            evaluate(&expression, &[], &[], None, None).unwrap(),
+            LuauValue::String("READY".into())
+        );
     }
 
     #[test]
