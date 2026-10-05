@@ -113,6 +113,10 @@ impl<D: StateTreeDomain> StateTreePlugin<D> {
 impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
     fn build(&self, app: &mut App) {
         assert!(
+            !D::AUTHORED_NAME.is_empty(),
+            "StateTreeDomain::AUTHORED_NAME cannot be empty"
+        );
+        assert!(
             !app.world().contains_resource::<StateTreeEventIngress<D>>(),
             "StateTreePlugin was added more than once for this domain"
         );
@@ -1019,6 +1023,8 @@ mod tests {
     struct SecondarySimulation;
 
     impl StateTreeDomain for Simulation {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config
                 .event::<Advance>()
@@ -1036,6 +1042,8 @@ mod tests {
     }
 
     impl StateTreeDomain for SecondarySimulation {
+        const AUTHORED_NAME: &'static str = "secondary-simulation";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config
                 .event::<SecondaryAdvance>()
@@ -1738,9 +1746,30 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "StateTreeDomain::AUTHORED_NAME cannot be empty")]
+    fn domain_authored_name_cannot_be_empty() {
+        struct EmptyName;
+
+        impl StateTreeDomain for EmptyName {
+            const AUTHORED_NAME: &'static str = "";
+
+            fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
+        }
+
+        let mut app = App::new();
+        app.add_plugins((
+            TimePlugin,
+            AssetPlugin::default(),
+            StateTreePlugin::<EmptyName>::new(Update),
+        ));
+    }
+
+    #[test]
     fn domain_configuration_is_used_to_validate_activities() {
         struct MissingActivity;
         impl StateTreeDomain for MissingActivity {
+            const AUTHORED_NAME: &'static str = "missing-activity";
+
             fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
         }
         let mut app = App::new();
@@ -1862,6 +1891,8 @@ mod tests {
     fn domain_configuration_is_used_to_validate_effects() {
         struct MissingEffect;
         impl StateTreeDomain for MissingEffect {
+            const AUTHORED_NAME: &'static str = "test";
+
             fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
         }
         let mut app = App::new();

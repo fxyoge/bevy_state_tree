@@ -338,6 +338,8 @@ mod tests {
     struct BindingDomain;
 
     impl StateTreeDomain for BindingDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config
                 .global_binding(
@@ -505,7 +507,7 @@ mod tests {
 
     fn binding_definition() -> StateTreeDefinition {
         let source = r#"
-            <scxml xmlns="http://www.w3.org/2005/07/scxml"
+            <scxml xmlns="http://www.w3.org/2005/07/scxml" bst:domain="test"
                    xmlns:bst="urn:bevy-state-tree"
                    datamodel="luau"
                    initial="active">

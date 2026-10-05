@@ -13,6 +13,8 @@ struct StateTreeUpdate;
 struct Simulation;
 
 impl StateTreeDomain for Simulation {
+    const AUTHORED_NAME: &'static str = "simulation";
+
     fn configure(config: &mut StateTreeConfig<'_, Self>) {
         config.event::<Advance>();
     }

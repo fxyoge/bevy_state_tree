@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="active">
+<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" bst:domain="test" initial="active">
   <parallel id="active">
     <state id="movement" initial="movement_left">
       <state id="movement_left"><transition event="tick" target="movement_right"/></state>

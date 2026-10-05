@@ -32,6 +32,8 @@ pub struct AiUpdate;
 pub struct Simulation;
 
 impl StateTreeDomain for Simulation {
+    const AUTHORED_NAME: &'static str = "test";
+
     fn configure(config: &mut StateTreeConfig<'_, Self>) {
         config
             .event::<Tick>()

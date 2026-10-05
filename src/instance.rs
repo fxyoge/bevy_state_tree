@@ -2519,6 +2519,8 @@ mod tests {
     struct TestDomain;
 
     impl crate::StateTreeDomain for TestDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config.event::<Advance>().event::<Finish>();
         }
@@ -2704,6 +2706,8 @@ mod tests {
     struct DescriptorDomain;
 
     impl StateTreeDomain for DescriptorDomain {
+        const AUTHORED_NAME: &'static str = "descriptor";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config.event::<DescriptorEvents>();
         }

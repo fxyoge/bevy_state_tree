@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml">
+<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" bst:domain="test">
   <state id="idle">
     <transition event="advance" target="done"/>
   </state>

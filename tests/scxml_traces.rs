@@ -19,6 +19,8 @@ const MICROSTEP_LIMIT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 struct HarnessDomain;
 
 impl StateTreeDomain for HarnessDomain {
+    const AUTHORED_NAME: &'static str = "test";
+
     fn configure(config: &mut StateTreeConfig<'_, Self>) {
         config
             .event::<A>()

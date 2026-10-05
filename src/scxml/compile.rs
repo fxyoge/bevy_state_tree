@@ -127,6 +127,14 @@ impl<'a> Compiler<'a> {
 
     fn compile(mut self) -> Result<StateTreeDefinition, CompileError> {
         self.reject_root_features()?;
+        self.builder.domain_at(
+            self.document
+                .root
+                .domain
+                .as_deref()
+                .expect("the domain declaration was validated"),
+            self.document.root.span.start,
+        );
         self.compile_datamodel()?;
         let root = self.builder.compound_root(self.root_name.clone())?;
 
@@ -154,6 +162,21 @@ impl<'a> Compiler<'a> {
     }
 
     fn reject_root_features(&self) -> Result<(), CompileError> {
+        match self.document.root.domain.as_deref() {
+            None => {
+                return self.invalid_document(
+                    self.document.root.span,
+                    "the root scxml element must declare `bst:domain`",
+                );
+            }
+            Some("") => {
+                return self.invalid_document(
+                    self.document.root.span,
+                    "the `bst:domain` declaration cannot be empty",
+                );
+            }
+            Some(_) => {}
+        }
         if let Some(version) = self.document.root.version.as_deref()
             && version != "1.0"
         {
@@ -180,7 +203,7 @@ impl<'a> Compiler<'a> {
         {
             return self.unsupported(self.document.root.span, "datamodel binding");
         }
-        if has_foreign_attributes(&self.document.root.attributes) {
+        if has_unsupported_root_attributes(&self.document.root.attributes) {
             return self.unsupported(self.document.root.span, "foreign root attributes");
         }
         self.reject_unknown_attributes(
@@ -1247,6 +1270,16 @@ fn has_foreign_attributes(attributes: &[Attribute]) -> bool {
     })
 }
 
+fn has_unsupported_root_attributes(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.namespace.is_some()
+            && attribute.name != "xmlns"
+            && !attribute.name.starts_with("xmlns:")
+            && !(attribute.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
+                && attribute.local_name == "domain")
+    })
+}
+
 fn has_unsupported_transition_attributes(attributes: &[Attribute]) -> bool {
     attributes.iter().any(|attribute| {
         attribute.namespace.is_some()
@@ -1289,6 +1322,8 @@ mod tests {
     struct NoEventsDomain;
 
     impl StateTreeDomain for NoEventsDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config
                 .effect::<RecordedEffect, _>("record", |_context, arguments| {
@@ -1314,6 +1349,48 @@ mod tests {
                     })
                 });
         }
+    }
+
+    #[test]
+    fn requires_a_nonempty_namespaced_domain_declaration() {
+        let missing = scxml::parse(
+            "missing-domain.scxml",
+            &format!(r#"<scxml xmlns="{NS}"><state/></scxml>"#),
+        )
+        .unwrap();
+        assert!(
+            compile(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("must declare `bst:domain`")
+        );
+
+        let empty = scxml::parse(
+            "empty-domain.scxml",
+            &format!(
+                r#"<scxml xmlns="{NS}" xmlns:bst="{}" bst:domain=""><state/></scxml>"#,
+                super::super::BEVY_STATE_TREE_NAMESPACE,
+            ),
+        )
+        .unwrap();
+        assert!(
+            compile(&empty)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be empty")
+        );
+
+        let unqualified = scxml::parse(
+            "unqualified-domain.scxml",
+            &format!(r#"<scxml xmlns="{NS}" domain="test"><state/></scxml>"#),
+        )
+        .unwrap();
+        assert!(
+            compile(&unqualified)
+                .unwrap_err()
+                .to_string()
+                .contains("must declare `bst:domain`")
+        );
     }
 
     #[derive(Message)]
@@ -1395,7 +1472,7 @@ mod tests {
         let document = scxml::parse(
             "machine.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" initial="parent">
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" initial="parent">
                     <state id="parent" initial="first">
                         <state id="first"><transition event="advance" target="second"/></state>
                         <state id="second"/>
@@ -1435,7 +1512,7 @@ mod tests {
         let document = scxml::parse(
             "history.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" initial="owner">
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" initial="owner">
                     <state id="owner" initial="recent">
                         <state id="first"/><state id="second"/>
                         <history id="recent" type="shallow">
@@ -1487,7 +1564,7 @@ mod tests {
         let document = scxml::parse(
             "anonymous-history.scxml",
             &format!(
-                r##"<scxml xmlns="{NS}"><state id="owner"><state id="#anonymous0"/><state/><history><transition target="#anonymous0"/></history></state></scxml>"##
+                r##"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state id="owner"><state id="#anonymous0"/><state/><history><transition target="#anonymous0"/></history></state></scxml>"##
             ),
         )
         .unwrap();
@@ -1505,7 +1582,7 @@ mod tests {
         let document = scxml::parse(
             "deep-history.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}"><state id="owner"><state id="child"/><history type="deep"><transition target="child"/></history></state></scxml>"#
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state id="owner"><state id="child"/><history type="deep"><transition target="child"/></history></state></scxml>"#
             ),
         )
         .unwrap();
@@ -1583,7 +1660,7 @@ mod tests {
 
         for (body, expected) in cases {
             let source = format!(
-                r#"<scxml xmlns="{NS}" xmlns:bst="{namespace}" xmlns:x="urn:other">{body}</scxml>"#
+                r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{namespace}" xmlns:x="urn:other">{body}</scxml>"#
             );
             let document = scxml::parse("invalid-history.scxml", &source).unwrap();
             let message = compile(&document).unwrap_err().to_string();
@@ -1599,7 +1676,7 @@ mod tests {
         let document = scxml::parse(
             "condition.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}"><state id="first"><transition cond="true" target="second"/></state><state id="second"/></scxml>"#
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state id="first"><transition cond="true" target="second"/></state><state id="second"/></scxml>"#
             ),
         )
         .unwrap();
@@ -1617,27 +1694,27 @@ mod tests {
     fn rejects_malformed_supported_syntax() {
         let cases = [
             (
-                r#"<scxml xmlns="{NS}"><state><transition/></state></scxml>"#,
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state><transition/></state></scxml>"#,
                 "transition requires an event, condition, or target",
             ),
             (
-                r#"<scxml xmlns="{NS}"><state><transition event=" "/></state></scxml>"#,
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state><transition event=" "/></state></scxml>"#,
                 "transition event cannot be empty",
             ),
             (
-                r#"<scxml xmlns="{NS}"><state><transition target=" "/></state></scxml>"#,
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state><transition target=" "/></state></scxml>"#,
                 "transition target cannot be empty",
             ),
             (
-                r#"<scxml xmlns="{NS}"><state><onentry><raise/></onentry></state></scxml>"#,
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state><onentry><raise/></onentry></state></scxml>"#,
                 "raise requires a non-empty event",
             ),
             (
-                r#"<scxml xmlns="{NS}"><state targett="typo"/></scxml>"#,
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state targett="typo"/></scxml>"#,
                 "unknown attribute `targett` on <state>",
             ),
             (
-                r#"<scxml xmlns="{NS}" version="2.0"><state/></scxml>"#,
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" version="2.0"><state/></scxml>"#,
                 "unsupported SCXML version `2.0`",
             ),
         ];
@@ -1656,7 +1733,7 @@ mod tests {
     #[test]
     fn rejects_event_and_after_on_the_same_transition() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}"><state><transition event="go" bst:after="1s"/></state></scxml>"#,
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}"><state><transition event="go" bst:after="1s"/></state></scxml>"#,
             super::super::BEVY_STATE_TREE_NAMESPACE,
         );
         let document = scxml::parse("event-after.scxml", &source).unwrap();
@@ -1672,7 +1749,7 @@ mod tests {
     #[test]
     fn after_does_not_allow_other_foreign_transition_attributes() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}" xmlns:x="urn:other"><state><transition bst:after="1s" x:after="2s"/></state></scxml>"#,
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}" xmlns:x="urn:other"><state><transition bst:after="1s" x:after="2s"/></state></scxml>"#,
             super::super::BEVY_STATE_TREE_NAMESPACE,
         );
         let document = scxml::parse("foreign-after.scxml", &source).unwrap();
@@ -1689,7 +1766,7 @@ mod tests {
     #[test]
     fn unqualified_after_is_not_the_bevy_extension() {
         let source = format!(
-            r#"<scxml xmlns="{NS}"><state><transition after="1s" target="done"/></state><final id="done"/></scxml>"#,
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state><transition after="1s" target="done"/></state><final id="done"/></scxml>"#,
         );
         let document = scxml::parse("unqualified-after.scxml", &source).unwrap();
 
@@ -1706,7 +1783,7 @@ mod tests {
         let document = scxml::parse(
             "completion.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" initial="parent">
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" initial="parent">
                     <state id="parent" initial="finished">
                         <transition event="done.state.parent" target="pass"/>
                         <final id="finished"/>
@@ -1729,7 +1806,7 @@ mod tests {
         let document = scxml::parse(
             "typo.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}"><state id="waiting"><transition event="adavnce" target="done"/></state><final id="done"/></scxml>"#
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state id="waiting"><transition event="adavnce" target="done"/></state><final id="done"/></scxml>"#
             ),
         )
         .unwrap();
@@ -1757,7 +1834,7 @@ mod tests {
         let document = scxml::parse(
             "complete.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" datamodel="luau" initial="done">
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau" initial="done">
                     <datamodel><data id="exited" expr="false"/></datamodel>
                     <final id="done"><onexit><assign location="exited" expr="true"/></onexit></final>
                 </scxml>"#
@@ -1785,7 +1862,7 @@ mod tests {
     #[test]
     fn compiles_and_emits_typed_effect_arguments() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}" datamodel="luau">
                 <state id="source">
                     <onentry><bst:effect name="record"><bst:arg name="value" expr="2 + 3"/></bst:effect></onentry>
                 </state>
@@ -1837,7 +1914,7 @@ mod tests {
         ];
         for (activity, expected) in cases {
             let source = format!(
-                r#"<scxml xmlns="{NS}" xmlns:bst="{namespace}" datamodel="luau"><state>{activity}</state></scxml>"#
+                r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{namespace}" datamodel="luau"><state>{activity}</state></scxml>"#
             );
             let document = scxml::parse("activity-invalid.scxml", &source).unwrap();
             assert!(
@@ -1854,7 +1931,7 @@ mod tests {
         let namespace = super::super::BEVY_STATE_TREE_NAMESPACE;
         for id in ["job", "job-child", "job_child"] {
             let source = format!(
-                r#"<scxml xmlns="{NS}" xmlns:bst="{namespace}"><state><bst:activity id="{id}" name="work"/></state></scxml>"#
+                r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{namespace}"><state><bst:activity id="{id}" name="work"/></state></scxml>"#
             );
             let document = scxml::parse("activity-valid.scxml", &source).unwrap();
             compile(&document).unwrap();
@@ -1864,7 +1941,7 @@ mod tests {
     #[test]
     fn valid_activity_ids_have_distinct_done_and_error_events() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}">
                 <state>
                     <bst:activity id="job" name="work"/>
                     <bst:activity id="job-child" name="work"/>
@@ -1895,7 +1972,7 @@ mod tests {
     #[test]
     fn app_activity_completion_carries_data_and_is_accepted_once() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}" datamodel="luau">
                 <datamodel><data id="target" expr="'north'"/><data id="result"/></datamodel>
                 <state id="active">
                     <onentry><assign location="target" expr="'south'"/></onentry>
@@ -1934,7 +2011,7 @@ mod tests {
     #[test]
     fn unhandled_activity_outcome_still_stabilizes_eventless_transitions() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}" datamodel="luau">
                 <state id="active">
                     <bst:activity id="job" name="work"/>
                     <transition cond="_event ~= nil and _event.data == 7" target="pass"/>
@@ -1961,7 +2038,7 @@ mod tests {
     #[test]
     fn activity_payload_does_not_leak_to_a_raised_internal_event() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}" datamodel="luau">
                 <datamodel><data id="leaked" expr="true"/></datamodel>
                 <state id="active">
                     <bst:activity id="job" name="work"/>
@@ -1991,7 +2068,7 @@ mod tests {
     #[test]
     fn app_effects_and_activities_support_mixed_macrosteps() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}" datamodel="luau">
                 <state id="active">
                     <bst:activity id="finished" name="work"/>
                     <bst:activity id="cancelled" name="work"/>
@@ -2028,6 +2105,8 @@ mod tests {
     struct ReenterDomain;
 
     impl StateTreeDomain for ReenterDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config
                 .event::<ReenterEvent>()
@@ -2047,7 +2126,7 @@ mod tests {
     #[test]
     fn reentry_uses_a_new_generation_and_stale_outcomes_are_ignored() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}">
             <state id="active"><bst:activity id="job" name="work"/><transition event="reenter" target="active"/><transition event="done.activity.job"/></state>
         </scxml>"#,
             super::super::BEVY_STATE_TREE_NAMESPACE
@@ -2068,7 +2147,7 @@ mod tests {
     #[test]
     fn root_completion_cancels_still_running_activities() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}" initial="done">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}" initial="done">
             <bst:activity id="root-job" name="work"/><final id="done"/>
         </scxml>"#,
             super::super::BEVY_STATE_TREE_NAMESPACE
@@ -2099,7 +2178,7 @@ mod tests {
     #[test]
     fn parallel_activity_starts_follow_entry_document_order() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:bst="{}">
+            r#"<scxml xmlns="{NS}" bst:domain="test" xmlns:bst="{}">
             <parallel id="p">
                 <bst:activity id="outer" name="work"/>
                 <state id="left"><bst:activity id="left-job" name="work"/></state>
@@ -2149,6 +2228,8 @@ mod tests {
     struct PayloadDomain;
 
     impl StateTreeDomain for PayloadDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config.event::<PayloadEvent>();
         }
@@ -2176,7 +2257,7 @@ mod tests {
     #[test]
     fn luau_conditions_can_read_projected_external_event_data() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <state id="source">
                     <transition event="payload" cond="_event.data.amount == 7" target="pass"/>
                     <transition event="payload" target="fail"/>
@@ -2196,6 +2277,8 @@ mod tests {
     struct FailedProjectionDomain;
 
     impl StateTreeDomain for FailedProjectionDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config.event::<FailedProjectionEvent>();
         }
@@ -2219,7 +2302,7 @@ mod tests {
     #[test]
     fn event_data_projection_errors_fault_the_instance() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <state id="source"><transition event="trigger" cond="_event.data ~= nil" target="pass"/></state>
                 <final id="pass"/>
             </scxml>"#,
@@ -2239,7 +2322,7 @@ mod tests {
     #[test]
     fn reading_only_event_name_does_not_project_payload_data() {
         let source = format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <state id="source"><transition event="trigger" cond="_event.name == 'trigger'" target="pass"/></state>
                 <final id="pass"/>
             </scxml>"#,
@@ -2256,7 +2339,7 @@ mod tests {
     #[test]
     fn executes_initial_and_entry_raises_in_order() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test">
                 <state id="parent">
                     <initial><transition target="leaf"><raise event="first"/></transition></initial>
                     <state id="leaf">
@@ -2276,7 +2359,7 @@ mod tests {
     #[test]
     fn executes_exit_raises_before_transition_raises() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test">
                 <state id="source">
                     <onentry><raise event="go"/></onentry>
                     <onexit><raise event="first"/></onexit>
@@ -2295,7 +2378,7 @@ mod tests {
     #[test]
     fn final_entry_raises_precede_completion_events() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test">
                 <state id="parent">
                     <transition event="first" target="waiting"/>
                     <final id="finished"><onentry><raise event="first"/></onentry></final>
@@ -2312,7 +2395,7 @@ mod tests {
     #[test]
     fn direct_descendant_targets_do_not_execute_ancestor_initial_actions() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test">
                 <state id="source"><transition target="leaf"/></state>
                 <state id="parent">
                     <initial><transition target="other"><raise event="bad"/></transition></initial>
@@ -2335,7 +2418,7 @@ mod tests {
     #[test]
     fn luau_initializers_and_conditions_use_authored_order() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <datamodel>
                     <data id="base" expr="2"/>
                     <data id="threshold" expr="base * 3"/>
@@ -2357,7 +2440,7 @@ mod tests {
     #[test]
     fn assignments_and_raises_preserve_executable_order() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <datamodel><data id="value" expr="0"/></datamodel>
                 <state id="source">
                     <onentry>
@@ -2380,7 +2463,7 @@ mod tests {
     #[test]
     fn expression_data_and_assignments_allow_whitespace_content() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <datamodel><data id="value" expr="1">
                 </data></datamodel>
                 <state id="source">
@@ -2401,7 +2484,7 @@ mod tests {
     #[test]
     fn false_luau_guard_tries_the_next_authored_transition() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <state id="source">
                     <transition cond="false" target="fail"/>
                     <transition target="pass"/>
@@ -2418,7 +2501,7 @@ mod tests {
     #[test]
     fn luau_runtime_errors_fault_the_instance() {
         let execution = execute(&format!(
-            r#"<scxml xmlns="{NS}" datamodel="luau">
+            r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                 <state id="source"><transition cond="missing()" target="pass"/></state>
                 <final id="pass"/>
             </scxml>"#
@@ -2438,7 +2521,7 @@ mod tests {
         let invalid_expression = scxml::parse(
             "invalid.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" datamodel="luau"><state id="source"><transition cond="(" target="pass"/></state><final id="pass"/></scxml>"#
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau"><state id="source"><transition cond="(" target="pass"/></state><final id="pass"/></scxml>"#
             ),
         )
         .unwrap();
@@ -2450,7 +2533,7 @@ mod tests {
         let duplicate = scxml::parse(
             "duplicate.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" datamodel="luau"><datamodel><data id="value"/><data id="value"/></datamodel><state id="source"/></scxml>"#
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau"><datamodel><data id="value"/><data id="value"/></datamodel><state id="source"/></scxml>"#
             ),
         )
         .unwrap();
@@ -2464,7 +2547,7 @@ mod tests {
         let reserved = scxml::parse(
             "reserved.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" datamodel="luau"><datamodel><data id="_event"/></datamodel><state id="source"/></scxml>"#
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau"><datamodel><data id="_event"/></datamodel><state id="source"/></scxml>"#
             ),
         )
         .unwrap();
@@ -2479,6 +2562,8 @@ mod tests {
     struct CounterDomain;
 
     impl StateTreeDomain for CounterDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
             config.event::<CounterEvent>();
         }
@@ -2493,7 +2578,7 @@ mod tests {
         let document = scxml::parse(
             "counter.scxml",
             &format!(
-                r#"<scxml xmlns="{NS}" datamodel="luau">
+                r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">
                     <datamodel><data id="count" expr="0"/></datamodel>
                     <state id="running">
                         <transition event="tick" cond="_event.name == 'tick'" target="running">

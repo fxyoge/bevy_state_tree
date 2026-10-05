@@ -19,7 +19,10 @@ Use it for game AI, UI controllers, animation graphs, and any other situation wh
 Author a state tree as an asset:
 
 ```xml
-<scxml xmlns="http://www.w3.org/2005/07/scxml" initial="idle">
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree"
+       bst:domain="enemy-ai"
+       initial="idle">
   <state id="idle">
     <transition event="enemy.spotted" target="chasing"/>
   </state>
@@ -50,6 +53,8 @@ struct EnemyLost {
 }
 
 impl StateTreeDomain for EnemyAi {
+    const AUTHORED_NAME: &'static str = "enemy-ai";
+
     fn configure(config: &mut StateTreeConfig<'_, Self>) {
         config.event::<EnemySpotted>();
         config.event::<EnemyLost>();

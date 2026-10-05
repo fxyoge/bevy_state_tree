@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml" datamodel="luau" initial="p">
+<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau" initial="p">
   <datamodel><data id="value" expr="0"/></datamodel>
   <parallel id="p">
     <state id="left" initial="left_wait">

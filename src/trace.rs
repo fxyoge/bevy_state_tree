@@ -421,6 +421,8 @@ mod tests {
     struct TestDomain;
 
     impl StateTreeDomain for TestDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
     }
 

@@ -30,6 +30,22 @@ when a `StateTreeInstance` initializes. A source can load successfully and still
 leave an instance pending with `StateTreeLinkFailure<D>` for a particular
 domain.
 
+Every SCXML document must declare its stable authored domain in the Bevy
+state-tree namespace. The declaration is retained during domain-independent
+asset loading and checked when an instance links:
+
+```xml
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
+       xmlns:bst="urn:bevy-state-tree"
+       bst:domain="simulation">
+```
+
+The value must equal `StateTreeDomain::AUTHORED_NAME`. A mismatch produces a
+single domain link issue before the domain's events, effects, and activities are
+checked. Generated definitions may opt into the same check with
+`StateTreeBuilder::domain`; generated definitions without one remain reusable
+across domains.
+
 Definitions constructed programmatically can be inserted directly into
 `Assets<StateTreeDefinition>`; they share the same initialization and linking
 path as file-loaded definitions.

@@ -215,12 +215,16 @@ mod tests {
     struct TestDomain;
 
     impl StateTreeDomain for TestDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(_config: &mut StateTreeConfig<'_, Self>) {}
     }
 
     struct ReservedNameDomain;
 
     impl StateTreeDomain for ReservedNameDomain {
+        const AUTHORED_NAME: &'static str = "reserved-name";
+
         fn configure(config: &mut StateTreeConfig<'_, Self>) {
             config.activity::<SpawnActivity, _>(NAME, |_context, arguments| {
                 Ok(SpawnActivity {

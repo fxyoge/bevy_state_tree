@@ -28,6 +28,9 @@ impl StateTreeEventDataError {
 
 /// Identifies one independent state-tree runtime.
 pub trait StateTreeDomain: Send + Sync + 'static + Sized {
+    /// The stable identifier used by authored state-tree definitions.
+    const AUTHORED_NAME: &'static str;
+
     /// Declares this domain's complete typed protocol.
     fn configure(config: &mut crate::StateTreeConfig<'_, Self>);
 }
@@ -401,6 +404,8 @@ mod tests {
     struct TestDomain;
 
     impl StateTreeDomain for TestDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
         fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
     }
 

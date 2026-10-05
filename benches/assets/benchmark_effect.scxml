@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml"
+<scxml xmlns="http://www.w3.org/2005/07/scxml" bst:domain="test"
        xmlns:bst="urn:bevy-state-tree" datamodel="luau">
   <datamodel><data id="amount" expr="1"/></datamodel>
   <state id="left">

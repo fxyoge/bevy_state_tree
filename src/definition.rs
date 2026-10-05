@@ -315,6 +315,8 @@ pub(crate) struct CompiledLuauDataModel {
 pub(crate) struct CompiledDefinition {
     pub identity: u64,
     pub name: Box<str>,
+    pub domain: Option<Box<str>>,
+    pub domain_span_start: Option<usize>,
     pub root: StateId,
     pub states: Box<[StateNode]>,
     pub children: Box<[StateId]>,
@@ -426,6 +428,18 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
         effects: &StateTreeEffectRegistry<D>,
         activities: &StateTreeActivityRegistry<D>,
     ) -> Result<Self, StateTreeLinkError> {
+        if let Some(declared) = compiled.domain.as_deref()
+            && declared != D::AUTHORED_NAME
+        {
+            return Err(StateTreeLinkError {
+                definition: compiled.name.clone(),
+                issues: Box::new([StateTreeLinkIssue::DomainMismatch {
+                    declared: declared.into(),
+                    expected: D::AUTHORED_NAME.into(),
+                    span_start: compiled.domain_span_start,
+                }]),
+            });
+        }
         let mut issues = Vec::new();
         for requirement in &compiled.event_requirements {
             let pattern = &compiled.events[requirement.event.index()];
@@ -559,6 +573,12 @@ impl StateTreeLinkError {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum StateTreeLinkIssue {
+    #[error("definition declares domain `{declared}`, but this instance uses `{expected}`")]
+    DomainMismatch {
+        declared: Box<str>,
+        expected: Box<str>,
+        span_start: Option<usize>,
+    },
     #[error("event descriptor `{descriptor}` matches no typed or internal event")]
     UnmatchedEventDescriptor {
         descriptor: Box<str>,
@@ -603,6 +623,11 @@ impl StateTreeDefinition {
     /// Returns the authored definition name.
     pub fn name(&self) -> &str {
         &self.compiled.name
+    }
+
+    /// Returns the stable authored domain identifier, when one was declared.
+    pub fn domain(&self) -> Option<&str> {
+        self.compiled.domain.as_deref()
     }
 
     /// Returns the state name associated with an ID from this definition.
@@ -1048,6 +1073,8 @@ impl StateTreeTransition {
 pub struct StateTreeBuilder {
     identity: u64,
     name: Box<str>,
+    domain: Option<Box<str>>,
+    domain_span_start: Option<usize>,
     states: Vec<DraftState>,
     histories: Vec<DraftHistory>,
     names: HashSet<Box<str>>,
@@ -1061,12 +1088,33 @@ impl StateTreeBuilder {
         Self {
             identity: NEXT_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
+            domain: None,
+            domain_span_start: None,
             states: Vec::new(),
             histories: Vec::new(),
             names: HashSet::new(),
             root: None,
             datamodel: None,
         }
+    }
+
+    /// Restricts this generated definition to one authored domain identifier.
+    pub fn domain(&mut self, domain: impl Into<Box<str>>) -> &mut Self {
+        self.set_domain(domain, None)
+    }
+
+    pub(crate) fn domain_at(
+        &mut self,
+        domain: impl Into<Box<str>>,
+        span_start: usize,
+    ) -> &mut Self {
+        self.set_domain(domain, Some(span_start))
+    }
+
+    fn set_domain(&mut self, domain: impl Into<Box<str>>, span_start: Option<usize>) -> &mut Self {
+        self.domain = Some(domain.into());
+        self.domain_span_start = span_start;
+        self
     }
 
     /// Adds the single compound root state.
@@ -1675,6 +1723,9 @@ impl StateTreeBuilder {
         if self.name.is_empty() {
             return Err(BuildError::EmptyDefinitionName);
         }
+        if self.domain.as_deref().is_some_and(str::is_empty) {
+            return Err(BuildError::EmptyDomainName);
+        }
         let root = self.root.ok_or(BuildError::MissingRoot)?;
         for (index, history) in self.histories.iter().enumerate() {
             if history.default.is_none() {
@@ -2131,6 +2182,8 @@ impl StateTreeBuilder {
             compiled: Arc::new(CompiledDefinition {
                 identity: self.identity,
                 name: self.name,
+                domain: self.domain,
+                domain_span_start: self.domain_span_start,
                 root,
                 states: states.into_boxed_slice(),
                 children: children.into_boxed_slice(),
@@ -2643,6 +2696,8 @@ pub(crate) fn is_activity_id(value: &str) -> bool {
 pub enum BuildError {
     #[error("the definition name cannot be empty")]
     EmptyDefinitionName,
+    #[error("the authored domain name cannot be empty")]
+    EmptyDomainName,
     #[error("a state name cannot be empty")]
     EmptyStateName,
     #[error("a history name cannot be empty")]
@@ -2782,6 +2837,7 @@ pub enum BuildError {
 #[derive(Debug, Eq, PartialEq)]
 struct DefinitionSemantics {
     name: Box<str>,
+    domain: Option<Box<str>>,
     root: u32,
     states: Vec<StateSemantics>,
     children: Vec<u32>,
@@ -2951,6 +3007,7 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
     let compiled = &definition.compiled;
     DefinitionSemantics {
         name: compiled.name.clone(),
+        domain: compiled.domain.clone(),
         root: compiled.root.index,
         states: compiled
             .states
@@ -3138,6 +3195,24 @@ fn target_semantics(target: StateTreeTarget) -> TargetSemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_definitions_may_declare_a_domain() {
+        let mut builder = StateTreeBuilder::new("generated");
+        builder.domain("simulation");
+        let root = builder.compound_root("root").unwrap();
+        let idle = builder.atomic("idle", root).unwrap();
+        builder.initial(root, idle).unwrap();
+        let definition = builder.build().unwrap();
+        assert_eq!(definition.domain(), Some("simulation"));
+
+        let mut invalid = StateTreeBuilder::new("invalid");
+        invalid.domain("");
+        let root = invalid.compound_root("root").unwrap();
+        let idle = invalid.atomic("idle", root).unwrap();
+        invalid.initial(root, idle).unwrap();
+        assert!(matches!(invalid.build(), Err(BuildError::EmptyDomainName)));
+    }
 
     #[test]
     fn entry_layout_remains_compact_with_history_support() {

@@ -10,6 +10,8 @@ struct StateTreeUpdate;
 struct TestDomain;
 
 impl StateTreeDomain for TestDomain {
+    const AUTHORED_NAME: &'static str = "test";
+
     fn configure(_config: &mut StateTreeConfig<'_, Self>) {}
 }
 
@@ -65,6 +67,7 @@ fn plugin_loads_scxml_assets_and_initializes_instances() {
         .get(&handle)
         .expect("SCXML definition should load");
     assert_eq!(definition.name(), "loaded");
+    assert_eq!(definition.domain(), Some("test"));
     assert_eq!(definition.state_count(), 2);
 
     let instance = app
@@ -73,6 +76,49 @@ fn plugin_loads_scxml_assets_and_initializes_instances() {
         .expect("state-tree instance should remain present");
     assert_eq!(instance.status(), &InstanceStatus::Running);
     assert_eq!(instance.active_state_names().last(), Some("idle"));
+}
+
+#[test]
+fn declared_domain_mismatch_is_reported_during_linking() {
+    let mut app = test_app();
+    let handle = app
+        .world()
+        .resource::<AssetServer>()
+        .load::<StateTreeDefinition>("mismatched-domain.scxml");
+    let entity = app
+        .world_mut()
+        .spawn(StateTreeInstance::<TestDomain>::new(handle.clone()))
+        .id();
+
+    for _ in 0..1_000 {
+        update(&mut app);
+        if app
+            .world()
+            .get::<StateTreeLinkFailure<TestDomain>>(entity)
+            .is_some()
+        {
+            break;
+        }
+    }
+
+    assert!(
+        app.world()
+            .resource::<Assets<StateTreeDefinition>>()
+            .contains(&handle),
+        "domain-independent definition should load successfully"
+    );
+    let failure = app
+        .world()
+        .get::<StateTreeLinkFailure<TestDomain>>(entity)
+        .expect("domain linking should reject the declaration");
+    assert!(matches!(
+        failure.error().issues(),
+        [StateTreeLinkIssue::DomainMismatch {
+            declared,
+            expected,
+            ..
+        }] if declared.as_ref() == "other" && expected.as_ref() == "test"
+    ));
 }
 
 #[test]
