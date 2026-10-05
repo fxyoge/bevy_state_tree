@@ -369,6 +369,14 @@ pub fn entity_toggle_definition() -> BenchmarkDefinition {
     BenchmarkDefinition::Generated(toggle_builder("entity-toggle", "tick.entity"))
 }
 
+pub fn uninterested_definition() -> BenchmarkDefinition {
+    let mut builder = StateTreeBuilder::new("uninterested");
+    let root = builder.compound_root("root").unwrap();
+    let idle = builder.atomic("idle", root).unwrap();
+    builder.initial(root, idle).unwrap();
+    BenchmarkDefinition::Generated(builder.build().unwrap())
+}
+
 pub fn deep_definition(depth: usize) -> BenchmarkDefinition {
     assert!(depth > 0);
     let mut builder = StateTreeBuilder::new(format!("depth-{depth}"));

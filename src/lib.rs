@@ -6,12 +6,13 @@
 //!
 //! # Event ordering
 //!
-//! Each [`StateTreeInstance`] has an independent ordered external event queue.
+//! Each [`StateTreeInstance`] has an independent ordered external event stream.
 //! [`EntityStateTreeEventWriter`] writes to one entity's queue, while
-//! [`BroadcastStateTreeEventWriter`] inserts an event at the corresponding
-//! position in every initialized instance's queue. A complete macrostep runs
-//! for one event before that instance receives its next event. Separate
-//! instances are processed in parallel and have no shared event order.
+//! [`BroadcastStateTreeEventWriter`] delivers an event at the corresponding
+//! position to every initialized instance whose definition accepts it. A
+//! complete macrostep runs for one event before that instance receives its next
+//! event. Separate instances are processed in parallel and have no shared event
+//! order.
 //!
 //! Concurrent writes to the same instance have a valid but unspecified order.
 //! Order the producer systems explicitly when the result must be deterministic.

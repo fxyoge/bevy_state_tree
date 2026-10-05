@@ -909,14 +909,17 @@ fn process_events<D: StateTreeDomain>(
                 }
                 debug_assert!(event.broadcasts_before <= broadcasts.len());
                 while broadcast_cursor < event.broadcasts_before {
-                    process_external_event(
-                        &mut instance,
-                        broadcasts[broadcast_cursor].view(protocol),
-                        microstep_limit,
-                        entity,
-                        &commands,
-                        traces.as_deref(),
-                    );
+                    let broadcast = broadcasts[broadcast_cursor].view(protocol);
+                    if instance.accepts_external_event(broadcast) {
+                        process_external_event(
+                            &mut instance,
+                            broadcast,
+                            microstep_limit,
+                            entity,
+                            &commands,
+                            traces.as_deref(),
+                        );
+                    }
                     broadcast_cursor += 1;
                 }
                 process_external_event(
@@ -930,14 +933,17 @@ fn process_events<D: StateTreeDomain>(
             }
 
             for event in &broadcasts[broadcast_cursor..] {
-                process_external_event(
-                    &mut instance,
-                    event.view(protocol),
-                    microstep_limit,
-                    entity,
-                    &commands,
-                    traces.as_deref(),
-                );
+                let event = event.view(protocol);
+                if instance.accepts_external_event(event) {
+                    process_external_event(
+                        &mut instance,
+                        event,
+                        microstep_limit,
+                        entity,
+                        &commands,
+                        traces.as_deref(),
+                    );
+                }
             }
             stage_timer_updates(instance.bypass_change_detection(), entity, staged);
         };
@@ -1358,6 +1364,14 @@ mod tests {
                 StateTreeTransition::after(Duration::from_secs(1)).target(elapsed),
             )
             .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn uninterested_definition() -> StateTreeDefinition {
+        let mut builder = StateTreeBuilder::new("uninterested");
+        let root = builder.compound_root("root").unwrap();
+        let idle = builder.atomic("idle", root).unwrap();
+        builder.initial(root, idle).unwrap();
         builder.build().unwrap()
     }
 
@@ -2245,6 +2259,53 @@ mod tests {
 
         assert_eq!(active_leaf(&app, first), "idle");
         assert_eq!(active_leaf(&app, second), "idle");
+    }
+
+    #[test]
+    fn broadcasts_skip_definitions_that_do_not_accept_the_event() {
+        let mut app = app();
+        app.add_plugins(crate::StateTreeTracePlugin::<Simulation>::default());
+        let (interested_handle, uninterested_handle) = {
+            let mut definitions = app
+                .world_mut()
+                .resource_mut::<Assets<StateTreeDefinition>>();
+            (
+                definitions.add(definition()),
+                definitions.add(uninterested_definition()),
+            )
+        };
+        let interested = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(interested_handle))
+            .id();
+        let uninterested = app
+            .world_mut()
+            .spawn(StateTreeInstance::<Simulation>::new(uninterested_handle))
+            .id();
+        app.update();
+
+        queue_advance_all(&mut app);
+        app.update();
+
+        assert_eq!(active_leaf(&app, interested), "active");
+        assert_eq!(active_leaf(&app, uninterested), "idle");
+        let traces = app
+            .world()
+            .resource::<crate::StateTreeTraceLog<Simulation>>();
+        assert!(
+            traces
+                .get(interested)
+                .unwrap()
+                .as_str()
+                .contains("macrostep external \"advance\"")
+        );
+        assert!(
+            !traces
+                .get(uninterested)
+                .unwrap()
+                .as_str()
+                .contains("macrostep external \"advance\"")
+        );
     }
 
     #[test]

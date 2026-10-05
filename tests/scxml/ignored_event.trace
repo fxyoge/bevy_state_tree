@@ -7,9 +7,3 @@ active "#document"
 active "idle"
 status running
 macrostep end
-macrostep external "tick"
-configuration
-active "#document"
-active "idle"
-status running
-macrostep end

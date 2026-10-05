@@ -172,6 +172,10 @@ impl EventSet {
             .get(index / 64)
             .is_some_and(|word| word & (1 << (index % 64)) != 0)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

@@ -60,6 +60,11 @@ fn broadcast_toggle(bencher: Bencher<'_, '_>, instances: usize) {
     process_broadcast(bencher, instances, support::toggle_definition);
 }
 
+#[divan::bench(args = [1_000, 100_000, 1_000_000], sample_count = 20)]
+fn broadcast_uninterested(bencher: Bencher<'_, '_>, instances: usize) {
+    process_broadcast(bencher, instances, support::uninterested_definition);
+}
+
 #[divan::bench(args = [1_000, 100_000], sample_count = 10)]
 fn broadcast_luau(bencher: Bencher<'_, '_>, instances: usize) {
     process_broadcast(bencher, instances, support::luau_definition);

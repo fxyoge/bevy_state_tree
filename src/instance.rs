@@ -388,6 +388,15 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.runtime_id
     }
 
+    pub(crate) fn accepts_external_event(&self, event: StateTreeEventRef<'_, D>) -> bool {
+        self.status == InstanceStatus::Running
+            && self
+                .linked
+                .as_ref()
+                .and_then(|linked| linked.external_event(event.registered_event_id().index()))
+                .is_some_and(|events| !events.is_empty())
+    }
+
     pub(crate) fn set_time(&mut self, now: Duration) {
         self.now = now;
     }
