@@ -407,6 +407,24 @@ impl CompiledDefinition {
     pub fn effect_names(&self) -> impl ExactSizeIterator<Item = &str> {
         self.effects.iter().map(Box::as_ref)
     }
+
+    pub(crate) fn protocol_event_requirements(&self) -> impl Iterator<Item = &str> {
+        self.event_requirements
+            .iter()
+            .map(|requirement| event_pattern_name(&self.events[requirement.event.index()]))
+    }
+
+    pub(crate) fn protocol_internal_event_names(&self) -> impl Iterator<Item = &str> {
+        self.internal_events
+            .iter()
+            .filter_map(|event| self.event_name(*event))
+    }
+
+    pub(crate) fn protocol_activity_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.activities
+            .iter()
+            .map(|activity| activity.name.as_ref())
+    }
 }
 
 pub(crate) struct LinkedDefinition<D: StateTreeDomain> {
@@ -622,6 +640,11 @@ impl StateTreeDefinition {
     /// Returns the stable authored domain identifier, when one was declared.
     pub fn domain(&self) -> Option<&str> {
         self.compiled.domain.as_deref()
+    }
+
+    /// Returns the compiled authored protocol used by this definition.
+    pub fn protocol(&self) -> crate::StateTreeDefinitionProtocol<'_> {
+        crate::StateTreeDefinitionProtocol { definition: self }
     }
 
     /// Returns the state name associated with an ID from this definition.

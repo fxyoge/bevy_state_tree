@@ -20,7 +20,7 @@ use bevy_ecs::{
 use crate::{
     LuauValue, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
     StateTreeDomain, StateTreeEffectContext, StateTreeEffectError, StateTreeEventDataError,
-    StateTreeInstance, definition::ActivityId,
+    StateTreeInstance, definition::ActivityId, protocol::RegistrationOrigin,
 };
 
 /// A typed long-running request owned by one active state.
@@ -241,12 +241,14 @@ where
 #[derive(Resource)]
 pub(crate) struct StateTreeActivityRegistry<D: StateTreeDomain> {
     activities: HashMap<Box<str>, Arc<dyn RegisteredActivity<D>>>,
+    origins: HashMap<Box<str>, RegistrationOrigin>,
 }
 
 impl<D: StateTreeDomain> Default for StateTreeActivityRegistry<D> {
     fn default() -> Self {
         Self {
             activities: HashMap::new(),
+            origins: HashMap::new(),
         }
     }
 }
@@ -254,6 +256,12 @@ impl<D: StateTreeDomain> Default for StateTreeActivityRegistry<D> {
 impl<D: StateTreeDomain> StateTreeActivityRegistry<D> {
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredActivity<D>>> {
         self.activities.get(name).cloned()
+    }
+
+    pub(crate) fn registrations(&self) -> impl Iterator<Item = (&str, RegistrationOrigin)> {
+        self.origins
+            .iter()
+            .map(|(name, origin)| (name.as_ref(), *origin))
     }
 }
 
@@ -376,8 +384,12 @@ impl<D: StateTreeDomain, A: StateTreeActivity> StateTreeActivityOutcomeWriter<'_
     }
 }
 
-pub(crate) fn register_activity<D, A, F>(app: &mut App, name: Box<str>, constructor: F)
-where
+pub(crate) fn register_activity<D, A, F>(
+    app: &mut App,
+    name: Box<str>,
+    constructor: F,
+    origin: RegistrationOrigin,
+) where
     D: StateTreeDomain,
     A: StateTreeActivity,
     F: Fn(
@@ -412,6 +424,7 @@ where
             marker: PhantomData,
         }),
     );
+    registry.origins.insert(name, origin);
 }
 
 #[cfg(test)]
@@ -441,11 +454,13 @@ mod tests {
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestActivity),
+            RegistrationOrigin::Domain,
         );
         register_activity::<TestDomain, TestActivity, _>(
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestActivity),
+            RegistrationOrigin::Domain,
         );
     }
 }

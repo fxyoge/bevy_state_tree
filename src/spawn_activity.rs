@@ -84,6 +84,7 @@ pub(crate) fn register<D: StateTreeDomain>(app: &mut App, schedule: InternedSche
             }
             Ok(SpawnActivity { definition })
         },
+        crate::protocol::RegistrationOrigin::BuiltIn,
     );
     app.init_resource::<SpawnRuns<D>>().add_systems(
         schedule,

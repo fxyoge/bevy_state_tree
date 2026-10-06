@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     marker::PhantomData,
     num::NonZeroUsize,
     ops::Range,
@@ -26,7 +26,8 @@ use bevy_utils::Parallel;
 
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
-    StateTreeDomain, StateTreeEventRef, StateTreeInstance, StateTreeLinkError,
+    StateTreeDomain, StateTreeDomainRegistry, StateTreeEventRef, StateTreeInstance,
+    StateTreeLinkError,
     activity::{
         BevyActivitySink, StateTreeActivityInbox, StateTreeActivityIngress,
         StateTreeActivityRegistry,
@@ -128,8 +129,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
         assert!(
             app.world_mut()
                 .resource_mut::<StateTreeDomainRegistry>()
-                .names
-                .insert(D::AUTHORED_NAME),
+                .reserve(D::AUTHORED_NAME),
             "state-tree domain `{}` was registered more than once",
             D::AUTHORED_NAME
         );
@@ -182,16 +182,12 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
 
         crate::spawn_activity::register::<D>(app, self.schedule);
         D::configure(&mut crate::StateTreeConfig::new(app, self.schedule));
+        crate::protocol::install_domain::<D>(app);
     }
 }
 
 #[derive(Resource)]
 struct StateTreeAssetsInstalled;
-
-#[derive(Default, Resource)]
-struct StateTreeDomainRegistry {
-    names: HashSet<&'static str>,
-}
 
 #[derive(Resource)]
 struct LinkedStateTreeDefinitions<D: StateTreeDomain> {

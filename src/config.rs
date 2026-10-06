@@ -35,7 +35,7 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
     where
         E: StateTreeEvent<D>,
     {
-        crate::event::register_event::<D, E>(self.app);
+        crate::event::register_event::<D, E>(self.app, crate::protocol::RegistrationOrigin::Domain);
         self
     }
 
@@ -51,7 +51,12 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
             + Sync
             + 'static,
     {
-        crate::effect::register_effect::<D, M, F>(self.app, name.into(), constructor);
+        crate::effect::register_effect::<D, M, F>(
+            self.app,
+            name.into(),
+            constructor,
+            crate::protocol::RegistrationOrigin::Domain,
+        );
         self
     }
 
@@ -67,7 +72,12 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
             + Sync
             + 'static,
     {
-        crate::activity::register_activity::<D, A, F>(self.app, name.into(), constructor);
+        crate::activity::register_activity::<D, A, F>(
+            self.app,
+            name.into(),
+            constructor,
+            crate::protocol::RegistrationOrigin::Domain,
+        );
         self
     }
 

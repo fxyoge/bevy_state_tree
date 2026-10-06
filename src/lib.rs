@@ -36,6 +36,7 @@ mod event;
 mod instance;
 mod luau;
 mod plugin;
+mod protocol;
 mod spawn_activity;
 mod trace;
 
@@ -71,6 +72,10 @@ pub use plugin::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeLinkFailure,
     StateTreePlugin, StateTreeSet, StateTreeSettings,
 };
+pub use protocol::{
+    StateTreeDefinitionProtocol, StateTreeDomainInventory, StateTreeDomainRegistry,
+    StateTreeProtocolAnalysis, StateTreeProtocolIssue, analyze_state_tree_protocol,
+};
 pub(crate) use trace::{
     NoStateTreeTrace, StateTreeHistoryResolution, StateTreeTrace, StateTreeTraceRecord,
     StateTreeTraceTrigger,
@@ -88,11 +93,12 @@ pub mod prelude {
         StateTreeActivityToken, StateTreeArgs, StateTreeArgument, StateTreeBinding,
         StateTreeBindingSet, StateTreeBuilder, StateTreeConfig, StateTreeContext, StateTreeData,
         StateTreeDataOverrideError, StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain,
-        StateTreeEffectArgs, StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
-        StateTreeEvent, StateTreeEventDataError, StateTreeEventLog, StateTreeEventRef,
-        StateTreeInstance, StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue,
-        StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTraceLog,
-        StateTreeTracePlugin, StateTreeTransition,
+        StateTreeDomainInventory, StateTreeDomainRegistry, StateTreeEffectArgs,
+        StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError, StateTreeEvent,
+        StateTreeEventDataError, StateTreeEventLog, StateTreeEventRef, StateTreeInstance,
+        StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin,
+        StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTraceLog, StateTreeTracePlugin,
+        StateTreeTransition,
     };
 }
 pub use activity::{

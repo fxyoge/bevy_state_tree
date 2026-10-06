@@ -168,13 +168,14 @@ pub(crate) fn register_global_binding<D, B, C, S, M>(
         std::any::type_name::<B>()
     );
 
-    crate::event::ensure_event::<D, B::Event>(app);
+    crate::event::ensure_event::<D, B::Event>(app, crate::protocol::RegistrationOrigin::Domain);
     crate::activity::register_activity::<D, GlobalBindingActivity<B>, _>(
         app,
         name,
         move |context, arguments| {
             constructor(context, arguments).map(|binding| GlobalBindingActivity(Arc::new(binding)))
         },
+        crate::protocol::RegistrationOrigin::Domain,
     );
     app.add_systems(
         schedule,

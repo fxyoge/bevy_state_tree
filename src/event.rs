@@ -9,7 +9,7 @@ use bevy_app::App;
 use bevy_ecs::event::{EntityEvent, Event};
 use thiserror::Error;
 
-use crate::LuauValue;
+use crate::{LuauValue, protocol::RegistrationOrigin};
 
 /// An error while projecting a typed external event for Luau `_event.data`.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -93,25 +93,38 @@ impl<D: StateTreeDomain> Default for StateTreeAppEventRegistry<D> {
 }
 
 impl<D: StateTreeDomain> StateTreeAppEventRegistry<D> {
-    pub(crate) fn register<E>(&mut self) -> Result<(), StateTreeEventRegistrationError>
+    pub(crate) fn register<E>(
+        &mut self,
+        origin: RegistrationOrigin,
+    ) -> Result<(), StateTreeEventRegistrationError>
     where
         E: StateTreeEvent<D>,
     {
-        self.0.register::<E>().map(|_| ())
+        self.0.register_with_origin::<E>(origin).map(|_| ())
     }
 
     pub(crate) fn protocol(&self) -> &StateTreeEventProtocol<D> {
         self.0.protocol()
     }
 
-    pub(crate) fn ensure<E>(&mut self) -> Result<(), StateTreeEventRegistrationError>
+    pub(crate) fn registrations(&self) -> impl Iterator<Item = (&str, RegistrationOrigin)> {
+        self.0
+            .entries
+            .iter()
+            .map(|entry| (entry.authored_name, entry.origin))
+    }
+
+    pub(crate) fn ensure<E>(
+        &mut self,
+        origin: RegistrationOrigin,
+    ) -> Result<(), StateTreeEventRegistrationError>
     where
         E: StateTreeEvent<D>,
     {
         if self.0.type_ids.contains_key(&TypeId::of::<E>()) {
             Ok(())
         } else {
-            self.register::<E>()
+            self.register::<E>(origin)
         }
     }
 }
@@ -135,7 +148,18 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
     }
 
     /// Registers one concrete event payload in insertion order.
+    #[cfg(test)]
     pub(crate) fn register<E>(&mut self) -> Result<&mut Self, StateTreeEventRegistrationError>
+    where
+        E: StateTreeEvent<D>,
+    {
+        self.register_with_origin::<E>(RegistrationOrigin::Domain)
+    }
+
+    fn register_with_origin<E>(
+        &mut self,
+        origin: RegistrationOrigin,
+    ) -> Result<&mut Self, StateTreeEventRegistrationError>
     where
         E: StateTreeEvent<D>,
     {
@@ -164,6 +188,7 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
             id,
             type_id,
             authored_name: E::AUTHORED_NAME,
+            origin,
             event_data: project_event_data::<D, E>,
         });
         Ok(self)
@@ -200,7 +225,7 @@ pub(crate) struct StateTreeEventProtocol<D: StateTreeDomain> {
     marker: PhantomData<fn() -> D>,
 }
 
-pub(crate) fn register_event<D, E>(app: &mut App)
+pub(crate) fn register_event<D, E>(app: &mut App, origin: RegistrationOrigin)
 where
     D: StateTreeDomain,
     E: StateTreeEvent<D>,
@@ -208,7 +233,7 @@ where
     let result = app
         .world_mut()
         .resource_mut::<StateTreeAppEventRegistry<D>>()
-        .ensure::<E>();
+        .ensure::<E>(origin);
     if let Err(error) = result {
         panic!(
             "failed to register state-tree event `{}`: {error}",
@@ -217,7 +242,7 @@ where
     }
 }
 
-pub(crate) fn ensure_event<D, E>(app: &mut App)
+pub(crate) fn ensure_event<D, E>(app: &mut App, origin: RegistrationOrigin)
 where
     D: StateTreeDomain,
     E: StateTreeEvent<D>,
@@ -225,7 +250,7 @@ where
     let result = app
         .world_mut()
         .resource_mut::<StateTreeAppEventRegistry<D>>()
-        .ensure::<E>();
+        .ensure::<E>(origin);
     if let Err(error) = result {
         panic!(
             "failed to register state-tree event `{}`: {error}",
@@ -351,6 +376,7 @@ pub(crate) struct RegisteredEvent {
     id: RegisteredEventId,
     type_id: TypeId,
     authored_name: &'static str,
+    pub(crate) origin: RegistrationOrigin,
     event_data: EventDataProjector,
 }
 
@@ -535,8 +561,12 @@ mod tests {
     #[test]
     fn ensuring_the_same_event_type_is_idempotent() {
         let mut registry = StateTreeAppEventRegistry::<TestDomain>::default();
-        registry.ensure::<First>().unwrap();
-        registry.ensure::<First>().unwrap();
+        registry
+            .ensure::<First>(RegistrationOrigin::Domain)
+            .unwrap();
+        registry
+            .ensure::<First>(RegistrationOrigin::Domain)
+            .unwrap();
 
         assert_eq!(registry.protocol().authored_names(), &["first"]);
     }

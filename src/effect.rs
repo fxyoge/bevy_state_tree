@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::{
     LuauValue, StateTreeDomain,
     event::{StateTreeEvent, StateTreeEventRef},
+    protocol::RegistrationOrigin,
 };
 
 /// An error while constructing a typed state-tree effect.
@@ -270,12 +271,14 @@ where
 #[derive(Resource)]
 pub(crate) struct StateTreeEffectRegistry<D: StateTreeDomain> {
     effects: HashMap<Box<str>, Arc<dyn RegisteredEffect<D>>>,
+    origins: HashMap<Box<str>, RegistrationOrigin>,
 }
 
 impl<D: StateTreeDomain> Default for StateTreeEffectRegistry<D> {
     fn default() -> Self {
         Self {
             effects: HashMap::new(),
+            origins: HashMap::new(),
         }
     }
 }
@@ -283,6 +286,12 @@ impl<D: StateTreeDomain> Default for StateTreeEffectRegistry<D> {
 impl<D: StateTreeDomain> StateTreeEffectRegistry<D> {
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredEffect<D>>> {
         self.effects.get(name).cloned()
+    }
+
+    pub(crate) fn registrations(&self) -> impl Iterator<Item = (&str, RegistrationOrigin)> {
+        self.origins
+            .iter()
+            .map(|(name, origin)| (name.as_ref(), *origin))
     }
 }
 
@@ -310,8 +319,12 @@ impl<D: StateTreeDomain> RuntimeEffectSink<D> for BevyEffectSink<'_, '_, '_> {
     }
 }
 
-pub(crate) fn register_effect<D, M, F>(app: &mut App, name: Box<str>, constructor: F)
-where
+pub(crate) fn register_effect<D, M, F>(
+    app: &mut App,
+    name: Box<str>,
+    constructor: F,
+    origin: RegistrationOrigin,
+) where
     D: StateTreeDomain,
     M: Message,
     F: Fn(
@@ -339,6 +352,7 @@ where
             marker: PhantomData,
         }),
     );
+    registry.origins.insert(name, origin);
 }
 
 #[cfg(test)]
@@ -367,11 +381,13 @@ mod tests {
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestEffect),
+            RegistrationOrigin::Domain,
         );
         register_effect::<TestDomain, TestEffect, _>(
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestEffect),
+            RegistrationOrigin::Domain,
         );
     }
 }
