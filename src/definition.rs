@@ -157,7 +157,7 @@ impl EventSet {
     fn for_name(events: &[EventPattern], name: &str) -> Self {
         let mut words = vec![0; events.len().div_ceil(64)];
         for (index, pattern) in events.iter().enumerate() {
-            if event_pattern_matches(pattern, name) {
+            if event_pattern_name(pattern) == name {
                 words[index / 64] |= 1 << (index % 64);
             }
         }
@@ -390,7 +390,7 @@ impl CompiledDefinition {
         let EventPattern::Exact(emitted) = &self.events[emitted.index()] else {
             return false;
         };
-        event_pattern_matches(&self.events[candidate.index()], emitted)
+        event_pattern_name(&self.events[candidate.index()]) == emitted.as_ref()
     }
 
     pub fn event_name(&self, event: EventId) -> Option<&str> {
@@ -450,16 +450,14 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
             let matches_external = events
                 .authored_names()
                 .iter()
-                .any(|name| event_pattern_matches(pattern, name));
+                .any(|name| event_pattern_name(pattern) == *name);
             let matches_internal = compiled.internal_events.iter().any(|event| {
                 let EventPattern::Exact(name) = &compiled.events[event.index()] else {
                     return false;
                 };
-                event_pattern_matches(pattern, name)
+                event_pattern_name(pattern) == name.as_ref()
             });
-            let wildcard =
-                matches!(pattern, EventPattern::Descriptor(value) if value.as_ref() == "*");
-            if !matches_external && !matches_internal && !wildcard {
+            if !matches_external && !matches_internal {
                 issues.push(StateTreeLinkIssue::UnmatchedEventDescriptor {
                     descriptor: match pattern {
                         EventPattern::Exact(value) | EventPattern::Descriptor(value) => {
@@ -600,17 +598,9 @@ pub enum StateTreeLinkIssue {
     },
 }
 
-fn event_pattern_matches(pattern: &EventPattern, event: &str) -> bool {
+fn event_pattern_name(pattern: &EventPattern) -> &str {
     match pattern {
-        EventPattern::Exact(name) => name.as_ref() == event,
-        EventPattern::Descriptor(descriptor) => {
-            let descriptor = descriptor.strip_suffix(".*").unwrap_or(descriptor);
-            descriptor == "*"
-                || descriptor == event
-                || event
-                    .strip_prefix(descriptor)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-        }
+        EventPattern::Exact(name) | EventPattern::Descriptor(name) => name,
     }
 }
 
@@ -968,7 +958,7 @@ pub struct StateTreeTransition {
 }
 
 impl StateTreeTransition {
-    /// Creates a transition selected by one SCXML-style event descriptor.
+    /// Creates a transition selected by one exact event name.
     pub fn on(event: impl Into<Box<str>>) -> Self {
         Self::on_any([event])
     }
@@ -1356,7 +1346,7 @@ impl StateTreeBuilder {
                 }
                 if let Some(event) = events
                     .iter()
-                    .find(|event| event.contains(char::is_whitespace))
+                    .find(|event| event.contains(char::is_whitespace) || event.contains('*'))
                 {
                     return Err(BuildError::InvalidEventDescriptor(event.clone()));
                 }
@@ -2788,7 +2778,7 @@ pub enum BuildError {
     UnknownDataName { name: Box<str>, span_start: usize },
     #[error("a transition must contain at least one event descriptor")]
     MissingEventDescriptor,
-    #[error("event descriptor `{0}` must contain exactly one token")]
+    #[error("event descriptor `{0}` must name one exact event")]
     InvalidEventDescriptor(Box<str>),
     #[error("an eventless transition requires a condition or target")]
     EmptyTransition,
@@ -3483,6 +3473,14 @@ mod tests {
                 .unwrap_err(),
             BuildError::InvalidEventDescriptor("advance fast".into())
         );
+        for wildcard in ["*", "advance.*"] {
+            assert_eq!(
+                builder
+                    .add_transition(source, StateTreeTransition::on(wildcard).target(target))
+                    .unwrap_err(),
+                BuildError::InvalidEventDescriptor(wildcard.into())
+            );
+        }
     }
 
     #[test]

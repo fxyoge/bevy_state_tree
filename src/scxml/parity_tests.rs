@@ -127,8 +127,6 @@ fn transition_definition() -> Result<StateTreeDefinition, BuildError> {
             .actions([StateTreeAction::assign("last", "_event.name")]),
     )?;
     builder.add_transition(source, StateTreeTransition::on("combat"))?;
-    builder.add_transition(source, StateTreeTransition::on("navigation.*"))?;
-    builder.add_transition(source, StateTreeTransition::on("*"))?;
     builder.add_transition(
         child,
         StateTreeTransition::eventless()

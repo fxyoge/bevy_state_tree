@@ -1830,6 +1830,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_wildcard_event_descriptors() {
+        for descriptor in ["*", "combat.*"] {
+            let document = scxml::parse(
+                "wildcard.scxml",
+                &format!(
+                    r#"<scxml xmlns="{NS}" xmlns:bst="urn:bevy-state-tree" bst:domain="test"><state><transition event="{descriptor}"/></state></scxml>"#
+                ),
+            )
+            .unwrap();
+
+            assert!(
+                compile(&document)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must name one exact event")
+            );
+        }
+    }
+
+    #[test]
     fn root_completion_retains_final_without_running_its_exit_actions() {
         let document = scxml::parse(
             "complete.scxml",

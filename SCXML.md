@@ -65,12 +65,13 @@ Each event in a domain must have a unique authored name, including entity and
 broadcast events.
 
 Authored descriptors are checked against registered authored names when a
-definition is linked. Descriptor matching retains SCXML prefix and wildcard
-semantics; linking precomputes dense transition sets for each registered event,
-so macrosteps do not perform dynamic string matching. Typed Rust payloads remain
-intact through queueing and execution, and typed constructors can inspect the
-current payload with `context.event::<T>()`. The runtime does not accept an
-unregistered arbitrary string as an external event.
+definition is linked. Unlike general-purpose SCXML, descriptors name exact
+events; prefix and wildcard matching are rejected so adding a typed event cannot
+change existing statechart behavior. Linking precomputes dense transition sets
+for each registered event, so macrosteps do not perform dynamic string matching.
+Typed Rust payloads remain intact through queueing and execution, and typed
+constructors can inspect the current payload with `context.event::<T>()`. The
+runtime does not accept an unregistered arbitrary string as an external event.
 
 An event payload may opt into Luau payload access with
 `#[state_tree(name = "...", data = projector)]`. The projector accepts a shared

@@ -2726,13 +2726,8 @@ mod tests {
     #[state_tree(domain = DescriptorDomain, name = "combat.damage", broadcast)]
     struct DescriptorEvents;
 
-    #[allow(non_upper_case_globals)]
-    impl DescriptorEvents {
-        const Combat: Self = Self;
-    }
-
     #[test]
-    fn linked_external_events_match_scxml_prefix_descriptors() {
+    fn linked_external_events_require_exact_descriptors() {
         let mut builder = StateTreeBuilder::new("descriptors");
         let root = builder.compound_root("root").unwrap();
         let waiting = builder.atomic("waiting", root).unwrap();
@@ -2742,11 +2737,19 @@ mod tests {
             .add_transition(waiting, StateTreeTransition::on("combat").target(done))
             .unwrap();
         let definition = builder.build().unwrap();
-        let mut execution =
-            TestApp::<DescriptorDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let execution = TestApp::<DescriptorDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let error = execution
+            .app()
+            .world()
+            .get::<crate::StateTreeLinkFailure<DescriptorDomain>>(execution.entity())
+            .unwrap()
+            .error();
 
-        assert!(execution.process_event(DescriptorEvents::Combat));
-        assert_eq!(execution.status(), &InstanceStatus::Complete);
+        assert!(matches!(
+            &error.issues()[0],
+            crate::StateTreeLinkIssue::UnmatchedEventDescriptor { descriptor, .. }
+                if descriptor.as_ref() == "combat"
+        ));
     }
 
     #[test]

@@ -11,8 +11,6 @@
       <assign location="last" expr="_event.name"/>
     </transition>
     <transition event="combat"/>
-    <transition event="navigation.*"/>
-    <transition event="*"/>
   </state>
   <state id="parent" initial="child">
     <state id="child">
