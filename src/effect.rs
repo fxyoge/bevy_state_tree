@@ -340,3 +340,38 @@ where
         }),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use bevy_ecs::message::Message;
+
+    use super::*;
+
+    struct TestDomain;
+
+    impl StateTreeDomain for TestDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
+        fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
+    }
+
+    #[derive(Message)]
+    struct TestEffect;
+
+    #[test]
+    #[should_panic(expected = "state-tree effect `duplicate` was registered more than once")]
+    fn effect_names_must_be_unique_within_a_domain() {
+        let mut app = App::new();
+        app.init_resource::<StateTreeEffectRegistry<TestDomain>>();
+        register_effect::<TestDomain, TestEffect, _>(
+            &mut app,
+            "duplicate".into(),
+            |_context, _arguments| Ok(TestEffect),
+        );
+        register_effect::<TestDomain, TestEffect, _>(
+            &mut app,
+            "duplicate".into(),
+            |_context, _arguments| Ok(TestEffect),
+        );
+    }
+}

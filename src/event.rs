@@ -64,12 +64,21 @@ pub(crate) enum StateTreeEventRegistrationError {
     /// Authored event names must contain at least one character.
     #[error("state-tree event payload type `{type_name}` has an empty authored name")]
     EmptyName { type_name: &'static str },
+    /// One authored event name cannot identify multiple Rust payload types.
+    #[error(
+        "state-tree event name `{name}` is already registered for payload type `{registered_type_name}`"
+    )]
+    DuplicateName {
+        name: &'static str,
+        registered_type_name: &'static str,
+    },
 }
 
 /// Builds an open external event protocol for one state-tree domain.
 pub(crate) struct StateTreeEventRegistry<D: StateTreeDomain> {
     entries: Vec<RegisteredEvent>,
     type_ids: HashMap<TypeId, RegisteredEventId>,
+    names: HashMap<&'static str, &'static str>,
     frozen: OnceLock<StateTreeEventProtocol<D>>,
     marker: PhantomData<fn() -> D>,
 }
@@ -119,6 +128,7 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
         Self {
             entries: Vec::new(),
             type_ids: HashMap::new(),
+            names: HashMap::new(),
             frozen: OnceLock::new(),
             marker: PhantomData,
         }
@@ -140,9 +150,16 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
                 type_name: type_name::<E>(),
             });
         }
+        if let Some(registered_type_name) = self.names.get(E::AUTHORED_NAME) {
+            return Err(StateTreeEventRegistrationError::DuplicateName {
+                name: E::AUTHORED_NAME,
+                registered_type_name,
+            });
+        }
 
         let id = RegisteredEventId(self.entries.len());
         self.type_ids.insert(type_id, id);
+        self.names.insert(E::AUTHORED_NAME, type_name::<E>());
         self.entries.push(RegisteredEvent {
             id,
             type_id,
@@ -502,20 +519,26 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_authored_names_are_allowed() {
+    fn duplicate_authored_names_are_rejected() {
         let mut registry = StateTreeEventRegistry::<TestDomain>::new();
-        registry
-            .register::<First>()
-            .unwrap()
-            .register::<SameName>()
-            .unwrap();
+        registry.register::<First>().unwrap();
 
-        let protocol = registry.freeze();
-        assert_eq!(protocol.authored_names(), &["first", "first"]);
         assert_eq!(
-            protocol.registered_event_id(TypeId::of::<SameName>()),
-            Some(RegisteredEventId(1))
+            registry.register::<SameName>().err().unwrap(),
+            StateTreeEventRegistrationError::DuplicateName {
+                name: "first",
+                registered_type_name: type_name::<First>(),
+            }
         );
+    }
+
+    #[test]
+    fn ensuring_the_same_event_type_is_idempotent() {
+        let mut registry = StateTreeAppEventRegistry::<TestDomain>::default();
+        registry.ensure::<First>().unwrap();
+        registry.ensure::<First>().unwrap();
+
+        assert_eq!(registry.protocol().authored_names(), &["first"]);
     }
 
     #[test]

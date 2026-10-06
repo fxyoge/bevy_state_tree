@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     marker::PhantomData,
     num::NonZeroUsize,
     ops::Range,
@@ -124,6 +124,15 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             app.world().contains_resource::<Time>(),
             "StateTreePlugin requires Bevy's TimePlugin to be installed first"
         );
+        app.init_resource::<StateTreeDomainRegistry>();
+        assert!(
+            app.world_mut()
+                .resource_mut::<StateTreeDomainRegistry>()
+                .names
+                .insert(D::AUTHORED_NAME),
+            "state-tree domain `{}` was registered more than once",
+            D::AUTHORED_NAME
+        );
 
         if !app.world().contains_resource::<StateTreeAssetsInstalled>() {
             assert!(
@@ -178,6 +187,11 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
 
 #[derive(Resource)]
 struct StateTreeAssetsInstalled;
+
+#[derive(Default, Resource)]
+struct StateTreeDomainRegistry {
+    names: HashSet<&'static str>,
+}
 
 #[derive(Resource)]
 struct LinkedStateTreeDefinitions<D: StateTreeDomain> {
@@ -1273,13 +1287,13 @@ mod tests {
     }
 
     #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = Simulation, name = "reset", broadcast)]
+    #[state_tree(domain = Simulation, name = "reset.all", broadcast)]
     struct ResetAll {
         reason: u32,
     }
 
     #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = Simulation, name = "advance", broadcast)]
+    #[state_tree(domain = Simulation, name = "advance.all", broadcast)]
     struct AdvanceAll;
 
     #[derive(EntityEvent, crate::StateTreeEvent)]
@@ -1295,11 +1309,11 @@ mod tests {
     }
 
     #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = SecondarySimulation, name = "reset", broadcast)]
+    #[state_tree(domain = SecondarySimulation, name = "reset.all", broadcast)]
     struct SecondaryResetAll;
 
     #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = SecondarySimulation, name = "advance", broadcast)]
+    #[state_tree(domain = SecondarySimulation, name = "advance.all", broadcast)]
     struct SecondaryAdvanceAll;
 
     fn project_advance(
@@ -1347,7 +1361,13 @@ mod tests {
             .add_transition(idle, StateTreeTransition::on("advance").target(active))
             .unwrap();
         builder
+            .add_transition(idle, StateTreeTransition::on("advance.all").target(active))
+            .unwrap();
+        builder
             .add_transition(active, StateTreeTransition::on("reset").target(idle))
+            .unwrap();
+        builder
+            .add_transition(active, StateTreeTransition::on("reset.all").target(idle))
             .unwrap();
         builder.build().unwrap()
     }
@@ -1776,6 +1796,23 @@ mod tests {
             AssetPlugin::default(),
             StateTreePlugin::<EmptyName>::new(Update),
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "state-tree domain `test` was registered more than once")]
+    fn domain_authored_names_must_be_unique() {
+        struct DuplicateName;
+
+        impl StateTreeDomain for DuplicateName {
+            const AUTHORED_NAME: &'static str = "test";
+
+            fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
+        }
+
+        let mut app = App::new();
+        app.add_plugins((TimePlugin, AssetPlugin::default()));
+        app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
+        app.add_plugins(StateTreePlugin::<DuplicateName>::new(Update));
     }
 
     #[test]
@@ -2297,14 +2334,14 @@ mod tests {
                 .get(interested)
                 .unwrap()
                 .as_str()
-                .contains("macrostep external \"advance\"")
+                .contains("macrostep external \"advance.all\"")
         );
         assert!(
             !traces
                 .get(uninterested)
                 .unwrap()
                 .as_str()
-                .contains("macrostep external \"advance\"")
+                .contains("macrostep external \"advance.all\"")
         );
     }
 

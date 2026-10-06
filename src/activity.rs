@@ -413,3 +413,39 @@ where
         }),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDomain;
+
+    impl StateTreeDomain for TestDomain {
+        const AUTHORED_NAME: &'static str = "test";
+
+        fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
+    }
+
+    struct TestActivity;
+
+    impl StateTreeActivity for TestActivity {
+        type Output = ();
+        type Error = ();
+    }
+
+    #[test]
+    #[should_panic(expected = "state-tree activity `duplicate` was registered more than once")]
+    fn activity_names_must_be_unique_within_a_domain() {
+        let mut app = App::new();
+        register_activity::<TestDomain, TestActivity, _>(
+            &mut app,
+            "duplicate".into(),
+            |_context, _arguments| Ok(TestActivity),
+        );
+        register_activity::<TestDomain, TestActivity, _>(
+            &mut app,
+            "duplicate".into(),
+            |_context, _arguments| Ok(TestActivity),
+        );
+    }
+}

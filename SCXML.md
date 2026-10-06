@@ -44,7 +44,8 @@ The value must equal `StateTreeDomain::AUTHORED_NAME`. A mismatch produces a
 single domain link issue before the domain's events, effects, and activities are
 checked. Generated definitions may opt into the same check with
 `StateTreeBuilder::domain`; generated definitions without one remain reusable
-across domains.
+across domains. Each installed domain must have a unique authored name within
+the Bevy application.
 
 Definitions constructed programmatically can be inserted directly into
 `Assets<StateTreeDefinition>`; they share the same initialization and linking
@@ -60,6 +61,8 @@ domain declares it with `StateTreeConfig::event`. Entity payloads also derive
 
 `StateTreePlugin` consumes the complete declaration during installation. There
 is no mutable application registration API and no separate portable protocol.
+Each event in a domain must have a unique authored name, including entity and
+broadcast events.
 
 Authored descriptors are checked against registered authored names when a
 definition is linked. Descriptor matching retains SCXML prefix and wildcard
@@ -240,6 +243,8 @@ publishes that message through deferred commands. Systems ordered in
 `StateTreeSet::HandleEffects` observe messages after state-tree processing.
 The constructor can use `context.event::<T>()` to borrow a matching concrete
 external payload; it returns `None` for internal events or another payload type.
+Registered effect names are unique within a domain, while definitions may invoke
+the same registered effect any number of times.
 
 Effects are constructed in SCXML action order. Publication across independently
 processed instances is unordered. A constructor, argument conversion, or
@@ -270,6 +275,8 @@ only. Arguments follow effect rules: unique non-empty names, non-empty Luau
 expressions, no content, and a
 Luau datamodel when arguments are present. Builder definitions use
 `StateTreeActivityDefinition` and `StateTreeBuilder::add_activity`.
+Registered activity names are unique within a domain, while definitions may use
+the same registered activity for multiple globally unique activity IDs.
 
 Owner entry actions run before starts. A committed exit cancels live activities
 after exit actions; fault, root completion, and component removal/replacement
