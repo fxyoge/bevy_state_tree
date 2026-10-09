@@ -6,13 +6,52 @@ use std::{
 };
 
 use full_moon::{
-    ast::{Expression, FunctionCall, Index, Prefix, Suffix, Var, VarExpression},
+    ast::{Expression, FunctionCall, Index, Prefix, Stmt, Suffix, Var, VarExpression},
     tokenizer::{TokenReference, TokenType},
     visitors::Visitor,
 };
 use mlua::{ChunkMode, Compiler, Error, Function, Lua, Table, Value};
 
 const FUNCTION_CACHE_CAPACITY: usize = 256;
+
+/// Accept only an assignable path rooted in a declared variable, never calls or statements.
+pub(crate) fn assignment_root(location: &str) -> Result<String, String> {
+    let ast = full_moon::parse(&format!("{location} = nil")).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    let mut statements = ast.nodes().stmts();
+    let Some(Stmt::Assignment(assignment)) = statements.next() else {
+        return Err("assignment location must be a variable or indexed path".into());
+    };
+    if statements.next().is_some()
+        || ast.nodes().last_stmt().is_some()
+        || assignment.variables().iter().count() != 1
+    {
+        return Err("assignment location must be a single path".into());
+    }
+    let token = match assignment.variables().iter().next().unwrap() {
+        Var::Name(name) => name,
+        Var::Expression(path)
+            if path
+                .suffixes()
+                .all(|suffix| matches!(suffix, Suffix::Index(_))) =>
+        {
+            let Prefix::Name(name) = path.prefix() else {
+                return Err("assignment path must start with a datamodel name".into());
+            };
+            name
+        }
+        _ => return Err("assignment path cannot contain calls".into()),
+    };
+    match token.token().token_type() {
+        TokenType::Identifier { identifier } => Ok(identifier.to_string()),
+        _ => Err("assignment path must start with a datamodel name".into()),
+    }
+}
 
 static NEXT_EXPRESSION_ID: AtomicU64 = AtomicU64::new(1);
 

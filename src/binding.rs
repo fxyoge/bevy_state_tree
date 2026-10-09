@@ -531,6 +531,168 @@ mod tests {
         scxml::compile(&document).unwrap()
     }
 
+    #[test]
+    fn nested_assignments_persist_only_the_root_and_support_event_keys_and_deletion() {
+        let source = r#"
+            <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree"
+                   bst:domain="test" datamodel="luau" initial="active">
+              <datamodel>
+                <data id="values" expr="{keep = {current = 5}, old = 1, list = {2, 3}}"/>
+                <data id="key" expr="'unit'"/>
+              </datamodel>
+              <state id="active">
+                <onentry>
+                  <assign location="values[key]" expr="{current = 10}"/>
+                  <assign location="values.list[2]" expr="7"/>
+                  <assign location="values.old" expr="nil"/>
+                </onentry>
+                <bst:activity id="sample" name="bind.sample"/>
+                <transition event="sample.changed">
+                  <assign location="values[key].current" expr="values.keep.current + 1"/>
+                  <assign location="values[_event.data.mode]" expr="_event.data.label"/>
+                </transition>
+              </state>
+            </scxml>
+        "#;
+        let definition = scxml::compile(&scxml::parse("nested.scxml", source).unwrap()).unwrap();
+        let mut app = binding_app();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(definition);
+        let entity = app
+            .world_mut()
+            .spawn(StateTreeInstance::<BindingDomain>::new(handle))
+            .id();
+        app.update();
+        app.update();
+        let values = app
+            .world()
+            .get::<StateTreeInstance<BindingDomain>>(entity)
+            .unwrap()
+            .data("values")
+            .unwrap();
+        assert_eq!(
+            values,
+            &LuauValue::Record(BTreeMap::from([
+                (
+                    "keep".into(),
+                    LuauValue::Record(BTreeMap::from([("current".into(), LuauValue::Integer(5))]))
+                ),
+                (
+                    "unit".into(),
+                    LuauValue::Record(BTreeMap::from([("current".into(), LuauValue::Integer(6))]))
+                ),
+                (
+                    "list".into(),
+                    LuauValue::Sequence(vec![LuauValue::Integer(2), LuauValue::Integer(7)])
+                ),
+                ("idle".into(), LuauValue::String("first".into())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn assignment_locations_reject_calls_multiple_targets_and_undeclared_roots() {
+        for location in [
+            "values()",
+            "values().field",
+            "values, other",
+            "values; other",
+            "missing.field",
+        ] {
+            let source = format!(
+                r#"
+                <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree"
+                       bst:domain="test" datamodel="luau">
+                  <datamodel><data id="values" expr="{{}}"/></datamodel>
+                  <state id="active"><onentry><assign location="{location}" expr="1"/></onentry></state>
+                </scxml>"#
+            );
+            let error =
+                scxml::compile(&scxml::parse("invalid.scxml", &source).unwrap()).unwrap_err();
+            if location == "missing.field" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("assignment location `missing` is not declared")
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("invalid Luau"),
+                    "location: {location}, error: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_nested_assignments_fault_without_persisting_partial_mutations() {
+        for location in [
+            "values.missing.current",
+            "values.keep.current.field",
+            "values[false]",
+            "values.list[1]",
+        ] {
+            let expression = if location == "values.list[1]" {
+                "nil"
+            } else {
+                "9"
+            };
+            let source = format!(
+                r#"
+                <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree"
+                       bst:domain="test" datamodel="luau">
+                  <datamodel><data id="values" expr="{{keep = {{current = 5}}, list = {{2, 3}}}}"/></datamodel>
+                  <state id="active"><onentry><assign location="{location}" expr="{expression}"/></onentry></state>
+                </scxml>"#
+            );
+            let definition =
+                scxml::compile(&scxml::parse("invalid-nested.scxml", &source).unwrap()).unwrap();
+            let mut app = binding_app();
+            let handle = app
+                .world_mut()
+                .resource_mut::<Assets<StateTreeDefinition>>()
+                .add(definition);
+            let entity = app
+                .world_mut()
+                .spawn(StateTreeInstance::<BindingDomain>::new(handle))
+                .id();
+            app.update();
+            let instance = app
+                .world()
+                .get::<StateTreeInstance<BindingDomain>>(entity)
+                .unwrap();
+            assert!(
+                matches!(
+                    instance.status(),
+                    crate::InstanceStatus::Faulted(crate::RuntimeFault::Datamodel {
+                        operation: crate::DatamodelOperation::Assign,
+                        ..
+                    })
+                ),
+                "{location}: {:?}",
+                instance.status()
+            );
+            assert_eq!(
+                instance.data("values"),
+                Some(&LuauValue::Record(BTreeMap::from([
+                    (
+                        "keep".into(),
+                        LuauValue::Record(BTreeMap::from([(
+                            "current".into(),
+                            LuauValue::Integer(5)
+                        )]))
+                    ),
+                    (
+                        "list".into(),
+                        LuauValue::Sequence(vec![LuauValue::Integer(2), LuauValue::Integer(3)])
+                    ),
+                ])))
+            );
+        }
+    }
+
     fn assert_binding_data(world: &World, entity: Entity, changes: i64, mode: &str, label: &str) {
         let instance = world
             .get::<StateTreeInstance<BindingDomain>>(entity)

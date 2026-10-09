@@ -918,7 +918,11 @@ impl StateTreeAction {
         }
     }
 
-    /// Assigns the result of a Luau expression to a declared datamodel value.
+    /// Assigns a Luau expression to a declared datamodel value or a nested path.
+    ///
+    /// Paths support fields and Luau bracket keys, e.g. `health[id].current`.
+    /// Intermediate tables must exist. Assigning `nil` removes a record key;
+    /// sequence results must remain contiguous. Only the named root is persisted.
     pub fn assign(location: impl Into<Box<str>>, expression: impl Into<Box<str>>) -> Self {
         Self::assign_at(location, expression, 0)
     }
@@ -1628,20 +1632,36 @@ impl StateTreeBuilder {
                 }
                 StateTreeActionKind::Assign {
                     location,
-                    expression,
+                    mut expression,
                 } => {
+                    let root = crate::luau::assignment_root(&location).map_err(|message| {
+                        BuildError::InvalidLuau {
+                            span_start: expression.span_start,
+                            message: message.into(),
+                        }
+                    })?;
                     let data = self
                         .datamodel
                         .as_ref()
                         .and_then(|datamodel| {
-                            datamodel.names.iter().position(|name| name == &location)
+                            datamodel
+                                .names
+                                .iter()
+                                .position(|name| name.as_ref() == root)
                         })
                         .and_then(|index| u32::try_from(index).ok())
                         .map(DataId)
                         .ok_or_else(|| BuildError::UnknownDataName {
-                            name: location.clone(),
+                            name: root.clone().into(),
                             span_start: expression.span_start,
                         })?;
+                    if location.trim() != root {
+                        expression.source = format!(
+                            "(function() {location} = ({}) return {root} end)()",
+                            expression.source
+                        )
+                        .into();
+                    }
                     let expression = self.register_expression(expression, false)?;
                     DraftAction::Assign { data, expression }
                 }
