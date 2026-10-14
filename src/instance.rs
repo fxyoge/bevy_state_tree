@@ -277,9 +277,14 @@ pub enum DatamodelOperation {
 #[component(on_discard = release_runtime_state::<D>)]
 #[require(PendingStateTree<D>, StateTreeEventInbox<D>)]
 pub struct StateTreeInstance<D: StateTreeDomain> {
-    runtime_id: u64,
     definition: Handle<StateTreeDefinition>,
     linked: Option<Arc<LinkedDefinition<D>>>,
+    runtime: InstanceRuntime,
+}
+
+#[derive(Debug)]
+struct InstanceRuntime {
+    runtime_id: u64,
     active: Vec<StateId>,
     active_states: Option<Box<[bool]>>,
     parallel: Option<Box<ParallelRuntime>>,
@@ -292,7 +297,26 @@ pub struct StateTreeInstance<D: StateTreeDomain> {
     initial_data: StateTreeDataOverrides,
     data: Vec<LuauValue>,
     status: InstanceStatus,
-    marker: PhantomData<fn() -> D>,
+}
+
+/// Borrows definition ownership separately from the mutable execution state.
+struct Execution<'a, D: StateTreeDomain> {
+    linked: Option<&'a LinkedDefinition<D>>,
+    runtime: &'a mut InstanceRuntime,
+}
+
+impl<D: StateTreeDomain> std::ops::Deref for Execution<'_, D> {
+    type Target = InstanceRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.runtime
+    }
+}
+
+impl<D: StateTreeDomain> std::ops::DerefMut for Execution<'_, D> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.runtime
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -355,22 +379,23 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         initial_data: StateTreeDataOverrides,
     ) -> Self {
         Self {
-            runtime_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             definition,
             linked: None,
-            active: Vec::new(),
-            active_states: None,
-            parallel: None,
-            internal_events: VecDeque::new(),
-            now: Duration::ZERO,
-            timers: Vec::new(),
-            activities: None,
-            history: None,
-            timer_updates: Vec::new(),
-            initial_data,
-            data: Vec::new(),
-            status: InstanceStatus::Pending,
-            marker: PhantomData,
+            runtime: InstanceRuntime {
+                runtime_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+                active: Vec::new(),
+                active_states: None,
+                parallel: None,
+                internal_events: VecDeque::new(),
+                now: Duration::ZERO,
+                timers: Vec::new(),
+                activities: None,
+                history: None,
+                timer_updates: Vec::new(),
+                initial_data,
+                data: Vec::new(),
+                status: InstanceStatus::Pending,
+            },
         }
     }
 
@@ -385,11 +410,11 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn runtime_id(&self) -> u64 {
-        self.runtime_id
+        self.runtime.runtime_id
     }
 
     pub(crate) fn accepts_external_event(&self, event: StateTreeEventRef<'_, D>) -> bool {
-        self.status == InstanceStatus::Running
+        self.runtime.status == InstanceStatus::Running
             && self
                 .linked
                 .as_ref()
@@ -398,20 +423,21 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn set_time(&mut self, now: Duration) {
-        self.now = now;
+        self.runtime.now = now;
     }
 
     pub(crate) fn drain_timer_updates(&mut self) -> std::vec::Drain<'_, TimerUpdate> {
-        self.timer_updates.drain(..)
+        self.runtime.timer_updates.drain(..)
     }
 
     fn armed_timer_tokens(&self) -> Vec<TimerToken> {
-        self.timers
+        self.runtime
+            .timers
             .iter()
             .enumerate()
             .filter(|(_, slot)| slot.armed)
             .map(|(index, slot)| TimerToken {
-                runtime_id: self.runtime_id,
+                runtime_id: self.runtime.runtime_id,
                 timer: TimerId(u32::try_from(index).expect("compiled timer index fits u32")),
                 generation: slot.generation,
             })
@@ -428,7 +454,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         let Some(linked) = &self.linked else {
             return Vec::new();
         };
-        let Some(activities) = self.activities.as_ref() else {
+        let Some(activities) = self.runtime.activities.as_ref() else {
             return Vec::new();
         };
         activities
@@ -441,7 +467,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     Arc::clone(linked.activity(id)),
                     ErasedActivityToken {
                         entity,
-                        runtime_id: self.runtime_id,
+                        runtime_id: self.runtime.runtime_id,
                         activity: id,
                         generation: slot.generation,
                     },
@@ -451,8 +477,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     fn invalidate_activity_tokens(&mut self) {
-        self.runtime_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
-        let Some(activities) = self.activities.as_mut() else {
+        self.runtime.runtime_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let Some(activities) = self.runtime.activities.as_mut() else {
             return;
         };
         for slot in activities {
@@ -462,9 +488,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn accepts_activity_token(&self, token: ErasedActivityToken) -> bool {
-        self.status == InstanceStatus::Running
-            && token.runtime_id == self.runtime_id
+        self.runtime.status == InstanceStatus::Running
+            && token.runtime_id == self.runtime.runtime_id
             && self
+                .runtime
                 .activities
                 .as_deref()
                 .and_then(|activities| activities.get(token.activity.index()))
@@ -473,12 +500,12 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
     /// Returns the current execution status.
     pub fn status(&self) -> &InstanceStatus {
-        &self.status
+        &self.runtime.status
     }
 
     /// Returns the active state IDs.
     pub fn active_states(&self) -> impl ExactSizeIterator<Item = StateId> + '_ {
-        self.active.iter().copied()
+        self.runtime.active.iter().copied()
     }
 
     /// Returns the active authored state names in canonical definition order.
@@ -487,16 +514,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .linked
             .as_deref()
             .map(|linked| linked.compiled.as_ref());
-        self.active.iter().filter_map(move |state| {
+        self.runtime.active.iter().filter_map(move |state| {
             compiled.map(|definition| definition.state(*state).name.as_ref())
         })
-    }
-
-    fn is_state_active(&self, state: StateId) -> bool {
-        self.active_states.as_deref().map_or_else(
-            || self.active.contains(&state),
-            |states| states[state.index()],
-        )
     }
 
     /// Returns one instance-local Luau datamodel value by authored id.
@@ -506,7 +526,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .names
             .iter()
             .position(|candidate| candidate.as_ref() == name)
-            .and_then(|index| self.data.get(index))
+            .and_then(|index| self.runtime.data.get(index))
     }
 
     pub(crate) fn initialize<
@@ -543,11 +563,176 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         activities: &mut A,
         trace: &mut T,
     ) {
+        self.linked = Some(linked);
+        self.execution()
+            .initialize_traced(microstep_limit, entity, effects, activities, trace);
+    }
+
+    fn execution(&mut self) -> Execution<'_, D> {
+        Execution {
+            linked: self.linked.as_deref(),
+            runtime: &mut self.runtime,
+        }
+    }
+
+    pub(crate) fn process_event<
+        S: RuntimeEffectSink<D> + ?Sized,
+        A: RuntimeActivitySink<D> + ?Sized,
+    >(
+        &mut self,
+        event: StateTreeEventRef<'_, D>,
+        microstep_limit: usize,
+        entity: Entity,
+        effects: &mut S,
+        activities: &mut A,
+    ) -> bool {
+        self.process_event_traced(
+            event,
+            microstep_limit,
+            entity,
+            effects,
+            activities,
+            &mut NoStateTreeTrace,
+        )
+    }
+
+    pub(crate) fn process_event_traced<
+        S: RuntimeEffectSink<D> + ?Sized,
+        A: RuntimeActivitySink<D> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        event: StateTreeEventRef<'_, D>,
+        microstep_limit: usize,
+        entity: Entity,
+        effects: &mut S,
+        activities: &mut A,
+        trace: &mut T,
+    ) -> bool {
+        self.execution().process_event_traced(
+            event,
+            microstep_limit,
+            entity,
+            effects,
+            activities,
+            trace,
+        )
+    }
+
+    pub(crate) fn process_timers<
+        S: RuntimeEffectSink<D> + ?Sized,
+        A: RuntimeActivitySink<D> + ?Sized,
+    >(
+        &mut self,
+        tokens: &[TimerToken],
+        microstep_limit: usize,
+        entity: Entity,
+        effects: &mut S,
+        activities: &mut A,
+    ) -> bool {
+        self.process_timers_traced(
+            tokens,
+            microstep_limit,
+            entity,
+            effects,
+            activities,
+            &mut NoStateTreeTrace,
+        )
+    }
+
+    pub(crate) fn process_timers_traced<
+        S: RuntimeEffectSink<D> + ?Sized,
+        A: RuntimeActivitySink<D> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        tokens: &[TimerToken],
+        microstep_limit: usize,
+        entity: Entity,
+        effects: &mut S,
+        activities: &mut A,
+        trace: &mut T,
+    ) -> bool {
+        self.execution().process_timers_traced(
+            tokens,
+            microstep_limit,
+            entity,
+            effects,
+            activities,
+            trace,
+        )
+    }
+
+    pub(crate) fn process_activity_outcome<
+        S: RuntimeEffectSink<D> + ?Sized,
+        A: RuntimeActivitySink<D> + ?Sized,
+    >(
+        &mut self,
+        outcome: crate::activity::ActivityOutcome,
+        microstep_limit: usize,
+        entity: Entity,
+        effects: &mut S,
+        activities: &mut A,
+    ) -> bool {
+        self.process_activity_outcome_traced(
+            outcome,
+            microstep_limit,
+            entity,
+            effects,
+            activities,
+            &mut NoStateTreeTrace,
+        )
+    }
+
+    pub(crate) fn process_activity_outcome_traced<
+        S: RuntimeEffectSink<D> + ?Sized,
+        A: RuntimeActivitySink<D> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        outcome: crate::activity::ActivityOutcome,
+        microstep_limit: usize,
+        entity: Entity,
+        effects: &mut S,
+        activities: &mut A,
+        trace: &mut T,
+    ) -> bool {
+        self.execution().process_activity_outcome_traced(
+            outcome,
+            microstep_limit,
+            entity,
+            effects,
+            activities,
+            trace,
+        )
+    }
+}
+
+impl<D: StateTreeDomain> Execution<'_, D> {
+    fn is_state_active(&self, state: StateId) -> bool {
+        self.active_states.as_deref().map_or_else(
+            || self.active.contains(&state),
+            |states| states[state.index()],
+        )
+    }
+
+    fn initialize_traced<
+        S: RuntimeEffectSink<D> + ?Sized,
+        A: RuntimeActivitySink<D> + ?Sized,
+        T: StateTreeTrace + ?Sized,
+    >(
+        &mut self,
+        microstep_limit: usize,
+        entity: Entity,
+        effects: &mut S,
+        activities: &mut A,
+        trace: &mut T,
+    ) {
+        let linked = self.linked.expect("initializing instance is linked");
         let compiled = &linked.compiled;
         trace.record(StateTreeTraceRecord::MacrostepStarted {
             trigger: StateTreeTraceTrigger::Initialization,
         });
-        self.linked = Some(Arc::clone(&linked));
         self.active.clear();
         self.active.reserve(compiled.max_active);
         self.active_states = compiled
@@ -651,27 +836,6 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.finish_macrostep(compiled, trace);
     }
 
-    pub(crate) fn process_event<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-    >(
-        &mut self,
-        event: StateTreeEventRef<'_, D>,
-        microstep_limit: usize,
-        entity: Entity,
-        effects: &mut S,
-        activities: &mut A,
-    ) -> bool {
-        self.process_event_traced(
-            event,
-            microstep_limit,
-            entity,
-            effects,
-            activities,
-            &mut NoStateTreeTrace,
-        )
-    }
-
     pub(crate) fn process_event_traced<
         S: RuntimeEffectSink<D> + ?Sized,
         A: RuntimeActivitySink<D> + ?Sized,
@@ -693,7 +857,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             trigger: StateTreeTraceTrigger::ExternalEvent(event_name),
         });
         let selected = if self.parallel.is_some() {
-            let Some(linked) = self.linked.as_ref().map(Arc::clone) else {
+            let Some(linked) = self.linked else {
                 return false;
             };
             let Some(events) = linked.external_event(event.registered_event_id().index()) else {
@@ -701,7 +865,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             };
             self.select_step(Trigger::External(events, event))
         } else {
-            let Some(linked) = self.linked.as_ref() else {
+            let Some(linked) = self.linked else {
                 return false;
             };
             let Some(events) = linked.external_event(event.registered_event_id().index()) else {
@@ -761,27 +925,6 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
         self.finish_current_macrostep(trace);
         true
-    }
-
-    pub(crate) fn process_timers<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-    >(
-        &mut self,
-        tokens: &[TimerToken],
-        microstep_limit: usize,
-        entity: Entity,
-        effects: &mut S,
-        activities: &mut A,
-    ) -> bool {
-        self.process_timers_traced(
-            tokens,
-            microstep_limit,
-            entity,
-            effects,
-            activities,
-            &mut NoStateTreeTrace,
-        )
     }
 
     pub(crate) fn process_timers_traced<
@@ -872,27 +1015,6 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         true
     }
 
-    pub(crate) fn process_activity_outcome<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-    >(
-        &mut self,
-        outcome: crate::activity::ActivityOutcome,
-        microstep_limit: usize,
-        entity: Entity,
-        effects: &mut S,
-        activities: &mut A,
-    ) -> bool {
-        self.process_activity_outcome_traced(
-            outcome,
-            microstep_limit,
-            entity,
-            effects,
-            activities,
-            &mut NoStateTreeTrace,
-        )
-    }
-
     pub(crate) fn process_activity_outcome_traced<
         S: RuntimeEffectSink<D> + ?Sized,
         A: RuntimeActivitySink<D> + ?Sized,
@@ -920,13 +1042,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             return false;
         }
         slot.active = false;
-        let compiled = Arc::clone(
-            &self
-                .linked
-                .as_ref()
-                .expect("running instance is linked")
-                .compiled,
-        );
+        let compiled = &self.linked.expect("running instance is linked").compiled;
         let definition = &compiled.activities[outcome.token.activity.index()];
         if !self.is_state_active(definition.owner) {
             return false;
@@ -1007,10 +1123,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         activities: &mut A,
         trace: &mut T,
     ) {
-        let compiled = self
-            .linked
-            .as_ref()
-            .map(|linked| Arc::clone(&linked.compiled));
+        let compiled = self.linked.map(|linked| &linked.compiled);
         let mut current_event = context.event_name;
         let mut external_event = context.external_event;
         let mut event_data = context.event_data;
@@ -1089,7 +1202,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &self,
         trigger: Trigger<'_, D>,
     ) -> Result<Option<SelectedTransition>, RuntimeFault> {
-        let Some(compiled) = self.linked.as_ref().map(|linked| &linked.compiled) else {
+        let Some(compiled) = self.linked.map(|linked| &linked.compiled) else {
             return Ok(None);
         };
         for state in self.active.iter().rev() {
@@ -1175,7 +1288,6 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         runtime.selected_root_domain = false;
         let compiled = &self
             .linked
-            .as_ref()
             .expect("initialized instance has a definition")
             .compiled;
 
@@ -1311,13 +1423,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         activities: &mut A,
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
-        let compiled = Arc::clone(
-            &self
-                .linked
-                .as_ref()
-                .expect("initialized instance has a definition")
-                .compiled,
-        );
+        let compiled = &self
+            .linked
+            .expect("initialized instance has a definition")
+            .compiled;
         runtime.exited.clear();
         runtime.exited_states.fill(false);
         if runtime.selected_targetful != 0 {
@@ -1356,10 +1465,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         });
 
         capture_history_values(
-            &compiled,
-            &self.active,
+            compiled,
+            &self.runtime.active,
             &runtime.exited,
-            self.history.as_deref_mut(),
+            self.runtime.history.as_deref_mut(),
         );
 
         for state in &runtime.exited {
@@ -1367,7 +1476,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 state: &compiled.state(*state).name,
             });
             self.execute_actions(
-                &compiled,
+                compiled,
                 &compiled.state(*state).exit_actions,
                 context,
                 effects,
@@ -1378,7 +1487,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             trace.record(StateTreeTraceRecord::StateExited {
                 state: &compiled.state(*state).name,
             });
-            self.cancel_state_timers(&compiled, *state);
+            self.cancel_state_timers(compiled, *state);
             self.cancel_state_activities(*state, context.entity, activities, trace);
         }
         for state in &runtime.exited {
@@ -1397,7 +1506,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let start = selected.transition.action_start as usize;
             let end = start + selected.transition.action_len as usize;
             self.execute_actions(
-                &compiled,
+                compiled,
                 &compiled.transition_actions[start..end],
                 context,
                 effects,
@@ -1421,7 +1530,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     .any(|entry| entry.history_default.is_some()))
             {
                 materialize_history_entries(
-                    &compiled,
+                    compiled,
                     &history.values,
                     source_entries,
                     selected.transition.target,
@@ -1455,7 +1564,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         for index in 0..runtime.entries.len() {
             let entry = runtime.entries[index];
             if let Err(fault) =
-                self.enter_state(&compiled, entry, context, effects, activities, trace)
+                self.enter_state(compiled, entry, context, effects, activities, trace)
             {
                 self.active
                     .sort_unstable_by_key(|state| compiled.state(*state).document_order);
@@ -1479,11 +1588,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         activities: &mut A,
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
-        let Some(compiled) = self
-            .linked
-            .as_ref()
-            .map(|linked| Arc::clone(&linked.compiled))
-        else {
+        let Some(compiled) = self.linked.map(|linked| &linked.compiled) else {
             return Ok(());
         };
         let transition = selected.transition;
@@ -1491,7 +1596,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let action_start = transition.action_start as usize;
             let action_end = action_start + transition.action_len as usize;
             return self.execute_actions(
-                &compiled,
+                compiled,
                 &compiled.transition_actions[action_start..action_end],
                 context,
                 effects,
@@ -1500,10 +1605,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         }
         let exit_depth = transition.exit_depth as usize;
         capture_history_values(
-            &compiled,
-            &self.active,
-            &self.active[exit_depth..],
-            self.history.as_deref_mut(),
+            compiled,
+            &self.runtime.active,
+            &self.runtime.active[exit_depth..],
+            self.runtime.history.as_deref_mut(),
         );
         for index in (exit_depth..self.active.len()).rev() {
             let state = self.active[index];
@@ -1511,7 +1616,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 state: &compiled.state(state).name,
             });
             self.execute_actions(
-                &compiled,
+                compiled,
                 &compiled.state(state).exit_actions,
                 context,
                 effects,
@@ -1523,16 +1628,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             trace.record(StateTreeTraceRecord::StateExited {
                 state: &compiled.state(state).name,
             });
-            self.cancel_state_timers(&compiled, state);
+            self.cancel_state_timers(compiled, state);
             self.cancel_state_activities(state, context.entity, activities, trace);
         }
-        if let Some(active_states) = self.active_states.as_mut() {
-            for state in &self.active[exit_depth..] {
+        if let Some(active_states) = self.runtime.active_states.as_mut() {
+            for state in &self.runtime.active[exit_depth..] {
                 active_states[state.index()] = false;
             }
         }
-        if let Some(runtime) = self.parallel.as_mut() {
-            for state in &self.active[exit_depth..] {
+        if let Some(runtime) = self.runtime.parallel.as_mut() {
+            for state in &self.runtime.active[exit_depth..] {
                 runtime.completed_states[state.index()] = false;
             }
             runtime
@@ -1544,7 +1649,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         let action_start = transition.action_start as usize;
         let action_end = action_start + transition.action_len as usize;
         self.execute_actions(
-            &compiled,
+            compiled,
             &compiled.transition_actions[action_start..action_end],
             context,
             effects,
@@ -1562,7 +1667,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         {
             let mut history = self.history.take().expect("checked history runtime");
             materialize_history_entries(
-                &compiled,
+                compiled,
                 &history.values,
                 source_entries,
                 transition.target,
@@ -1573,7 +1678,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let entries = std::mem::take(&mut history.entries);
             self.history = Some(history);
             for entry in &entries {
-                self.enter_state(&compiled, *entry, context, effects, activities, trace)?;
+                self.enter_state(compiled, *entry, context, effects, activities, trace)?;
             }
             self.history
                 .as_mut()
@@ -1581,7 +1686,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 .entries = entries;
         } else {
             for entry in source_entries {
-                self.enter_state(&compiled, *entry, context, effects, activities, trace)?;
+                self.enter_state(compiled, *entry, context, effects, activities, trace)?;
             }
         }
         debug_assert!(
@@ -1689,15 +1794,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let TransitionTrigger::After(timer) = transition.trigger else {
                 continue;
             };
-            let slot = &mut self.timers[timer.index()];
+            let slot = &mut self.runtime.timers[timer.index()];
             slot.generation = slot.generation.wrapping_add(1);
             slot.armed = true;
-            let Some(deadline) = self.now.checked_add(compiled.timers[timer.index()]) else {
+            let Some(deadline) = self.runtime.now.checked_add(compiled.timers[timer.index()])
+            else {
                 continue;
             };
-            self.timer_updates.push(TimerUpdate::Arm {
+            self.runtime.timer_updates.push(TimerUpdate::Arm {
                 token: TimerToken {
-                    runtime_id: self.runtime_id,
+                    runtime_id: self.runtime.runtime_id,
                     timer,
                     generation: slot.generation,
                 },
@@ -1720,30 +1826,34 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let TransitionTrigger::After(timer) = transition.trigger else {
                 continue;
             };
-            let slot = &mut self.timers[timer.index()];
+            let slot = &mut self.runtime.timers[timer.index()];
             if !slot.armed {
                 continue;
             }
             slot.armed = false;
-            self.timer_updates.push(TimerUpdate::Cancel(TimerToken {
-                runtime_id: self.runtime_id,
-                timer,
-                generation: slot.generation,
-            }));
+            self.runtime
+                .timer_updates
+                .push(TimerUpdate::Cancel(TimerToken {
+                    runtime_id: self.runtime.runtime_id,
+                    timer,
+                    generation: slot.generation,
+                }));
         }
     }
 
     fn cancel_all_timers(&mut self) {
-        for (index, slot) in self.timers.iter_mut().enumerate() {
+        for (index, slot) in self.runtime.timers.iter_mut().enumerate() {
             if !slot.armed {
                 continue;
             }
             slot.armed = false;
-            self.timer_updates.push(TimerUpdate::Cancel(TimerToken {
-                runtime_id: self.runtime_id,
-                timer: TimerId(u32::try_from(index).expect("compiled timer index fits u32")),
-                generation: slot.generation,
-            }));
+            self.runtime
+                .timer_updates
+                .push(TimerUpdate::Cancel(TimerToken {
+                    runtime_id: self.runtime.runtime_id,
+                    timer: TimerId(u32::try_from(index).expect("compiled timer index fits u32")),
+                    generation: slot.generation,
+                }));
         }
     }
 
@@ -1778,6 +1888,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 ));
             }
             let slot = &mut self
+                .runtime
                 .activities
                 .as_mut()
                 .expect("compiled activities require activity slot storage")[index];
@@ -1840,7 +1951,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         sink: &mut A,
         trace: &mut T,
     ) {
-        let Some(linked) = self.linked.as_ref() else {
+        let Some(linked) = self.linked else {
             return;
         };
         let node = linked.compiled.state(state);
@@ -1851,6 +1962,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         let end = start + node.activity_len as usize;
         for index in start..end {
             let slot = &mut self
+                .runtime
                 .activities
                 .as_mut()
                 .expect("compiled activities require activity slot storage")[index];
@@ -1861,7 +1973,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             let id = ActivityId(index as u32);
             let token = ErasedActivityToken {
                 entity,
-                runtime_id: self.runtime_id,
+                runtime_id: self.runtime.runtime_id,
                 activity: id,
                 generation: slot.generation,
             };
@@ -1931,13 +2043,13 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 return Err(RuntimeFault::UnknownDataOverride { name: name.clone() });
             }
         }
-        for (name, value) in self.initial_data.values.iter() {
+        for (name, value) in self.runtime.initial_data.values.iter() {
             let index = datamodel
                 .names
                 .iter()
                 .position(|candidate| candidate == name)
                 .expect("initial data names were validated");
-            self.data[index] = value.clone();
+            self.runtime.data[index] = value.clone();
             trace.record(StateTreeTraceRecord::DataAssigned {
                 data: &datamodel.names[index],
                 value: &self.data[index],
@@ -2071,10 +2183,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                         });
                     let handler = self
                         .linked
-                        .as_ref()
                         .map(|linked| linked.effect(effect))
                         .expect("running instance is linked");
-                    let handler = Arc::clone(handler);
                     let name = compiled.effect_name(effect);
                     let context = StateTreeEffectContext {
                         entity: context.entity,
@@ -2084,7 +2194,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                         data,
                     };
                     if let Err(error) =
-                        effects.emit(&handler, context, StateTreeEffectArgs::new(values))
+                        effects.emit(handler, context, StateTreeEffectArgs::new(values))
                     {
                         return Err(RuntimeFault::Effect {
                             effect: name.into(),
@@ -2112,7 +2222,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             self.parallel = Some(runtime);
             return;
         }
-        let Some(linked) = self.linked.as_ref() else {
+        let Some(linked) = self.linked else {
             return;
         };
         let compiled = &linked.compiled;
@@ -2151,13 +2261,10 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         activities: &mut A,
         trace: &mut T,
     ) {
-        let compiled = Arc::clone(
-            &self
-                .linked
-                .as_ref()
-                .expect("initialized instance has a definition")
-                .compiled,
-        );
+        let compiled = &self
+            .linked
+            .expect("initialized instance has a definition")
+            .compiled;
         if compiled.children(compiled.root).iter().any(|child| {
             self.is_state_active(*child) && compiled.state(*child).kind == StateKind::Final
         }) {
@@ -2169,7 +2276,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
 
         for depth in (1..compiled.max_depth as u32).rev() {
             for state in
-                self.active.iter().copied().filter(|state| {
+                self.runtime.active.iter().copied().filter(|state| {
                     compiled.state(*state).depth == depth && *state != compiled.root
                 })
             {
@@ -2201,7 +2308,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                     }
                     StateKind::Atomic | StateKind::Final => unreachable!(),
                 };
-                self.internal_events.push_back(completion);
+                self.runtime.internal_events.push_back(completion);
                 if let Some(event) = compiled.event_name(completion) {
                     trace.record(StateTreeTraceRecord::InternalEventRaised { event });
                 }
@@ -2581,7 +2688,7 @@ mod tests {
 
         let instance = instance(&definition, 8);
 
-        assert!(instance.instance().activities.is_none());
+        assert!(instance.instance().runtime.activities.is_none());
     }
 
     #[test]
