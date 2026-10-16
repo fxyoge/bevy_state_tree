@@ -9,6 +9,57 @@ use full_moon::{
 };
 use std::{collections::BTreeMap, ops::Deref};
 
+pub(crate) fn environment() -> &'static bevy_luau::EnvironmentSpec {
+    static SPEC: std::sync::OnceLock<bevy_luau::EnvironmentSpec> = std::sync::OnceLock::new();
+    SPEC.get_or_init(|| {
+        let mut builder = bevy_luau::EnvironmentSpec::builder().globals([
+            "assert",
+            "error",
+            "ipairs",
+            "pairs",
+            "next",
+            "select",
+            "tonumber",
+            "tostring",
+            "type",
+            "typeof",
+            "print",
+            "pcall",
+            "xpcall",
+            "unpack",
+            "gcinfo",
+            "newproxy",
+            "getfenv",
+            "setfenv",
+            "getmetatable",
+            "setmetatable",
+            "rawequal",
+            "rawget",
+            "rawset",
+            "rawlen",
+            "_G",
+            "_VERSION",
+        ]);
+        for name in [
+            "math",
+            "string",
+            "table",
+            "utf8",
+            "bit32",
+            "buffer",
+            "vector",
+            "coroutine",
+            "os",
+            "debug",
+        ] {
+            builder = builder.library(name, &[]);
+        }
+        builder
+            .build()
+            .expect("valid state-tree expression environment")
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledLuauExpression {
     engine: EngineExpression,
@@ -28,7 +79,7 @@ pub(crate) fn compile_expression(
     boolean: bool,
     span_start: usize,
 ) -> Result<CompiledLuauExpression, Error> {
-    let engine = bevy_luau::compile_expression(source, boolean)?;
+    let engine = environment().compile(source, boolean)?;
     let ast =
         full_moon::parse(&format!("return ({source})")).map_err(|errors| Error::SyntaxError {
             message: errors

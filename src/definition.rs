@@ -1337,6 +1337,13 @@ impl StateTreeBuilder {
                     reason: "is reserved by the state-tree runtime",
                 });
             }
+            if crate::luau::environment().is_builtin(&declaration.name) {
+                return Err(BuildError::InvalidDataName {
+                    name: declaration.name,
+                    span_start: declaration.span_start,
+                    reason: "is reserved for a Lua builtin",
+                });
+            }
             if !seen.insert(declaration.name.clone()) {
                 return Err(BuildError::DuplicateDataName {
                     name: declaration.name,
@@ -3567,8 +3574,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_luau_keywords_and_system_data_names() {
-        for name in ["if", "true", "_event", "_x", "In"] {
+    fn rejects_luau_keywords_system_names_and_builtin_data_names() {
+        for name in [
+            "if", "true", "_event", "_x", "In", "math", "type", "os", "rawget",
+        ] {
             let mut builder = StateTreeBuilder::new("invalid-data");
             assert!(builder.luau_datamodel([StateTreeData::new(name)]).is_err());
         }

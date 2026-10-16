@@ -1,5 +1,13 @@
 # bevy_state_tree
 
+State-tree expressions use a library-owned, explicit Lua environment; using this
+crate alone requires no builtin registration or KUI dependency. Datamodel root
+names may not shadow exposed Lua builtins (`math`, `type`, `os`, etc.) or SCXML
+runtime names such as `_event`. Definition construction reports these collisions;
+nested fields such as `printer.type` remain valid. Each worker VM shares the
+environment's builtin tables and metatable across cached expressions while each
+state-tree instance retains its own persistent Rust datamodel.
+
 Asset-backed hierarchical statecharts for Bevy 0.20 (Rust 1.97.1 or newer).
 
 `bevy_state_tree` lets you author entity behavior as SCXML, load it through Bevy's asset system, and connect it to typed Bevy events, messages, and long-running activities. Definitions are compiled once, shared between entities, and executed independently in parallel.
