@@ -1090,7 +1090,7 @@ mod tests {
         fn error_data(
             error: &Self::Error,
         ) -> Result<Option<crate::LuauValue>, crate::StateTreeEventDataError> {
-            Ok(Some(crate::LuauValue::String(error.clone().into())))
+            Ok(Some(crate::LuauValue::String(error.clone())))
         }
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
     ) -> Result<crate::LuauValue, crate::StateTreeEventDataError> {
         Ok(crate::LuauValue::Record(
             [(
-                Box::from("steps"),
+                "steps".into(),
                 crate::LuauValue::Integer(event.steps.into()),
             )]
             .into(),
@@ -2005,7 +2005,7 @@ mod tests {
         assert_eq!(
             event.event_data().unwrap(),
             Some(crate::LuauValue::Record(
-                [(Box::from("steps"), crate::LuauValue::Integer(9))].into(),
+                [("steps".into(), crate::LuauValue::Integer(9))].into(),
             ))
         );
     }

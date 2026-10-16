@@ -329,6 +329,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_luau"
+version = "0.1.0"
+source = "git+ssh://git@github.com/fxyoge/bevy_luau.git?rev=ca9704273f282effb3c5cffce36d8090d31baca0#ca9704273f282effb3c5cffce36d8090d31baca0"
+dependencies = [
+ "full_moon",
+ "mlua",
+]
+
+[[package]]
 name = "bevy_macro_utils"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -417,6 +426,7 @@ dependencies = [
  "bevy_app",
  "bevy_asset",
  "bevy_ecs",
+ "bevy_luau",
  "bevy_reflect",
  "bevy_state_tree_macros",
  "bevy_tasks",
@@ -424,7 +434,6 @@ dependencies = [
  "bevy_utils",
  "divan",
  "full_moon",
- "mlua",
  "quick-xml",
  "thiserror 2.0.21",
 ]

@@ -180,7 +180,7 @@ impl FromStateTreeValue for bool {
 impl FromStateTreeValue for String {
     fn from_state_tree_value(value: LuauValue) -> Result<Self, Box<str>> {
         match value {
-            LuauValue::String(value) => Ok(value.into()),
+            LuauValue::String(value) => Ok(value),
             _ => Err("expected a string".into()),
         }
     }

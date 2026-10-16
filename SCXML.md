@@ -211,6 +211,13 @@ threads reuse sandboxed VMs with bounded memory, expression interruption, and a
 fresh authored environment for each evaluation; scripts cannot access Bevy's
 `World`.
 
+Luau compilation/evaluation and the portable `LuauValue` type are supplied by
+the shared `bevy_luau` crate. Supported simple expressions use native read plans;
+other expressions use cached bytecode with the same Luau semantics. The state
+tree retains ownership of assignment ordering, persistence, event projection,
+and authored diagnostics. Its evaluation policy preserves datamodel behavior;
+KUI uses the shared engine's stricter read-only presentation policy.
+
 `_event.name` exposes the currently processed typed event's authored name.
 `_event.data` exposes the opt-in portable projection of the current external
 event or accepted activity outcome. Activity data remains available through

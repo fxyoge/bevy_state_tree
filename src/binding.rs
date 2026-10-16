@@ -404,7 +404,7 @@ mod tests {
     fn project_sample(event: &SampleChanged) -> Result<LuauValue, StateTreeEventDataError> {
         Ok(LuauValue::Record(BTreeMap::from([
             (
-                Box::from("mode"),
+                "mode".into(),
                 LuauValue::String(
                     match event.value.mode {
                         SampleMode::Idle => "idle",
@@ -413,10 +413,7 @@ mod tests {
                     .into(),
                 ),
             ),
-            (
-                Box::from("label"),
-                LuauValue::String(event.value.label.clone().into()),
-            ),
+            ("label".into(), LuauValue::String(event.value.label.clone())),
         ])))
     }
 

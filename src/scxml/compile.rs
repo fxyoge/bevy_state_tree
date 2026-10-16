@@ -2012,8 +2012,8 @@ mod tests {
         let token = starts[0].0;
         let data = LuauValue::Record(
             [
-                (Box::from("ok"), LuauValue::Boolean(true)),
-                (Box::from("route"), LuauValue::String("n1".into())),
+                ("ok".into(), LuauValue::Boolean(true)),
+                ("route".into(), LuauValue::String("n1".into())),
             ]
             .into(),
         );
@@ -2270,7 +2270,7 @@ mod tests {
         event: &PayloadEvent,
     ) -> Result<LuauValue, crate::StateTreeEventDataError> {
         Ok(LuauValue::Record(
-            [(Box::from("amount"), LuauValue::Integer(event.amount))].into(),
+            [("amount".into(), LuauValue::Integer(event.amount))].into(),
         ))
     }
 

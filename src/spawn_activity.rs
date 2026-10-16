@@ -28,7 +28,7 @@ impl StateTreeActivity for SpawnActivity {
     fn error_data(
         error: &Self::Error,
     ) -> Result<Option<LuauValue>, crate::StateTreeEventDataError> {
-        Ok(Some(LuauValue::String(error.clone().into())))
+        Ok(Some(LuauValue::String(error.clone())))
     }
 }
 
