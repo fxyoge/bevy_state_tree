@@ -1,6 +1,6 @@
 # bevy_state_tree
 
-Asset-backed hierarchical statecharts for Bevy.
+Asset-backed hierarchical statecharts for Bevy 0.20 (Rust 1.97.1 or newer).
 
 `bevy_state_tree` lets you author entity behavior as SCXML, load it through Bevy's asset system, and connect it to typed Bevy events, messages, and long-running activities. Definitions are compiled once, shared between entities, and executed independently in parallel.
 

@@ -2,7 +2,7 @@
 name = "bevy_state_tree"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97.1"
 description = "Asset-backed hierarchical statecharts for Bevy"
 license = "MIT OR Apache-2.0"
 
@@ -11,13 +11,13 @@ members = ["macros"]
 resolver = "3"
 
 [dependencies]
-bevy_app = "0.19.1"
-bevy_asset = "0.19.1"
-bevy_ecs = { version = "0.19.1", features = ["multi_threaded"] }
-bevy_reflect = "0.19.1"
-bevy_tasks = "0.19.1"
-bevy_time = "0.19.1"
-bevy_utils = "0.19.1"
+bevy_app = "0.20.0"
+bevy_asset = "0.20.0"
+bevy_ecs = { version = "0.20.0", features = ["multi_threaded"] }
+bevy_reflect = "0.20.0"
+bevy_tasks = "0.20.0"
+bevy_time = "0.20.0"
+bevy_utils = "0.20.0"
 bevy_state_tree_macros = { version = "0.1.0", path = "macros" }
 bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "ca9704273f282effb3c5cffce36d8090d31baca0" }
 full_moon = { version = "2.2.0", features = ["luau"] }
@@ -25,7 +25,7 @@ quick-xml = "0.41"
 thiserror = "2.0"
 
 [dev-dependencies]
-bevy_ecs = { version = "0.19.1", features = ["bevy_reflect", "multi_threaded"] }
+bevy_ecs = { version = "0.20.0", features = ["bevy_reflect", "multi_threaded"] }
 divan = "0.1.21"
 
 [[bench]]

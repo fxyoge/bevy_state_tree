@@ -765,9 +765,13 @@ fn process_timers<D: StateTreeDomain>(
             } else if parallel {
                 instances
                     .par_iter_many_unique_mut(&entities)
-                    .for_each(&process_instance);
+                    .for_each(|result| {
+                        if let Ok(instance) = result {
+                            process_instance(instance);
+                        }
+                    });
             } else {
-                for instance in instances.iter_many_unique_mut(&entities) {
+                for instance in instances.iter_many_unique_mut(&entities).matched() {
                     process_instance(instance);
                 }
             }
@@ -860,9 +864,13 @@ fn process_activity_outcomes<D: StateTreeDomain>(
         if ComputeTaskPool::try_get().is_some() {
             instances
                 .par_iter_many_unique_mut(&entities)
-                .for_each(&process);
+                .for_each(|result| {
+                    if let Ok(instance) = result {
+                        process(instance);
+                    }
+                });
         } else {
-            for instance in instances.iter_many_unique_mut(&entities) {
+            for instance in instances.iter_many_unique_mut(&entities).matched() {
                 process(instance);
             }
         }
@@ -962,9 +970,13 @@ fn process_events<D: StateTreeDomain>(
         if broadcasts.is_empty() && parallel {
             instances
                 .par_iter_many_unique_mut(&*dirty_entities)
-                .for_each(&process_instance);
+                .for_each(|result| {
+                    if let Ok(instance) = result {
+                        process_instance(instance);
+                    }
+                });
         } else if broadcasts.is_empty() {
-            for instance in instances.iter_many_unique_mut(&*dirty_entities) {
+            for instance in instances.iter_many_unique_mut(&*dirty_entities).matched() {
                 process_instance(instance);
             }
         } else if parallel {
