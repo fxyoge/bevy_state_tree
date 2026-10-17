@@ -19,7 +19,7 @@ bevy_tasks = "0.20.0"
 bevy_time = "0.20.0"
 bevy_utils = "0.20.0"
 bevy_state_tree_macros = { version = "0.1.0", path = "macros" }
-bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "f10e081723520867c4ef4b6aeff4dfe82451cbd2" }
+bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "94793a405eaa1d10daeba0a0938f03c52b0b00d9" }
 full_moon = { version = "2.2.0", features = ["luau"] }
 quick-xml = "0.41"
 thiserror = "2.0"
