@@ -4,7 +4,7 @@ use crate::{
     instance::persistence::fingerprint,
     persistence::{
         Apply, DomainCodec, DomainSnapshot, Error, Registry, ResolvedRun, SavedEvent, SavedOutcome,
-        TreeSnapshot, Value, entity_id, invalid, loaded_run, query_all, run_id,
+        TreeSnapshot, Value, entity_id, invalid, loaded_entity, loaded_run, query_all, run_id,
     },
 };
 use bevy_ecs::world::World;
@@ -12,7 +12,7 @@ use bevy_ecs::world::World;
 struct Domain<D>(PhantomData<fn() -> D>);
 
 pub(super) fn register<D: StateTreeDomain>(app: &mut App) {
-    app.init_resource::<Registry>();
+    crate::persistence::ensure_adapter(app);
     app.world_mut()
         .resource_mut::<Registry>()
         .domains
@@ -157,7 +157,6 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
         &self,
         world: &mut World,
         snapshot: &DomainSnapshot,
-        entities: &[Entity],
     ) -> Result<(Apply, Vec<ResolvedRun>, Vec<u64>), Error> {
         let now = world.resource::<Time>().elapsed();
         let mut prepared = Vec::new();
@@ -172,9 +171,7 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
             ),
         >::new();
         for tree in &snapshot.trees {
-            let entity = *entities
-                .get(tree.owner)
-                .ok_or_else(|| invalid("invalid tree owner"))?;
+            let entity = loaded_entity(tree.owner)?;
             if !owners.insert(entity) {
                 return Err(invalid("duplicate tree owner"));
             }
@@ -191,7 +188,14 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
                             .resource::<Assets<StateTreeDefinition>>()
                             .contains(handle.id())
                     {
-                        return Err(Error::DefinitionNotLoaded(path.clone()));
+                        if let Some(bevy_asset::LoadState::Failed(error)) =
+                            world.resource::<AssetServer>().get_load_state(handle.id())
+                        {
+                            return Err(invalid(format!(
+                                "definition failed to load: {path}: {error}"
+                            )));
+                        }
+                        return Err(Error::AssetNotReady(path.clone()));
                     }
                     handle
                 } else {
@@ -208,7 +212,7 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
                                 }
                                 _ => Some(id),
                             })
-                            .ok_or_else(|| Error::DefinitionNotLoaded(tree.definition.clone()))?
+                            .ok_or_else(|| Error::AssetNotReady(tree.definition.clone()))?
                     };
                     world
                         .resource_mut::<Assets<StateTreeDefinition>>()
@@ -219,7 +223,7 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
                     let compiled = world
                         .resource::<Assets<StateTreeDefinition>>()
                         .get(&handle)
-                        .ok_or_else(|| Error::DefinitionNotLoaded(tree.definition.clone()))?
+                        .ok_or_else(|| Error::AssetNotReady(tree.definition.clone()))?
                         .compiled
                         .clone();
                     if fingerprint(&compiled)? != expected {
@@ -285,7 +289,6 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
         &self,
         world: &World,
         snapshot: &DomainSnapshot,
-        entities: &[Entity],
         runtimes: &[u64],
     ) -> Result<Apply, Error> {
         let protocol = world.resource::<StateTreeAppEventRegistry<D>>().protocol();
@@ -296,7 +299,7 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut prepared = Vec::new();
         for (tree, runtime) in snapshot.trees.iter().zip(runtimes) {
-            let entity = entities[tree.owner];
+            let entity = loaded_entity(tree.owner)?;
             let mut previous = 0;
             let events = tree
                 .events

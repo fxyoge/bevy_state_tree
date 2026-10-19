@@ -7,15 +7,16 @@ description = "Asset-backed hierarchical statecharts for Bevy"
 license = "MIT OR Apache-2.0"
 
 [workspace]
-members = ["macros", "gigasaver"]
+members = ["macros"]
 default-members = [".", "macros"]
 resolver = "3"
 
 [features]
 default = []
-persistence = ["dep:serde", "dep:serde_json", "dep:blake3", "bevy_state_tree_macros/persistence"]
+persistence = ["dep:bevy_gigasaver", "dep:serde", "dep:serde_json", "dep:blake3", "bevy_state_tree_macros/persistence", "bevy_luau/serde"]
 
 [dependencies]
+bevy_gigasaver = { git = "ssh://git@github.com/fxyoge/bevy_gigasaver.git", rev = "0ab8245aa62f6fd131da0086b989334746be6d5e", optional = true }
 bevy_app = "0.20.0"
 bevy_asset = "0.20.0"
 bevy_ecs = { version = "0.20.0", features = ["multi_threaded"] }
@@ -24,7 +25,7 @@ bevy_tasks = "0.20.0"
 bevy_time = "0.20.0"
 bevy_utils = "0.20.0"
 bevy_state_tree_macros = { version = "0.1.0", path = "macros" }
-bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "94793a405eaa1d10daeba0a0938f03c52b0b00d9" }
+bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "1069cd1aeb36ea8770c5f3843d3a6200ad23c758" }
 full_moon = { version = "2.2.0", features = ["luau"] }
 quick-xml = "0.41"
 thiserror = "2.0"
@@ -33,8 +34,13 @@ serde_json = { version = "1", optional = true }
 blake3 = { version = "1", optional = true }
 
 [dev-dependencies]
+tempfile = "3"
 bevy_ecs = { version = "0.20.0", features = ["bevy_reflect", "multi_threaded"] }
 divan = "0.1.21"
+
+[[example]]
+name = "save_slots"
+required-features = ["persistence"]
 
 [[bench]]
 name = "execution"
@@ -50,6 +56,11 @@ harness = false
 
 [[bench]]
 name = "persistence"
+harness = false
+required-features = ["persistence"]
+
+[[bench]]
+name = "checkpoint_frames"
 harness = false
 required-features = ["persistence"]
 

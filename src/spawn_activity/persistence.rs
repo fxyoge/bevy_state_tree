@@ -23,6 +23,9 @@ pub(super) fn register<D: StateTreeDomain>(app: &mut App) {
 }
 
 impl<D: StateTreeDomain> DataCodec for Codec<D> {
+    fn clear(&self, world: &mut World) {
+        world.insert_resource(SpawnRuns::<D>::default());
+    }
     fn capture(&self, world: &mut World) -> Result<Vec<u8>, Error> {
         let runs = world
             .resource::<SpawnRuns<D>>()

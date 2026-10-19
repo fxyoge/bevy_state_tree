@@ -3,7 +3,7 @@ use proc_macro_crate::{FoundCrate, crate_name};
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Error, LitStr, Path, parse_macro_input, spanned::Spanned};
 
-#[proc_macro_derive(StateTreeEvent, attributes(state_tree))]
+#[proc_macro_derive(StateTreeEvent, attributes(state_tree, serde))]
 /// Declares one external event payload for a state-tree domain.
 pub fn derive_state_tree_event(input: TokenStream) -> TokenStream {
     expand_state_tree_event(parse_macro_input!(input as DeriveInput))

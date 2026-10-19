@@ -47,7 +47,7 @@ pub trait StateTreeEvent<D: StateTreeDomain>: Event {
     /// must support these methods if their events can be pending during saves.
     #[cfg(feature = "persistence")]
     fn persistence_encode(&self) -> Result<Vec<u8>, crate::persistence::Error> {
-        Err(crate::persistence::Error::Data(format!(
+        Err(crate::persistence::Error::InvalidData(format!(
             "event {} has no persistence codec",
             Self::AUTHORED_NAME
         )))
@@ -58,7 +58,7 @@ pub trait StateTreeEvent<D: StateTreeDomain>: Event {
     where
         Self: Sized,
     {
-        Err(crate::persistence::Error::Data(format!(
+        Err(crate::persistence::Error::InvalidData(format!(
             "event {} has no persistence codec",
             Self::AUTHORED_NAME
         )))

@@ -1,5 +1,70 @@
 #![cfg(feature = "persistence")]
 
+#[derive(Component, Serialize, Deserialize)]
+struct Attached(u32);
+#[derive(Component, Serialize, Deserialize)]
+struct ReferenceCollection {
+    #[serde(with = "bevy_state_tree::persistence::entities")]
+    members: Vec<Entity>,
+    #[serde(with = "bevy_state_tree::persistence::entity_map")]
+    edges: bevy_ecs::entity::EntityHashMap<ReferenceTarget>,
+    #[serde(with = "bevy_state_tree::persistence::asset")]
+    definition: bevy_asset::Handle<StateTreeDefinition>,
+}
+#[derive(Serialize, Deserialize)]
+struct ReferenceTarget(#[serde(with = "bevy_state_tree::persistence::entity")] Entity);
+
+#[test]
+fn attached_components_do_not_select_platform_entities_and_nested_references_remap() {
+    let mut source = app();
+    source
+        .persist_component::<ReferenceCollection>("refs")
+        .persist_attached_component::<Attached>("attached");
+    let root = install(&mut source, definition());
+    let handle = source
+        .world()
+        .resource::<bevy_asset::AssetServer>()
+        .load("unloaded-reference.scxml");
+    source.world_mut().entity_mut(root).insert((
+        Attached(17),
+        ReferenceCollection {
+            members: vec![root],
+            edges: [(root, ReferenceTarget(root))].into(),
+            definition: handle,
+        },
+    ));
+    source.world_mut().spawn(Attached(99));
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    let mut target = app();
+    target
+        .persist_component::<ReferenceCollection>("refs")
+        .persist_attached_component::<Attached>("attached");
+    let platform = target.world_mut().spawn(Attached(88)).id();
+    install(&mut target, definition());
+    checkpoint.restore(target.world_mut()).unwrap();
+    let (entity, refs, attached) = target
+        .world_mut()
+        .query::<(Entity, &ReferenceCollection, &Attached)>()
+        .single(target.world())
+        .unwrap();
+    assert_eq!(attached.0, 17);
+    assert_eq!(refs.members, [entity]);
+    assert_eq!(refs.edges[&entity].0, entity);
+    assert_eq!(
+        refs.definition.path().unwrap().to_string(),
+        "unloaded-reference.scxml"
+    );
+    assert_eq!(target.world().get::<Attached>(platform).unwrap().0, 88);
+    assert_eq!(
+        target
+            .world_mut()
+            .query::<&Attached>()
+            .iter(target.world())
+            .count(),
+        2
+    );
+}
+
 use bevy_app::{App, TaskPoolPlugin, Update};
 use bevy_asset::{AssetPlugin, Assets};
 use bevy_ecs::{prelude::*, system::RunSystemOnce};
@@ -387,7 +452,7 @@ fn malformed_data_and_changed_definitions_do_not_replace_existing_state() {
     let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
     let entity_count = app.world_mut().query::<Entity>().iter(app.world()).count();
     let mut wire = serde_json::to_value(&checkpoint).unwrap();
-    wire["data"]["runs"] = serde_json::json!([123]);
+    wire["data"]["runs"][0][1] = serde_json::json!([123]);
     let corrupt: Checkpoint = serde_json::from_value(wire).unwrap();
     assert!(corrupt.restore(app.world_mut()).is_err());
     assert_eq!(owner(&mut app), old_owner);
@@ -697,14 +762,12 @@ fn domains_sharing_an_owner_restore_distinct_typed_runs_and_reject_cross_domain_
     let old = app.world().resource::<OtherRun>().0.unwrap();
     let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
     let mut corrupt = serde_json::to_value(&checkpoint).unwrap();
-    let other_wire: Vec<u8> = serde_json::from_value(corrupt["data"]["other-run"].clone()).unwrap();
-    let encoded: serde_json::Value = serde_json::from_slice(&other_wire).unwrap();
-    let id = encoded["Present"].as_u64().unwrap() as usize;
+    let mut records: Vec<(i64, Vec<u8>)> =
+        serde_json::from_value(corrupt["data"]["other-run"].clone()).unwrap();
+    let id: usize = serde_json::from_slice(&records[0].1).unwrap();
     let wrong_id = if id == 0 { 1 } else { 0 };
-    corrupt["data"]["other-run"] = serde_json::to_value(
-        serde_json::to_vec(&serde_json::json!({"Present": wrong_id})).unwrap(),
-    )
-    .unwrap();
+    records[0].1 = serde_json::to_vec(&wrong_id).unwrap();
+    corrupt["data"]["other-run"] = serde_json::to_value(records).unwrap();
     assert!(
         serde_json::from_value::<Checkpoint>(corrupt)
             .unwrap()
@@ -736,7 +799,7 @@ fn domains_sharing_an_owner_restore_distinct_typed_runs_and_reject_cross_domain_
 
 #[test]
 fn null_like_resources_are_distinct_from_absent_resources() {
-    #[derive(Resource, Serialize, Deserialize)]
+    #[derive(Resource, Default, Serialize, Deserialize)]
     struct Ready;
     let mut app = App::new();
     app.persist_resource::<Ready>("ready")

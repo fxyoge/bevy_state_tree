@@ -199,15 +199,15 @@ pub(crate) fn register_global_binding<D, B, C, S, M>(
     #[cfg(feature = "persistence")]
     {
         use crate::persistence::AppPersistenceExt;
-        app.init_resource::<BindingPrevious<D, B>>()
-            .persist_resource::<BindingPrevious<D, B>>(&format!(
-                "bst.binding.previous.{}.{name}",
-                D::AUTHORED_NAME
-            ))
-            .persist_component::<GlobalBindingListeners<D, B>>(&format!(
-                "bst.binding.listeners.{}.{name}",
-                D::AUTHORED_NAME
-            ));
+        app.init_resource::<BindingPrevious<D, B>>();
+        app.persist_resource::<BindingPrevious<D, B>>(&format!(
+            "bst.binding.previous.{}.{name}",
+            D::AUTHORED_NAME
+        ));
+        app.persist_component::<GlobalBindingListeners<D, B>>(&format!(
+            "bst.binding.listeners.{}.{name}",
+            D::AUTHORED_NAME
+        ));
     }
     crate::activity::register_activity::<D, GlobalBindingActivity<B>, _>(
         app,
@@ -430,6 +430,18 @@ mod tests {
     struct SampleSource {
         value: SampleValue,
         reads: usize,
+    }
+
+    impl Default for SampleSource {
+        fn default() -> Self {
+            Self {
+                value: SampleValue {
+                    mode: SampleMode::Idle,
+                    label: "first".into(),
+                },
+                reads: 0,
+            }
+        }
     }
 
     fn sample_value(mut source: ResMut<SampleSource>) -> SampleValue {

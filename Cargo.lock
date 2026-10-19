@@ -34,6 +34,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
+name = "approx"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -331,11 +340,14 @@ dependencies = [
 [[package]]
 name = "bevy_gigasaver"
 version = "0.1.0"
-source = "git+ssh://git@github.com/fxyoge/bevy_gigasaver.git?rev=e4b1f23bc22db30fe95c17e1054bbbcd91fb045c#e4b1f23bc22db30fe95c17e1054bbbcd91fb045c"
 dependencies = [
  "bevy_app",
+ "bevy_asset",
  "bevy_ecs",
+ "bevy_gigasaver_macros",
  "bevy_time",
+ "bevy_transform",
+ "inventory",
  "rusqlite",
  "serde",
  "serde_json",
@@ -343,12 +355,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_gigasaver_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "bevy_luau"
 version = "0.1.0"
-source = "git+ssh://git@github.com/fxyoge/bevy_luau.git?rev=94793a405eaa1d10daeba0a0938f03c52b0b00d9#94793a405eaa1d10daeba0a0938f03c52b0b00d9"
 dependencies = [
  "full_moon",
  "mlua",
+ "serde",
 ]
 
 [[package]]
@@ -361,6 +383,22 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "toml_edit",
+]
+
+[[package]]
+name = "bevy_math"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "598cbdcec4d0f0d966905996240ac76f77a644c583f95fb612d4f59f5f649038"
+dependencies = [
+ "approx",
+ "bevy_reflect",
+ "derive_more 2.1.1",
+ "glam",
+ "rand",
+ "serde",
+ "thiserror 2.0.21",
+ "variadics_please",
 ]
 
 [[package]]
@@ -440,6 +478,7 @@ dependencies = [
  "bevy_app",
  "bevy_asset",
  "bevy_ecs",
+ "bevy_gigasaver",
  "bevy_luau",
  "bevy_reflect",
  "bevy_state_tree_macros",
@@ -452,20 +491,6 @@ dependencies = [
  "quick-xml",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "bevy_state_tree_gigasaver"
-version = "0.1.0"
-dependencies = [
- "bevy_app",
- "bevy_asset",
- "bevy_ecs",
- "bevy_gigasaver",
- "bevy_state_tree",
- "bevy_time",
- "serde",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -512,6 +537,23 @@ dependencies = [
  "crossbeam-channel",
  "log",
  "serde",
+]
+
+[[package]]
+name = "bevy_transform"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83379023d77a0739569a5bcb859eed652781a1b3271e94a86dfbb56fc5d067e0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_math",
+ "bevy_reflect",
+ "bevy_tasks",
+ "bevy_utils",
+ "derive_more 2.1.1",
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1091,6 +1133,7 @@ version = "0.33.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
 dependencies = [
+ "bytemuck",
  "serde_core",
 ]
 
@@ -1621,6 +1664,22 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rand"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+dependencies = [
+ "getrandom",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "raw-window-handle"
