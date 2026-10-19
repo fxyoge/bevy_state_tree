@@ -30,6 +30,9 @@ use crate::{
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(feature = "persistence")]
+pub(crate) mod persistence;
+
 /// Immutable instance-local values applied after authored datamodel initializers.
 #[derive(Clone, Debug, Default)]
 pub struct StateTreeDataOverrides {
@@ -198,6 +201,7 @@ impl<'a, D: StateTreeDomain> Trigger<'a, D> {
 
 /// Current execution status of a state-tree instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub enum InstanceStatus {
     /// The definition asset has never been initialized.
     ///
@@ -220,6 +224,7 @@ pub enum InstanceStatus {
 
 /// A terminal state-tree execution fault.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub enum RuntimeFault {
     /// Another transition set was enabled after the macrostep reached its limit.
     MicrostepLimitExceeded { limit: usize },
@@ -255,6 +260,7 @@ pub enum RuntimeFault {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub enum DatamodelOperation {
     Initialize,
     Condition,

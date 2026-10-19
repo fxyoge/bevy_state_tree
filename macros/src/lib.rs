@@ -60,15 +60,87 @@ fn expand_state_tree_event_with_runtime(
         }
     };
 
+    let persistence = persistence_methods(&input, &runtime);
+
     Ok(quote! {
         impl #runtime::StateTreeEvent<#domain> for #payload {
             const AUTHORED_NAME: &'static str = #authored_name;
 
             #event_data
+            #persistence
         }
 
         #routing_impl
     })
+}
+
+fn persistence_methods(
+    input: &DeriveInput,
+    runtime: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if !cfg!(feature = "persistence") {
+        return quote!();
+    }
+    let mut helper = input.clone();
+    let remote = LitStr::new(&input.ident.to_string(), input.ident.span());
+    let serde_path = LitStr::new(
+        &format!(
+            "{}::persistence::__private::serde",
+            runtime.to_string().replace(' ', "")
+        ),
+        input.ident.span(),
+    );
+    let entity_path = LitStr::new(
+        &format!(
+            "{}::persistence::entity",
+            runtime.to_string().replace(' ', "")
+        ),
+        input.ident.span(),
+    );
+    helper.ident = format_ident!("__StateTreePersistencePayload");
+    helper.vis = syn::Visibility::Inherited;
+    helper.attrs.clear();
+    let mut fields = Vec::new();
+    match &mut helper.data {
+        Data::Struct(data) => fields.extend(data.fields.iter_mut()),
+        Data::Enum(data) => {
+            for variant in &mut data.variants {
+                variant.attrs.retain(|attr| attr.path().is_ident("serde"));
+                fields.extend(variant.fields.iter_mut());
+            }
+        }
+        Data::Union(_) => unreachable!(),
+    }
+    for field in fields {
+        field.attrs.retain(|attr| attr.path().is_ident("serde"));
+        if matches!(&field.ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Entity"))
+            && field.attrs.is_empty()
+        {
+            field
+                .attrs
+                .push(syn::parse_quote!(#[serde(with = #entity_path)]));
+        }
+    }
+    let declaration = quote! {
+        #[derive(#runtime::persistence::__private::serde::Serialize, #runtime::persistence::__private::serde::Deserialize)]
+        #[serde(crate = #serde_path, remote = #remote)]
+        #helper
+    };
+    quote! {
+        fn persistence_encode(&self) -> ::core::result::Result<::std::vec::Vec<u8>, #runtime::persistence::Error> {
+            #declaration
+            let mut bytes = ::std::vec::Vec::new();
+            __StateTreePersistencePayload::serialize(self, &mut #runtime::persistence::__private::serde_json::Serializer::new(&mut bytes))?;
+            Ok(bytes)
+        }
+        fn persistence_decode(bytes: &[u8]) -> ::core::result::Result<Self, #runtime::persistence::Error> {
+            #declaration
+            let mut deserializer = #runtime::persistence::__private::serde_json::Deserializer::from_slice(bytes);
+            let value = __StateTreePersistencePayload::deserialize(&mut deserializer)?;
+            deserializer.end()?;
+            Ok(value)
+        }
+    }
 }
 
 fn runtime_crate() -> syn::Result<proc_macro2::TokenStream> {

@@ -74,6 +74,7 @@ impl StateTreeActivity for BenchmarkActivity {
 }
 
 #[derive(Resource, Default)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 struct BenchmarkActivityTokens(Vec<StateTreeActivityToken<Simulation, BenchmarkActivity>>);
 
 #[derive(Clone, Copy)]
@@ -171,6 +172,12 @@ impl BenchmarkApp {
     }
 
     pub fn register_benchmark_activity(&mut self) {
+        #[cfg(feature = "persistence")]
+        {
+            use bevy_state_tree::persistence::AppPersistenceExt;
+            self.app
+                .persist_resource::<BenchmarkActivityTokens>("benchmark-activity-tokens");
+        }
         self.app
             .init_resource::<BenchmarkActivityTokens>()
             .add_systems(

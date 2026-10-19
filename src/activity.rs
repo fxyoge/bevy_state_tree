@@ -127,6 +127,10 @@ pub enum StateTreeActivityLifecycle<D, A: StateTreeActivity> {
 impl<D: Send + Sync + 'static, A: StateTreeActivity> Message for StateTreeActivityLifecycle<D, A> {}
 
 pub(crate) trait RegisteredActivity<D: StateTreeDomain>: Send + Sync {
+    #[cfg(feature = "persistence")]
+    fn type_name(&self) -> &'static str;
+    #[cfg(feature = "persistence")]
+    fn clear_lifecycle(&self, world: &mut bevy_ecs::world::World);
     fn start(
         &self,
         context: StateTreeEffectContext<'_, D>,
@@ -177,7 +181,7 @@ pub(crate) struct ErasedActivityToken {
 }
 
 impl ErasedActivityToken {
-    fn typed<D, A>(self) -> StateTreeActivityToken<D, A> {
+    pub(crate) fn typed<D, A>(self) -> StateTreeActivityToken<D, A> {
         StateTreeActivityToken {
             entity: self.entity,
             runtime_id: self.runtime_id,
@@ -205,6 +209,18 @@ where
         + Sync
         + 'static,
 {
+    #[cfg(feature = "persistence")]
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<A>()
+    }
+
+    #[cfg(feature = "persistence")]
+    fn clear_lifecycle(&self, world: &mut bevy_ecs::world::World) {
+        world
+            .resource_mut::<bevy_ecs::message::Messages<StateTreeActivityLifecycle<D, A>>>()
+            .clear();
+    }
+
     fn start(
         &self,
         context: StateTreeEffectContext<'_, D>,
@@ -254,6 +270,11 @@ impl<D: StateTreeDomain> Default for StateTreeActivityRegistry<D> {
 }
 
 impl<D: StateTreeDomain> StateTreeActivityRegistry<D> {
+    #[cfg(feature = "persistence")]
+    pub(crate) fn handlers_for_persistence(&self) -> Vec<Arc<dyn RegisteredActivity<D>>> {
+        self.activities.values().cloned().collect()
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredActivity<D>>> {
         self.activities.get(name).cloned()
     }

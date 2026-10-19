@@ -39,6 +39,9 @@ use crate::{
     scxml::ScxmlLoader,
 };
 
+#[cfg(feature = "persistence")]
+mod persistence;
+
 /// Ordered phases installed into each state-tree domain schedule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 pub enum StateTreeSet {
@@ -183,6 +186,8 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
         crate::spawn_activity::register::<D>(app, self.schedule);
         D::configure(&mut crate::StateTreeConfig::new(app, self.schedule));
         crate::protocol::install_domain::<D>(app);
+        #[cfg(feature = "persistence")]
+        persistence::register::<D>(app);
     }
 }
 

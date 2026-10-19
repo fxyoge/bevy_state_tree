@@ -1,0 +1,26 @@
+[package]
+name = "bevy_state_tree_gigasaver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "Optional Gigasaver storage adapter for backend-neutral state-tree checkpoints"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy_app = "0.20.0"
+bevy_ecs = "0.20.0"
+bevy_state_tree = { version = "0.1.0", path = "..", features = ["persistence"] }
+bevy_gigasaver = { git = "ssh://git@github.com/fxyoge/bevy_gigasaver.git", rev = "e4b1f23bc22db30fe95c17e1054bbbcd91fb045c" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+bevy_asset = "0.20.0"
+bevy_time = "0.20.0"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

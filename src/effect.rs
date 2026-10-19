@@ -228,6 +228,8 @@ impl FromStateTreeValue for f32 {
 }
 
 pub(crate) trait RegisteredEffect<D: StateTreeDomain>: Send + Sync {
+    #[cfg(feature = "persistence")]
+    fn clear_messages(&self, world: &mut bevy_ecs::world::World);
     fn publish(
         &self,
         context: StateTreeEffectContext<'_, D>,
@@ -253,6 +255,12 @@ where
         + Sync
         + 'static,
 {
+    #[cfg(feature = "persistence")]
+    fn clear_messages(&self, world: &mut bevy_ecs::world::World) {
+        world
+            .resource_mut::<bevy_ecs::message::Messages<M>>()
+            .clear();
+    }
     fn publish(
         &self,
         context: StateTreeEffectContext<'_, D>,
@@ -284,6 +292,10 @@ impl<D: StateTreeDomain> Default for StateTreeEffectRegistry<D> {
 }
 
 impl<D: StateTreeDomain> StateTreeEffectRegistry<D> {
+    #[cfg(feature = "persistence")]
+    pub(crate) fn handlers_for_persistence(&self) -> Vec<Arc<dyn RegisteredEffect<D>>> {
+        self.effects.values().cloned().collect()
+    }
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredEffect<D>>> {
         self.effects.get(name).cloned()
     }

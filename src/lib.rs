@@ -40,6 +40,20 @@ mod protocol;
 mod spawn_activity;
 mod trace;
 
+#[cfg(feature = "persistence")]
+pub mod persistence;
+
+/// Ordinary serializable data when persistence is enabled.
+#[cfg(feature = "persistence")]
+pub trait PersistenceData: serde::Serialize + serde::de::DeserializeOwned {}
+#[cfg(feature = "persistence")]
+impl<T: serde::Serialize + serde::de::DeserializeOwned> PersistenceData for T {}
+#[doc(hidden)]
+#[cfg(not(feature = "persistence"))]
+pub trait PersistenceData {}
+#[cfg(not(feature = "persistence"))]
+impl<T> PersistenceData for T {}
+
 #[cfg(test)]
 mod test_harness;
 

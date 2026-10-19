@@ -7,8 +7,13 @@ description = "Asset-backed hierarchical statecharts for Bevy"
 license = "MIT OR Apache-2.0"
 
 [workspace]
-members = ["macros"]
+members = ["macros", "gigasaver"]
+default-members = [".", "macros"]
 resolver = "3"
+
+[features]
+default = []
+persistence = ["dep:serde", "dep:serde_json", "dep:blake3", "bevy_state_tree_macros/persistence"]
 
 [dependencies]
 bevy_app = "0.20.0"
@@ -23,6 +28,9 @@ bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "94793a40
 full_moon = { version = "2.2.0", features = ["luau"] }
 quick-xml = "0.41"
 thiserror = "2.0"
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+serde_json = { version = "1", optional = true }
+blake3 = { version = "1", optional = true }
 
 [dev-dependencies]
 bevy_ecs = { version = "0.20.0", features = ["bevy_reflect", "multi_threaded"] }
@@ -39,6 +47,11 @@ harness = false
 [[bench]]
 name = "event_storage"
 harness = false
+
+[[bench]]
+name = "persistence"
+harness = false
+required-features = ["persistence"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -74,6 +74,23 @@ impl Deref for CompiledLuauExpression {
     }
 }
 
+#[cfg(feature = "persistence")]
+impl serde::Serialize for CompiledLuauExpression {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Engine identities and worker caches are process-local. Only compiled
+        // semantics contribute to definition compatibility.
+        serde::Serialize::serialize(
+            &(
+                &self.bytecode,
+                &self.dependencies,
+                self.span_start,
+                self.reads_event_data,
+            ),
+            serializer,
+        )
+    }
+}
+
 pub(crate) fn compile_expression(
     source: &str,
     boolean: bool,

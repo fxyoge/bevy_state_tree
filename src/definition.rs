@@ -22,7 +22,9 @@ use crate::{
 
 /// A compact state identifier local to one [`StateTreeDefinition`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub struct StateId {
+    #[cfg_attr(feature = "persistence", serde(skip))]
     definition: u64,
     index: u32,
 }
@@ -35,7 +37,9 @@ impl StateId {
 
 /// A compact shallow-history identifier local to one [`StateTreeDefinition`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub struct HistoryId {
+    #[cfg_attr(feature = "persistence", serde(skip))]
     definition: u64,
     index: u32,
 }
@@ -48,6 +52,7 @@ impl HistoryId {
 
 /// A state-tree transition or compound initial target.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub enum StateTreeTarget {
     State(StateId),
     History(HistoryId),
@@ -74,7 +79,8 @@ impl PartialEq<StateId> for StateTreeTarget {
 static NEXT_DEFINITION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct EventId(u32);
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
+pub(crate) struct EventId(pub(crate) u32);
 
 impl EventId {
     fn index(self) -> usize {
@@ -83,6 +89,7 @@ impl EventId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct TimerId(pub(crate) u32);
 
 impl TimerId {
@@ -92,6 +99,7 @@ impl TimerId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct DataId(u32);
 
 impl DataId {
@@ -101,6 +109,7 @@ impl DataId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct ExpressionId(u32);
 
 impl ExpressionId {
@@ -110,6 +119,7 @@ impl ExpressionId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct EffectId(u32);
 
 impl EffectId {
@@ -119,6 +129,7 @@ impl EffectId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct ActivityId(pub(crate) u32);
 
 impl ActivityId {
@@ -128,6 +139,7 @@ impl ActivityId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) enum Action {
     Raise(EventId),
     Assign {
@@ -143,6 +155,7 @@ pub(crate) enum Action {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct NamedArgument {
     pub name: Arc<str>,
     pub expression: ExpressionId,
@@ -179,12 +192,14 @@ impl EventSet {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 enum EventPattern {
     Exact(Box<str>),
     Descriptor(Box<str>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) enum StateKind {
     Atomic,
     Compound {
@@ -198,6 +213,7 @@ pub(crate) enum StateKind {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct StateNode {
     pub name: Box<str>,
     pub parent: Option<StateId>,
@@ -216,6 +232,7 @@ pub(crate) struct StateNode {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct ActivityDefinition {
     pub id: Box<str>,
     pub name: Box<str>,
@@ -228,6 +245,7 @@ pub(crate) struct ActivityDefinition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct Entry {
     pub state: StateId,
     pub take_initial: bool,
@@ -235,6 +253,7 @@ pub(crate) struct Entry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct HistoryIndex(NonZeroU32);
 
 impl HistoryIndex {
@@ -248,6 +267,7 @@ impl HistoryIndex {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct HistorySlotId(u32);
 
 impl HistorySlotId {
@@ -257,6 +277,7 @@ impl HistorySlotId {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct HistoryDefinition {
     pub name: Box<str>,
     pub owner: StateId,
@@ -269,6 +290,7 @@ pub(crate) struct HistoryDefinition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct HistorySlotDefinition {
     pub owner: StateId,
     pub child_plan_start: u32,
@@ -276,6 +298,7 @@ pub(crate) struct HistorySlotDefinition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct HistoryChildPlan {
     pub child: StateId,
     pub entry_start: u32,
@@ -283,6 +306,7 @@ pub(crate) struct HistoryChildPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) enum TransitionTrigger {
     Event(EventId),
     Eventless,
@@ -290,6 +314,7 @@ pub(crate) enum TransitionTrigger {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct Transition {
     pub trigger: TransitionTrigger,
     pub condition: Option<ExpressionId>,
@@ -303,12 +328,14 @@ pub(crate) struct Transition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 struct EventRequirement {
     event: EventId,
     span_start: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct CompiledLuauDataModel {
     pub names: Box<[Box<str>]>,
     pub initializers: Box<[Option<ExpressionId>]>,
@@ -316,7 +343,9 @@ pub(crate) struct CompiledLuauDataModel {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct CompiledDefinition {
+    #[cfg_attr(feature = "persistence", serde(skip))]
     pub identity: u64,
     pub name: Box<str>,
     pub domain: Option<Box<str>>,
@@ -346,6 +375,22 @@ pub(crate) struct CompiledDefinition {
 }
 
 impl CompiledDefinition {
+    #[cfg(feature = "persistence")]
+    pub(crate) fn persistent_state(&self, index: u32) -> Option<StateId> {
+        self.states.get(index as usize).map(|_| StateId {
+            definition: self.identity,
+            index,
+        })
+    }
+
+    #[cfg(feature = "persistence")]
+    pub(crate) fn persistent_event(&self, name: &str) -> Option<EventId> {
+        self.events
+            .iter()
+            .position(|event| matches!(event, EventPattern::Exact(value) if value.as_ref() == name))
+            .map(|index| EventId(index as u32))
+    }
+
     pub fn state(&self, target: impl Into<StateTreeTarget>) -> &StateNode {
         let id = match target.into() {
             StateTreeTarget::State(state) => state,

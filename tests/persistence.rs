@@ -1,0 +1,751 @@
+#![cfg(feature = "persistence")]
+
+use bevy_app::{App, TaskPoolPlugin, Update};
+use bevy_asset::{AssetPlugin, Assets};
+use bevy_ecs::{prelude::*, system::RunSystemOnce};
+use bevy_state_tree::{
+    persistence::{AppPersistenceExt, Checkpoint},
+    prelude::*,
+};
+use bevy_time::{Time, TimePlugin};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, time::Duration};
+
+struct Simulation;
+impl StateTreeDomain for Simulation {
+    const AUTHORED_NAME: &'static str = "save-test";
+    fn configure(config: &mut StateTreeConfig<'_, Self>) {
+        config
+            .event::<Kick>()
+            .event::<Mark>()
+            .activity("work", |_, _| Ok(Work))
+            .effect("grant", |context, _| {
+                Ok(Grant(
+                    context.event::<Kick>().map_or(1, |event| event.amount),
+                ))
+            });
+    }
+}
+
+// Neither requests nor domains need serialization implementations. The actual
+// running state is ordinary game data, registered once below.
+struct Work;
+impl StateTreeActivity for Work {
+    type Output = ();
+    type Error = ();
+}
+type Token = StateTreeActivityToken<Simulation, Work>;
+
+#[derive(EntityEvent, StateTreeEvent)]
+#[state_tree(domain = Simulation, name = "kick", data = kick_data)]
+struct Kick {
+    entity: Entity,
+    amount: u32,
+}
+
+fn kick_data(event: &Kick) -> Result<LuauValue, StateTreeEventDataError> {
+    Ok(LuauValue::Integer(event.amount.into()))
+}
+
+#[derive(Clone, Copy, Event, StateTreeEvent)]
+#[state_tree(domain = Simulation, name = "mark", broadcast)]
+enum Mark {
+    A,
+    B,
+}
+
+#[derive(Message)]
+struct Grant(u32);
+
+#[derive(Resource, Default)]
+struct Observations {
+    starts: usize,
+    grants: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Progress {
+    work: u32,
+}
+
+#[derive(Resource, Default, Serialize, Deserialize)]
+struct Runs {
+    progress: HashMap<Token, Progress>,
+    nested: Vec<Option<Token>>,
+}
+
+#[derive(Component, Serialize, Deserialize)]
+struct SavedOwner {
+    #[serde(with = "bevy_state_tree::persistence::entity")]
+    peer: Entity,
+}
+
+fn lifecycle(
+    mut messages: MessageReader<StateTreeActivityLifecycle<Simulation, Work>>,
+    mut runs: ResMut<Runs>,
+    mut observations: ResMut<Observations>,
+) {
+    for message in messages.read() {
+        match message {
+            StateTreeActivityLifecycle::Started { token, .. } => {
+                observations.starts += 1;
+                runs.progress.insert(*token, Progress { work: 0 });
+                runs.nested.push(Some(*token));
+            }
+            StateTreeActivityLifecycle::Cancelled { token } => {
+                runs.progress.remove(token);
+                runs.nested.retain(|value| value.as_ref() != Some(token));
+            }
+        }
+    }
+}
+
+fn effects(mut messages: MessageReader<Grant>, mut observations: ResMut<Observations>) {
+    for Grant(amount) in messages.read() {
+        observations.grants += amount;
+    }
+}
+
+fn app() -> App {
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        TimePlugin,
+        AssetPlugin::default(),
+        StateTreePlugin::<Simulation>::new(Update),
+    ))
+    .init_resource::<Runs>()
+    .init_resource::<Observations>()
+    .persist_resource::<Runs>("runs")
+    .persist_component::<SavedOwner>("owners")
+    .add_systems(Update, lifecycle.in_set(StateTreeSet::HandleActivities))
+    .add_systems(Update, effects.in_set(StateTreeSet::HandleEffects));
+    app
+}
+
+fn definition() -> StateTreeDefinition {
+    let mut builder = StateTreeBuilder::new("persistent-worker");
+    builder
+        .luau_datamodel([
+            StateTreeData::new("entries").with_initializer("0"),
+            StateTreeData::new("completions").with_initializer("0"),
+            StateTreeData::new("log").with_initializer("''"),
+        ])
+        .unwrap();
+    let root = builder.compound_root("root").unwrap();
+    let active = builder.atomic("active", root).unwrap();
+    let done = builder.final_state("done", root).unwrap();
+    builder.initial(root, active).unwrap();
+    builder
+        .entry_actions(
+            active,
+            [
+                StateTreeAction::assign("entries", "entries + 1"),
+                StateTreeAction::effect("grant", []),
+            ],
+        )
+        .unwrap();
+    builder
+        .add_activity(active, StateTreeActivityDefinition::new("job", "work"))
+        .unwrap();
+    builder
+        .add_transition(
+            active,
+            StateTreeTransition::after(Duration::from_secs(10)).target(done),
+        )
+        .unwrap();
+    builder
+        .add_transition(
+            active,
+            StateTreeTransition::on("done.activity.job")
+                .actions([StateTreeAction::assign("completions", "completions + 1")]),
+        )
+        .unwrap();
+    builder
+        .add_transition(
+            active,
+            StateTreeTransition::on("kick").actions([
+                StateTreeAction::assign("log", "log .. tostring(_event.data)"),
+                StateTreeAction::effect("grant", []),
+            ]),
+        )
+        .unwrap();
+    builder
+        .add_transition(
+            active,
+            StateTreeTransition::on("mark").actions([StateTreeAction::assign("log", "log .. 'm'")]),
+        )
+        .unwrap();
+    builder.build().unwrap()
+}
+
+fn install(app: &mut App, definition: StateTreeDefinition) -> Entity {
+    let handle = app
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(definition);
+    let entity = app
+        .world_mut()
+        .spawn(StateTreeInstance::<Simulation>::new(handle))
+        .id();
+    app.world_mut()
+        .entity_mut(entity)
+        .insert(SavedOwner { peer: entity });
+    app.world_mut().run_schedule(Update);
+    entity
+}
+
+fn owner(app: &mut App) -> Entity {
+    app.world_mut()
+        .query_filtered::<Entity, With<SavedOwner>>()
+        .single(app.world())
+        .unwrap()
+}
+
+fn token(app: &App) -> Token {
+    *app.world()
+        .resource::<Runs>()
+        .progress
+        .keys()
+        .next()
+        .unwrap()
+}
+
+fn complete(app: &mut App, token: Token) -> bool {
+    app.world_mut()
+        .run_system_once(
+            move |mut writer: StateTreeActivityOutcomeWriter<Simulation, Work>| {
+                writer.complete(token, ())
+            },
+        )
+        .unwrap()
+}
+
+fn kick(app: &mut App, entity: Entity, amount: u32) {
+    app.world_mut()
+        .run_system_once(move |mut writer: EntityStateTreeEventWriter<Simulation>| {
+            writer.write(Kick { entity, amount });
+        })
+        .unwrap();
+}
+
+fn mark(app: &mut App, value: Mark) {
+    app.world_mut()
+        .run_system_once(
+            move |mut writer: BroadcastStateTreeEventWriter<Simulation>| {
+                writer.write(value);
+            },
+        )
+        .unwrap();
+}
+
+fn data(app: &App, entity: Entity, key: &str) -> LuauValue {
+    app.world()
+        .get::<StateTreeInstance<Simulation>>(entity)
+        .unwrap()
+        .data(key)
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn progress_nested_tokens_and_map_keys_restore_without_consumer_adapters_or_replayed_effects() {
+    let mut app = app();
+    let old_owner = install(&mut app, definition());
+    let old_token = token(&app);
+    app.world_mut()
+        .resource_mut::<Runs>()
+        .progress
+        .get_mut(&old_token)
+        .unwrap()
+        .work = 73;
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(3));
+    app.world_mut().run_schedule(Update);
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    let bytes = serde_json::to_vec(&checkpoint).unwrap();
+    let checkpoint: Checkpoint = serde_json::from_slice(&bytes).unwrap();
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(97));
+    checkpoint.restore(app.world_mut()).unwrap();
+    let owner = owner(&mut app);
+    let restored_token = token(&app);
+    assert_ne!(owner, old_owner);
+    assert_ne!(old_token, restored_token);
+    assert_eq!(restored_token.entity(), owner);
+    assert_eq!(app.world().get::<SavedOwner>(owner).unwrap().peer, owner);
+    let runs = app.world().resource::<Runs>();
+    assert_eq!(runs.progress[&restored_token].work, 73);
+    assert_eq!(runs.nested, [Some(restored_token)]);
+    assert!(!complete(&mut app, old_token));
+    app.world_mut().run_schedule(Update);
+    assert_eq!(app.world().resource::<Observations>().starts, 1);
+    assert_eq!(app.world().resource::<Observations>().grants, 1);
+    assert_eq!(data(&app, owner, "entries"), LuauValue::Integer(1));
+    assert_eq!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(owner)
+            .unwrap()
+            .status(),
+        &InstanceStatus::Running
+    );
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(6));
+    app.world_mut().run_schedule(Update);
+    assert_eq!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(owner)
+            .unwrap()
+            .status(),
+        &InstanceStatus::Running
+    );
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(1));
+    app.world_mut().run_schedule(Update);
+    assert_eq!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(owner)
+            .unwrap()
+            .status(),
+        &InstanceStatus::Complete
+    );
+}
+
+#[test]
+fn checkpoint_loads_in_a_fresh_world_with_recompiled_definition_and_repeated_loads_reject_old_tokens()
+ {
+    let mut source = app();
+    install(&mut source, definition());
+    let source_token = token(&source);
+    source
+        .world_mut()
+        .resource_mut::<Runs>()
+        .progress
+        .get_mut(&source_token)
+        .unwrap()
+        .work = 42;
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    let mut target = app();
+    // Independent compilation allocates new definition/state identities.
+    target
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(definition());
+    checkpoint.restore(target.world_mut()).unwrap();
+    let first = token(&target);
+    assert_eq!(target.world().resource::<Runs>().progress[&first].work, 42);
+    target.world_mut().run_schedule(Update);
+    assert_eq!(target.world().resource::<Observations>().starts, 0);
+    assert_eq!(target.world().resource::<Observations>().grants, 0);
+    checkpoint.restore(target.world_mut()).unwrap();
+    assert!(!complete(&mut target, first));
+    let second = token(&target);
+    assert!(complete(&mut target, second));
+}
+
+#[test]
+fn pending_typed_events_broadcast_order_and_outcomes_round_trip() {
+    let mut app = app();
+    let old_owner = install(&mut app, definition());
+    let run = token(&app);
+    kick(&mut app, old_owner, 2);
+    mark(&mut app, Mark::A);
+    kick(&mut app, old_owner, 3);
+    mark(&mut app, Mark::B);
+    assert!(complete(&mut app, run));
+    assert!(!complete(&mut app, run));
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    checkpoint.restore(app.world_mut()).unwrap();
+    let owner = owner(&mut app);
+    app.world_mut().run_schedule(Update);
+    assert_eq!(data(&app, owner, "log"), LuauValue::String("2m3m".into()));
+    assert_eq!(data(&app, owner, "completions"), LuauValue::Integer(1));
+    assert_eq!(app.world().resource::<Observations>().grants, 6);
+    assert_eq!(app.world().resource::<Observations>().starts, 1);
+    // Completed activity stays inactive even while its owning state stays active.
+    // A stale reference must never silently turn into a live run on reload.
+    assert!(Checkpoint::capture(app.world_mut()).is_err());
+    // Consumers should remove terminal run records as part of normal lifecycle;
+    // remove this test's deliberately retained references before capturing again.
+    app.world_mut().resource_mut::<Runs>().progress.clear();
+    app.world_mut().resource_mut::<Runs>().nested.clear();
+    let completed = Checkpoint::capture(app.world_mut()).unwrap();
+    completed.restore(app.world_mut()).unwrap();
+    app.world_mut().run_schedule(Update);
+    assert_eq!(app.world().resource::<Observations>().starts, 1);
+}
+
+#[test]
+fn malformed_data_and_changed_definitions_do_not_replace_existing_state() {
+    let mut app = app();
+    let old_owner = install(&mut app, definition());
+    let old_token = token(&app);
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    let entity_count = app.world_mut().query::<Entity>().iter(app.world()).count();
+    let mut wire = serde_json::to_value(&checkpoint).unwrap();
+    wire["data"]["runs"] = serde_json::json!([123]);
+    let corrupt: Checkpoint = serde_json::from_value(wire).unwrap();
+    assert!(corrupt.restore(app.world_mut()).is_err());
+    assert_eq!(owner(&mut app), old_owner);
+    assert_eq!(token(&app), old_token);
+    assert_eq!(
+        app.world_mut().query::<Entity>().iter(app.world()).count(),
+        entity_count
+    );
+    let handle = app
+        .world()
+        .get::<StateTreeInstance<Simulation>>(old_owner)
+        .unwrap()
+        .definition()
+        .clone();
+    let mut different = StateTreeBuilder::new("persistent-worker");
+    let root = different.compound_root("root").unwrap();
+    let other = different.atomic("other", root).unwrap();
+    different.initial(root, other).unwrap();
+    app.world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .insert(handle.id(), different.build().unwrap())
+        .unwrap();
+    assert!(checkpoint.restore(app.world_mut()).is_err());
+    assert_eq!(owner(&mut app), old_owner);
+    assert_eq!(token(&app), old_token);
+}
+
+#[test]
+fn token_serialization_outside_a_checkpoint_fails_instead_of_writing_runtime_ids() {
+    let mut app = app();
+    install(&mut app, definition());
+    assert!(serde_json::to_vec(&token(&app)).is_err());
+    assert!(serde_json::from_str::<Token>("0").is_err());
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    checkpoint.restore(app.world_mut()).unwrap();
+    assert!(serde_json::to_vec(&token(&app)).is_err());
+}
+
+fn xml_definition(name: &str, body: &str) -> StateTreeDefinition {
+    bevy_state_tree::scxml::compile(
+        &bevy_state_tree::scxml::parse(
+            name,
+            &format!(
+                r#"
+        <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree"
+            bst:domain="save-test" datamodel="luau">{body}</scxml>"#
+            ),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn shallow_history_restores_prior_child_instead_of_reentering_initial_child() {
+    let definition = xml_definition(
+        "saved-history",
+        r#"
+        <state id="inside" initial="first">
+          <history id="recent"><transition target="first"/></history>
+          <state id="first"><transition event="kick" target="second"/></state>
+          <state id="second"><transition event="kick" target="outside"/></state>
+        </state>
+        <state id="outside"><transition event="kick" target="recent"/></state>"#,
+    );
+    let mut app = app();
+    let original = install(&mut app, definition);
+    kick(&mut app, original, 1);
+    app.world_mut().run_schedule(Update);
+    kick(&mut app, original, 1);
+    app.world_mut().run_schedule(Update);
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    checkpoint.restore(app.world_mut()).unwrap();
+    let restored = owner(&mut app);
+    kick(&mut app, restored, 1);
+    app.world_mut().run_schedule(Update);
+    assert_eq!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(restored)
+            .unwrap()
+            .active_state_names()
+            .last(),
+        Some("second")
+    );
+}
+
+#[test]
+fn parallel_completion_bookkeeping_does_not_emit_a_second_completion_after_restore() {
+    let definition = xml_definition(
+        "saved-parallel",
+        r#"
+        <datamodel><data id="completions" expr="0"/></datamodel>
+        <parallel id="both">
+          <transition event="done.state.left"><assign location="completions" expr="completions + 1"/></transition>
+          <state id="left" initial="left-start">
+            <state id="left-start"><transition event="kick" cond="_event.data == 1" target="left-done"/></state>
+            <final id="left-done"/>
+          </state>
+          <state id="right" initial="right-a">
+            <state id="right-a"><transition event="kick" cond="_event.data == 2" target="right-b"/></state>
+            <state id="right-b"><transition event="kick" cond="_event.data == 2" target="right-a"/></state>
+          </state>
+        </parallel>"#,
+    );
+    let mut app = app();
+    let original = install(&mut app, definition);
+    kick(&mut app, original, 1);
+    app.world_mut().run_schedule(Update);
+    assert_eq!(data(&app, original, "completions"), LuauValue::Integer(1));
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    checkpoint.restore(app.world_mut()).unwrap();
+    let restored = owner(&mut app);
+    kick(&mut app, restored, 2);
+    app.world_mut().run_schedule(Update);
+    assert_eq!(data(&app, restored, "completions"), LuauValue::Integer(1));
+    assert!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(restored)
+            .unwrap()
+            .active_state_names()
+            .any(|name| name == "right-b")
+    );
+}
+
+#[test]
+fn disabled_trees_are_included_and_remain_disabled() {
+    use bevy_ecs::entity_disabling::Disabled;
+    let mut app = app();
+    let original = install(&mut app, definition());
+    app.world_mut().entity_mut(original).insert(Disabled);
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    checkpoint.restore(app.world_mut()).unwrap();
+    let restored = token(&app).entity();
+    assert_ne!(restored, original);
+    assert!(app.world().get::<Disabled>(restored).is_some());
+    assert!(app.world().get_entity(original).is_err());
+    assert_eq!(
+        app.world().get::<SavedOwner>(restored).unwrap().peer,
+        restored
+    );
+}
+
+#[test]
+fn faulted_instances_and_nonfinite_luau_values_round_trip_without_vm_handles() {
+    let mut app = app();
+    let mut builder = StateTreeBuilder::new("faulted-numbers");
+    builder
+        .luau_datamodel([
+            StateTreeData::new("number"),
+            StateTreeData::new("negative_zero"),
+        ])
+        .unwrap();
+    let root = builder.compound_root("root").unwrap();
+    let active = builder.atomic("active", root).unwrap();
+    builder.initial(root, active).unwrap();
+    builder
+        .add_transition(active, StateTreeTransition::eventless().target(active))
+        .unwrap();
+    let handle = app
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(builder.build().unwrap());
+    let nan = f64::from_bits(0x7ff8_0000_0000_0123);
+    let overrides = StateTreeDataOverrides::try_new([
+        ("number", LuauValue::Number(nan)),
+        ("negative_zero", LuauValue::Number(-0.0)),
+    ])
+    .unwrap();
+    let entity = app
+        .world_mut()
+        .spawn(StateTreeInstance::<Simulation>::new_with_initial_data(
+            handle, overrides,
+        ))
+        .id();
+    app.world_mut()
+        .entity_mut(entity)
+        .insert(SavedOwner { peer: entity });
+    app.world_mut().run_schedule(Update);
+    assert!(matches!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(entity)
+            .unwrap()
+            .status(),
+        InstanceStatus::Faulted(_)
+    ));
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    let bytes = serde_json::to_vec(&checkpoint).unwrap();
+    serde_json::from_slice::<Checkpoint>(&bytes)
+        .unwrap()
+        .restore(app.world_mut())
+        .unwrap();
+    let restored = owner(&mut app);
+    let LuauValue::Number(value) = data(&app, restored, "number") else {
+        panic!("number type changed")
+    };
+    assert_eq!(value.to_bits(), nan.to_bits());
+    let LuauValue::Number(value) = data(&app, restored, "negative_zero") else {
+        panic!("number type changed")
+    };
+    assert_eq!(value.to_bits(), (-0.0f64).to_bits());
+    app.world_mut().run_schedule(Update);
+    assert!(matches!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(restored)
+            .unwrap()
+            .status(),
+        InstanceStatus::Faulted(_)
+    ));
+}
+
+#[test]
+fn pending_instances_keep_initial_overrides_and_initialize_exactly_once_after_restore() {
+    let mut app = app();
+    let handle = app
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(definition());
+    let initial = StateTreeDataOverrides::try_new([("entries", LuauValue::Integer(5))]).unwrap();
+    let original = app
+        .world_mut()
+        .spawn(StateTreeInstance::<Simulation>::new_with_initial_data(
+            handle, initial,
+        ))
+        .id();
+    app.world_mut()
+        .entity_mut(original)
+        .insert(SavedOwner { peer: original });
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    checkpoint.restore(app.world_mut()).unwrap();
+    let restored = owner(&mut app);
+    assert_eq!(
+        app.world()
+            .get::<StateTreeInstance<Simulation>>(restored)
+            .unwrap()
+            .status(),
+        &InstanceStatus::Pending
+    );
+    app.world_mut().run_schedule(Update);
+    app.world_mut().run_schedule(Update);
+    assert_eq!(data(&app, restored, "entries"), LuauValue::Integer(6));
+    assert_eq!(app.world().resource::<Observations>().starts, 1);
+    assert_eq!(app.world().resource::<Observations>().grants, 1);
+}
+
+#[test]
+fn capture_rejects_an_overdue_clock_boundary_instead_of_merging_timer_cohorts() {
+    let mut app = app();
+    install(&mut app, definition());
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(11));
+    assert!(Checkpoint::capture(app.world_mut()).is_err());
+    app.world_mut().run_schedule(Update);
+    app.world_mut().resource_mut::<Runs>().nested.clear();
+    assert!(Checkpoint::capture(app.world_mut()).is_ok());
+}
+
+struct Other;
+impl StateTreeDomain for Other {
+    const AUTHORED_NAME: &'static str = "other-save-test";
+    fn configure(config: &mut StateTreeConfig<'_, Self>) {
+        config.activity("work", |_, _| Ok(OtherWork));
+    }
+}
+struct OtherWork;
+impl StateTreeActivity for OtherWork {
+    type Output = ();
+    type Error = ();
+}
+#[derive(Resource, Default, Serialize, Deserialize)]
+struct OtherRun(Option<StateTreeActivityToken<Other, OtherWork>>);
+
+#[test]
+fn domains_sharing_an_owner_restore_distinct_typed_runs_and_reject_cross_domain_references() {
+    let mut app = app();
+    app.add_plugins(StateTreePlugin::<Other>::new(Update))
+        .init_resource::<OtherRun>()
+        .persist_resource::<OtherRun>("other-run")
+        .add_systems(
+            Update,
+            (|mut messages: MessageReader<StateTreeActivityLifecycle<Other, OtherWork>>,
+              mut run: ResMut<OtherRun>| {
+                for message in messages.read() {
+                    if let StateTreeActivityLifecycle::Started { token, .. } = message {
+                        run.0 = Some(*token);
+                    }
+                }
+            })
+            .in_set(StateTreeSet::HandleActivities),
+        );
+    let original = install(&mut app, definition());
+    let mut builder = StateTreeBuilder::new("second-worker");
+    let root = builder.compound_root("root").unwrap();
+    let active = builder.atomic("active", root).unwrap();
+    builder.initial(root, active).unwrap();
+    builder
+        .add_activity(active, StateTreeActivityDefinition::new("job", "work"))
+        .unwrap();
+    let handle = app
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(builder.build().unwrap());
+    app.world_mut()
+        .entity_mut(original)
+        .insert(StateTreeInstance::<Other>::new(handle));
+    app.world_mut().run_schedule(Update);
+    let old = app.world().resource::<OtherRun>().0.unwrap();
+    let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+    let mut corrupt = serde_json::to_value(&checkpoint).unwrap();
+    let other_wire: Vec<u8> = serde_json::from_value(corrupt["data"]["other-run"].clone()).unwrap();
+    let encoded: serde_json::Value = serde_json::from_slice(&other_wire).unwrap();
+    let id = encoded["Present"].as_u64().unwrap() as usize;
+    let wrong_id = if id == 0 { 1 } else { 0 };
+    corrupt["data"]["other-run"] = serde_json::to_value(
+        serde_json::to_vec(&serde_json::json!({"Present": wrong_id})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        serde_json::from_value::<Checkpoint>(corrupt)
+            .unwrap()
+            .restore(app.world_mut())
+            .is_err()
+    );
+    assert_eq!(app.world().resource::<OtherRun>().0, Some(old));
+    checkpoint.restore(app.world_mut()).unwrap();
+    let restored = app.world().resource::<OtherRun>().0.unwrap();
+    assert_ne!(restored, old);
+    assert_eq!(restored.entity(), token(&app).entity());
+    assert!(
+        !app.world_mut()
+            .run_system_once(
+                move |mut outcomes: StateTreeActivityOutcomeWriter<Other, OtherWork>| outcomes
+                    .complete(old, ())
+            )
+            .unwrap()
+    );
+    assert!(
+        app.world_mut()
+            .run_system_once(
+                move |mut outcomes: StateTreeActivityOutcomeWriter<Other, OtherWork>| outcomes
+                    .complete(restored, ())
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn null_like_resources_are_distinct_from_absent_resources() {
+    #[derive(Resource, Serialize, Deserialize)]
+    struct Ready;
+    let mut app = App::new();
+    app.persist_resource::<Ready>("ready")
+        .insert_resource(Ready);
+    let present = Checkpoint::capture(app.world_mut()).unwrap();
+    app.world_mut().remove_resource::<Ready>();
+    let absent = Checkpoint::capture(app.world_mut()).unwrap();
+    present.restore(app.world_mut()).unwrap();
+    assert!(app.world().contains_resource::<Ready>());
+    absent.restore(app.world_mut()).unwrap();
+    assert!(!app.world().contains_resource::<Ready>());
+}

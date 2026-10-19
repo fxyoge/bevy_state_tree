@@ -17,6 +17,9 @@ use crate::{
 
 const NAME: &str = "bst.spawn";
 
+#[cfg(feature = "persistence")]
+mod persistence;
+
 struct SpawnActivity {
     definition: String,
 }
@@ -92,6 +95,8 @@ pub(crate) fn register<D: StateTreeDomain>(app: &mut App, schedule: InternedSche
             .chain()
             .in_set(StateTreeSet::HandleActivities),
     );
+    #[cfg(feature = "persistence")]
+    persistence::register::<D>(app);
 }
 
 fn handle_lifecycle<D: StateTreeDomain>(
@@ -130,6 +135,7 @@ fn handle_lifecycle<D: StateTreeDomain>(
 fn monitor_runs<D: StateTreeDomain>(
     mut commands: Commands,
     definitions: Res<Assets<StateTreeDefinition>>,
+    #[cfg(feature = "persistence")] asset_server: Res<AssetServer>,
     children: Query<(&StateTreeInstance<D>, Option<&StateTreeLinkFailure<D>>)>,
     mut load_failures: MessageReader<AssetLoadFailedEvent<StateTreeDefinition>>,
     mut runs: ResMut<SpawnRuns<D>>,
@@ -144,7 +150,15 @@ fn monitor_runs<D: StateTreeDomain>(
     while index < runs.runs.len() {
         let outcome = match runs.runs[index].state {
             SpawnRunState::Loading(ref handle) => {
-                if let Some(error) = failures.get(&handle.id()) {
+                let failure = failures.get(&handle.id());
+                #[cfg(feature = "persistence")]
+                let retained_failure = match asset_server.get_load_state(handle.id()) {
+                    Some(bevy_asset::LoadState::Failed(error)) => Some(error.to_string()),
+                    _ => None,
+                };
+                #[cfg(feature = "persistence")]
+                let failure = failure.or(retained_failure.as_ref());
+                if let Some(error) = failure {
                     Some(Err(format!(
                         "failed to load spawned state-tree definition `{}`: {error}",
                         runs.runs[index].definition
@@ -371,6 +385,144 @@ mod tests {
 
     fn update_state_trees(app: &mut App) {
         app.world_mut().run_schedule(Update);
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn running_spawn_checkpoint_reconnects_child_and_preserves_cancellation() {
+        use crate::persistence::Checkpoint;
+        let mut app = app();
+        let parent = spawn_parent(&mut app, "loaded.scxml", Some(Duration::from_secs(1)));
+        app.update();
+        insert_for_run(&mut app, running_child_definition());
+        update_state_trees(&mut app);
+        update_state_trees(&mut app);
+        let (old_token, old_child) = {
+            let run = &app.world().resource::<SpawnRuns<TestDomain>>().runs[0];
+            let SpawnRunState::Running(child) = run.state else {
+                panic!("child must be running")
+            };
+            (run.token, child)
+        };
+        let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+        checkpoint.restore(app.world_mut()).unwrap();
+        assert_eq!(instance_count(&mut app), 2);
+        let run = &app.world().resource::<SpawnRuns<TestDomain>>().runs[0];
+        let SpawnRunState::Running(child) = run.state else {
+            panic!("child must remain running")
+        };
+        assert_ne!(run.token, old_token);
+        assert_ne!(child, old_child);
+        assert_ne!(run.token.entity(), parent);
+        update_state_trees(&mut app);
+        assert_eq!(instance_count(&mut app), 2);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        update_state_trees(&mut app);
+        assert_eq!(instance_count(&mut app), 1);
+        assert!(
+            app.world()
+                .resource::<SpawnRuns<TestDomain>>()
+                .runs
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn loading_spawn_checkpoint_does_not_duplicate_or_skip_child_creation() {
+        use crate::persistence::Checkpoint;
+        let mut app = app();
+        spawn_parent(&mut app, "loaded.scxml", None);
+        app.update();
+        let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+        checkpoint.restore(app.world_mut()).unwrap();
+        assert_eq!(
+            app.world().resource::<SpawnRuns<TestDomain>>().runs.len(),
+            1
+        );
+        insert_for_run(&mut app, running_child_definition());
+        update_state_trees(&mut app);
+        update_state_trees(&mut app);
+        assert_eq!(instance_count(&mut app), 2);
+        assert_eq!(
+            app.world().resource::<SpawnRuns<TestDomain>>().runs.len(),
+            1
+        );
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn restored_loading_run_detects_failure_even_without_the_old_failure_message() {
+        use crate::persistence::Checkpoint;
+        let mut app = app();
+        let path = "checkpoint-missing-child.scxml";
+        let parent = spawn_parent(&mut app, path, None);
+        app.update();
+        let handle = app
+            .world()
+            .resource::<AssetServer>()
+            .load::<StateTreeDefinition>(path);
+        for _ in 0..1_000 {
+            app.world_mut().run_schedule(bevy_app::PreUpdate);
+            if matches!(
+                app.world()
+                    .resource::<AssetServer>()
+                    .get_load_state(handle.id()),
+                Some(bevy_asset::LoadState::Failed(_))
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            app.world()
+                .resource::<AssetServer>()
+                .get_load_state(handle.id()),
+            Some(bevy_asset::LoadState::Failed(_))
+        ));
+        // Model a loading checkpoint after the asset subsystem has delivered
+        // and retired its notification. Persistent loading state must suffice.
+        let token = app
+            .world()
+            .get::<StateTreeInstance<TestDomain>>(parent)
+            .unwrap()
+            .persistent_runs(parent)[0]
+            .token
+            .typed();
+        app.world_mut().resource_mut::<SpawnRuns<TestDomain>>().runs = vec![SpawnRun {
+            token,
+            definition: path.into(),
+            state: SpawnRunState::Loading(handle),
+        }];
+        app.world()
+            .get::<crate::activity::StateTreeActivityInbox<TestDomain>>(parent)
+            .unwrap()
+            .outcomes
+            .lock()
+            .unwrap()
+            .clear();
+        app.world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<AssetLoadFailedEvent<StateTreeDefinition>>>(
+            )
+            .clear();
+        let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
+        checkpoint.restore(app.world_mut()).unwrap();
+        update_state_trees(&mut app);
+        update_state_trees(&mut app);
+        assert!(
+            app.world()
+                .resource::<SpawnRuns<TestDomain>>()
+                .runs
+                .is_empty()
+        );
+        let instance = app
+            .world_mut()
+            .query::<&StateTreeInstance<TestDomain>>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(instance.active_state_names().last(), Some("failed"));
     }
 
     #[test]
