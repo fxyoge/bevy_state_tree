@@ -128,7 +128,7 @@ impl<D: Send + Sync + 'static, A: StateTreeActivity> Message for StateTreeActivi
 
 pub(crate) trait RegisteredActivity<D: StateTreeDomain>: Send + Sync {
     #[cfg(feature = "persistence")]
-    fn type_name(&self) -> &'static str;
+    fn type_id(&self) -> std::any::TypeId;
     #[cfg(feature = "persistence")]
     fn clear_lifecycle(&self, world: &mut bevy_ecs::world::World);
     fn start(
@@ -210,8 +210,8 @@ where
         + 'static,
 {
     #[cfg(feature = "persistence")]
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<A>()
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<A>()
     }
 
     #[cfg(feature = "persistence")]

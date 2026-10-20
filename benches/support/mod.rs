@@ -459,7 +459,9 @@ pub fn timer_definition(duration: Duration) -> BenchmarkDefinition {
     builder
         .add_transition(
             waiting,
-            StateTreeTransition::after(duration).target(elapsed),
+            StateTreeTransition::after(duration)
+                .timer_id("elapsed")
+                .target(elapsed),
         )
         .unwrap();
     BenchmarkDefinition::Generated(builder.build().unwrap())

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     activity::{ActivityOutcome, ActivityOutcomeKind},
-    instance::persistence::fingerprint,
+    instance::persistence::validate_definition,
     persistence::{
         Apply, DomainCodec, DomainSnapshot, Error, Registry, ResolvedRun, SavedEvent, SavedOutcome,
         TreeSnapshot, Value, entity_id, invalid, loaded_entity, loaded_run, query_all, run_id,
@@ -34,7 +34,7 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
             .collect()
     }
 
-    fn runs(&self, world: &mut World) -> Vec<(crate::activity::ErasedActivityToken, &'static str)> {
+    fn runs(&self, world: &mut World) -> Vec<ResolvedRun> {
         query_all::<(Entity, &StateTreeInstance<D>), ()>(world)
             .iter(world)
             .flat_map(|(entity, instance)| instance.active_activity_tokens_for_persistence(entity))
@@ -65,7 +65,6 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
             .map(|event| save_event(event, world))
             .collect::<Result<Vec<_>, _>>()?;
         let mut trees = Vec::new();
-        let mut fingerprints = HashMap::new();
         for (entity, instance, inbox, outcomes, disabled) in query_all::<
             (
                 Entity,
@@ -95,18 +94,13 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
                     .active
                     .get(&token)
                     .map(|timer| timer.deadline.saturating_sub(now))
-            });
-            let fingerprint = if let Some(linked) = linked {
-                let value = match fingerprints.entry(linked.compiled.identity) {
-                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        *entry.insert(fingerprint(&linked.compiled)?)
-                    }
-                };
-                Some(value)
-            } else {
-                None
-            };
+            })?;
+            if let Some(asset) = world
+                .resource::<Assets<StateTreeDefinition>>()
+                .get(instance.definition())
+            {
+                validate_definition(&asset.compiled)?;
+            }
             let events = inbox
                 .events
                 .lock()
@@ -143,7 +137,6 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
                 disabled: disabled.is_some(),
                 definition,
                 path: instance.definition().path().map(ToString::to_string),
-                fingerprint,
                 runtime,
                 events,
                 outcomes,
@@ -175,7 +168,8 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
             if !owners.insert(entity) {
                 return Err(invalid("duplicate tree owner"));
             }
-            let key = (tree.definition.clone(), tree.path.clone(), tree.fingerprint);
+            let initialized = tree.runtime.status != InstanceStatus::Pending;
+            let key = (tree.definition.clone(), tree.path.clone(), initialized);
             let (handle, linked) = if let Some(value) = definitions.get(&key) {
                 value.clone()
             } else {
@@ -183,7 +177,7 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
                     let handle = world
                         .resource::<AssetServer>()
                         .load::<StateTreeDefinition>(path.clone());
-                    if tree.fingerprint.is_some()
+                    if initialized
                         && !world
                             .resource::<Assets<StateTreeDefinition>>()
                             .contains(handle.id())
@@ -201,34 +195,38 @@ impl<D: StateTreeDomain> DomainCodec for Domain<D> {
                 } else {
                     let id = {
                         let assets = world.resource::<Assets<StateTreeDefinition>>();
-                        let mut candidates =
-                            assets.iter().filter(|(_, d)| d.name() == tree.definition);
-                        candidates
-                            .find_map(|(id, d)| match tree.fingerprint {
-                                Some(expected)
-                                    if fingerprint(&d.compiled).ok() != Some(expected) =>
-                                {
-                                    None
-                                }
-                                _ => Some(id),
-                            })
-                            .ok_or_else(|| Error::AssetNotReady(tree.definition.clone()))?
+                        let mut candidates = assets.iter().filter(|(_, d)| {
+                            d.name() == tree.definition
+                                && d.compiled
+                                    .domain
+                                    .as_deref()
+                                    .is_none_or(|name| name == D::AUTHORED_NAME)
+                        });
+                        let id = candidates
+                            .next()
+                            .map(|(id, _)| id)
+                            .ok_or_else(|| Error::AssetNotReady(tree.definition.clone()))?;
+                        if candidates.next().is_some() {
+                            return Err(invalid(format!(
+                                "ambiguous generated definition: {}",
+                                tree.definition
+                            )));
+                        }
+                        id
                     };
                     world
                         .resource_mut::<Assets<StateTreeDefinition>>()
                         .get_strong_handle(id)
                         .ok_or_else(|| invalid("definition handle is unavailable"))?
                 };
-                let linked = if let Some(expected) = tree.fingerprint {
+                let linked = if initialized {
                     let compiled = world
                         .resource::<Assets<StateTreeDefinition>>()
                         .get(&handle)
                         .ok_or_else(|| Error::AssetNotReady(tree.definition.clone()))?
                         .compiled
                         .clone();
-                    if fingerprint(&compiled)? != expected {
-                        return Err(invalid(format!("definition changed: {}", tree.definition)));
-                    }
+                    validate_definition(&compiled)?;
                     Some(Arc::new(
                         LinkedDefinition::new(
                             compiled,

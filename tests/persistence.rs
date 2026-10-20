@@ -216,7 +216,9 @@ fn definition() -> StateTreeDefinition {
     builder
         .add_transition(
             active,
-            StateTreeTransition::after(Duration::from_secs(10)).target(done),
+            StateTreeTransition::after(Duration::from_secs(10))
+                .timer_id("finish")
+                .target(done),
         )
         .unwrap();
     builder
@@ -811,4 +813,405 @@ fn null_like_resources_are_distinct_from_absent_resources() {
     assert!(app.world().contains_resource::<Ready>());
     absent.restore(app.world_mut()).unwrap();
     assert!(!app.world().contains_resource::<Ready>());
+}
+
+fn evolving_definition(updated: bool) -> StateTreeDefinition {
+    let body = r#"
+        <datamodel>
+          <data id="entries" expr="0"/><data id="completions" expr="0"/>
+          <data id="log" expr="''"/><data id="optional" expr="nil"/>
+        </datamodel>
+        <state id="active">
+          <onentry><assign location="entries" expr="entries + 1"/><bst:effect name="grant"/></onentry>
+          <bst:activity id="job" name="work"/>
+          <transition bst:id="finish" bst:after="10s" target="done"/>
+          <transition event="kick"><assign location="log" expr="log .. tostring(_event.data)"/></transition>
+        </state>
+        <final id="done"/>
+    "#;
+    let body = if updated {
+        body.replace(
+            "<data id=\"entries\" expr=\"0\"/><data id=\"completions\" expr=\"0\"/>",
+            "<data id=\"completions\" expr=\"900\"/><data id=\"new_value\" expr=\"entries + 10\"/><data id=\"entries\" expr=\"999\"/>",
+        )
+        .replace("id=\"optional\" expr=\"nil\"", "id=\"optional\" expr=\"123\"")
+        .replace("<state id=\"active\">", r#"<state id="dormant"><bst:activity id="unrelated" name="work"/><transition bst:id="unrelated" bst:after="1s" target="done"/></state><state id="active">"#)
+        .replace("entries + 1\"", "entries + 1000\"")
+        .replace("bst:after=\"10s\"", "bst:after=\"999s\" cond=\"entries == 1\"")
+        .replace("tostring(_event.data)", "tostring(_event.data * 10)")
+    } else {
+        body.into()
+    };
+    xml_definition("evolving.scxml", &body)
+}
+
+#[test]
+fn changed_expressions_and_reordered_slots_restore_progress_and_use_current_rules() {
+    let mut source = app();
+    install(&mut source, evolving_definition(false));
+    let stale_token = token(&source);
+    source
+        .world_mut()
+        .resource_mut::<Runs>()
+        .progress
+        .get_mut(&stale_token)
+        .unwrap()
+        .work = 73;
+    source
+        .world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(3));
+    source.world_mut().run_schedule(Update);
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+
+    let mut target = app();
+    target
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(evolving_definition(true));
+    checkpoint.restore(target.world_mut()).unwrap();
+    let entity = owner(&mut target);
+    let restored = token(&target);
+    assert_eq!(
+        target.world().resource::<Runs>().progress[&restored].work,
+        73
+    );
+    assert!(!complete(&mut target, stale_token));
+    assert_eq!(data(&target, entity, "entries"), LuauValue::Integer(1));
+    assert_eq!(data(&target, entity, "completions"), LuauValue::Integer(0));
+    assert_eq!(data(&target, entity, "new_value"), LuauValue::Integer(11));
+    assert_eq!(data(&target, entity, "optional"), LuauValue::Nil);
+    assert_eq!(target.world().resource::<Observations>().starts, 0);
+    assert_eq!(target.world().resource::<Observations>().grants, 0);
+    kick(&mut target, entity, 4);
+    target.world_mut().run_schedule(Update);
+    assert_eq!(data(&target, entity, "log"), LuauValue::String("40".into()));
+    target
+        .world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(6));
+    target.world_mut().run_schedule(Update);
+    assert_eq!(
+        target
+            .world()
+            .get::<StateTreeInstance<Simulation>>(entity)
+            .unwrap()
+            .status(),
+        &InstanceStatus::Running
+    );
+    target
+        .world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs(1));
+    target.world_mut().run_schedule(Update);
+    assert_eq!(
+        target
+            .world()
+            .get::<StateTreeInstance<Simulation>>(entity)
+            .unwrap()
+            .status(),
+        &InstanceStatus::Complete
+    );
+}
+
+#[test]
+fn symbolic_migration_renames_state_data_and_live_activity_without_restarting_work() {
+    let mut source = app();
+    install(&mut source, evolving_definition(false));
+    let old_token = token(&source);
+    // This entity is owned exclusively by the runtime adapter, not a saved component.
+    source
+        .world_mut()
+        .entity_mut(old_token.entity())
+        .remove::<SavedOwner>();
+    source
+        .world_mut()
+        .resource_mut::<Runs>()
+        .progress
+        .get_mut(&old_token)
+        .unwrap()
+        .work = 52;
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    let mut target = app();
+    target.add_plugins(
+        bevy_gigasaver::SavePlugin::default()
+            .version(2)
+            .migrate(1, |data| {
+                bevy_state_tree::persistence::migrate_runtime(data, |snapshot| {
+                    for run in snapshot.runs.values_mut() {
+                        if run.activity == "job" {
+                            run.activity = "worker".into();
+                        }
+                    }
+                    for domain in snapshot.domains.values_mut() {
+                        for tree in &mut domain.trees {
+                            let runtime = &mut tree.runtime;
+                            let state = runtime.active.remove("active").unwrap();
+                            runtime.active.insert("working".into(), state);
+                            let value = runtime.data.remove("entries").unwrap();
+                            runtime.data.insert("visits".into(), value);
+                            let mut activity = runtime.activities.remove("job").unwrap();
+                            activity.owner = "working".into();
+                            runtime.activities.insert("worker".into(), activity);
+                            let timers = runtime.timers.remove("active").unwrap();
+                            runtime.timers.insert("working".into(), timers);
+                        }
+                    }
+                    Ok(())
+                })
+            }),
+    );
+    let mut builder = StateTreeBuilder::new("evolving.scxml");
+    builder
+        .luau_datamodel([
+            StateTreeData::new("visits"),
+            StateTreeData::new("completions"),
+            StateTreeData::new("log"),
+            StateTreeData::new("optional"),
+        ])
+        .unwrap();
+    let root = builder
+        .compound_root("different-root-diagnostic-name")
+        .unwrap();
+    let active = builder.atomic("working", root).unwrap();
+    let done = builder.final_state("done", root).unwrap();
+    builder.initial(root, active).unwrap();
+    builder
+        .add_activity(active, StateTreeActivityDefinition::new("worker", "work"))
+        .unwrap();
+    builder
+        .add_transition(
+            active,
+            StateTreeTransition::after(Duration::from_secs(10))
+                .timer_id("finish")
+                .target(done),
+        )
+        .unwrap();
+    target
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(builder.build().unwrap());
+    checkpoint.restore(target.world_mut()).unwrap();
+    let entity = token(&target).entity();
+    assert_eq!(data(&target, entity, "visits"), LuauValue::Integer(1));
+    assert_eq!(
+        target.world().resource::<Runs>().progress[&token(&target)].work,
+        52
+    );
+    assert_eq!(target.world().resource::<Observations>().starts, 0);
+    let restored_token = token(&target);
+    assert!(complete(&mut target, restored_token));
+}
+
+#[test]
+fn active_lifecycle_changes_require_migration_and_preserve_the_live_world_on_failure() {
+    let mut source = app();
+    install(&mut source, evolving_definition(false));
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    for replacement in [
+        r#"<state id="active"><bst:activity id="job" name="work"/><bst:activity id="new-job" name="work"/><transition bst:id="finish" bst:after="10s" target="done"/></state><final id="done"/>"#,
+        r#"<state id="active"><bst:activity id="job" name="work"/><transition bst:id="finish" bst:after="10s" target="done"/><transition bst:id="new-timer" bst:after="20s" target="done"/></state><final id="done"/>"#,
+    ] {
+        let mut target = app();
+        let unrelated = install(&mut target, definition());
+        let body = format!(
+            r#"<datamodel><data id="entries"/><data id="completions"/><data id="log"/><data id="optional"/></datamodel>{replacement}"#
+        );
+        target
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(xml_definition("evolving.scxml", &body));
+        let error = checkpoint
+            .restore(target.world_mut())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("migration required"), "{error}");
+        assert!(target.world().get_entity(unrelated).is_ok());
+        assert_eq!(target.world().resource::<Observations>().starts, 1);
+    }
+}
+
+#[test]
+fn anonymous_states_and_unnamed_timers_cannot_be_saved() {
+    for body in [
+        r#"<state/>"#,
+        r#"<state id="active"><transition bst:after="1s" target="done"/></state><final id="done"/>"#,
+    ] {
+        let mut source = app();
+        install(&mut source, xml_definition("unstable.scxml", body));
+        let error = Checkpoint::capture(source.world_mut())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit"), "{error}");
+    }
+}
+
+#[test]
+fn sqlite_loads_changed_content_and_delivers_saved_events_under_current_rules() {
+    use bevy_gigasaver::WorldSaveExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("evolving.sqlite");
+    let mut source = app();
+    source.add_plugins(bevy_gigasaver::SavePlugin::sqlite(&path));
+    let entity = install(&mut source, evolving_definition(false));
+    kick(&mut source, entity, 6);
+    source.world_mut().save().unwrap();
+    let mut target = app();
+    target.add_plugins(bevy_gigasaver::SavePlugin::sqlite(&path));
+    target
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(evolving_definition(true));
+    target.world_mut().load().unwrap();
+    let entity = owner(&mut target);
+    target.world_mut().run_schedule(Update);
+    assert_eq!(data(&target, entity, "log"), LuauValue::String("60".into()));
+    assert_eq!(data(&target, entity, "entries"), LuauValue::Integer(1));
+    assert_eq!(target.world().resource::<Observations>().starts, 0);
+    assert_eq!(target.world().resource::<Observations>().grants, 0);
+}
+
+#[test]
+fn new_initializer_failure_is_transactional_and_removed_data_needs_migration() {
+    let mut source = app();
+    install(&mut source, evolving_definition(false));
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    for declarations in [
+        r#"<data id="entries"/><data id="completions"/><data id="log"/><data id="optional"/><data id="broken" expr="missing.field"/>"#,
+        r#"<data id="entries"/><data id="completions"/><data id="log"/>"#,
+    ] {
+        let mut target = app();
+        let survivor = install(&mut target, definition());
+        let body = format!(
+            r#"<datamodel>{declarations}</datamodel><state id="active"><bst:activity id="job" name="work"/><transition bst:id="finish" bst:after="10s" target="done"/></state><final id="done"/>"#
+        );
+        target
+            .world_mut()
+            .resource_mut::<Assets<StateTreeDefinition>>()
+            .add(xml_definition("evolving.scxml", &body));
+        let error = checkpoint
+            .restore(target.world_mut())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("broken") || error.contains("optional"),
+            "{error}"
+        );
+        assert_eq!(data(&target, survivor, "entries"), LuauValue::Integer(1));
+        assert_eq!(target.world().resource::<Runs>().progress.len(), 1);
+    }
+}
+
+#[test]
+fn history_memories_survive_reordered_children_and_new_history_slots() {
+    let mut source = app();
+    let entity = install(
+        &mut source,
+        xml_definition(
+            "history-evolves",
+            r#"
+        <state id="inside" initial="first">
+          <history id="recent"><transition target="first"/></history>
+          <state id="first"><transition event="kick" target="second"/></state>
+          <state id="second"><transition event="kick" target="outside"/></state>
+        </state>
+        <state id="outside"><transition event="kick" target="recent"/></state>
+    "#,
+        ),
+    );
+    for _ in 0..2 {
+        kick(&mut source, entity, 1);
+        source.world_mut().run_schedule(Update);
+    }
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    let mut target = app();
+    target.world_mut().resource_mut::<Assets<StateTreeDefinition>>().add(xml_definition("history-evolves", r#"
+        <state id="unused"><history id="unrelated"><transition target="unused-child"/></history><state id="unused-child"/></state>
+        <state id="inside" initial="first">
+          <history id="recent"><transition target="first"/></history>
+          <state id="second"><transition event="kick" target="outside"/></state>
+          <state id="first"><transition event="kick" target="second"/></state>
+        </state>
+        <state id="outside"><transition event="kick" target="recent"/></state>
+    "#));
+    checkpoint.restore(target.world_mut()).unwrap();
+    let entity = owner(&mut target);
+    kick(&mut target, entity, 1);
+    target.world_mut().run_schedule(Update);
+    assert_eq!(
+        target
+            .world()
+            .get::<StateTreeInstance<Simulation>>(entity)
+            .unwrap()
+            .active_state_names()
+            .last(),
+        Some("second")
+    );
+}
+
+struct RefactoredDomain;
+struct RefactoredWork;
+impl StateTreeActivity for RefactoredWork {
+    type Output = ();
+    type Error = ();
+}
+impl StateTreeDomain for RefactoredDomain {
+    const AUTHORED_NAME: &'static str = "save-test";
+    fn configure(config: &mut StateTreeConfig<'_, Self>) {
+        config.activity("work", |_, _| Ok(RefactoredWork));
+    }
+}
+#[derive(Resource, Default, Serialize, Deserialize)]
+struct RefactoredRuns {
+    progress: HashMap<StateTreeActivityToken<RefactoredDomain, RefactoredWork>, Progress>,
+    nested: Vec<Option<StateTreeActivityToken<RefactoredDomain, RefactoredWork>>>,
+}
+
+#[test]
+fn rust_activity_type_names_are_not_save_identities() {
+    let mut source = app();
+    let mut builder = StateTreeBuilder::new("type-refactor");
+    let root = builder.compound_root("root").unwrap();
+    let active = builder.atomic("active", root).unwrap();
+    builder.initial(root, active).unwrap();
+    builder
+        .add_activity(active, StateTreeActivityDefinition::new("job", "work"))
+        .unwrap();
+    let definition = builder.build().unwrap();
+    install(&mut source, definition.clone());
+    let old = token(&source);
+    source
+        .world_mut()
+        .resource_mut::<Runs>()
+        .progress
+        .get_mut(&old)
+        .unwrap()
+        .work = 18;
+    let checkpoint = Checkpoint::capture(source.world_mut()).unwrap();
+    let mut target = App::new();
+    target
+        .add_plugins((
+            TaskPoolPlugin::default(),
+            TimePlugin,
+            AssetPlugin::default(),
+            StateTreePlugin::<RefactoredDomain>::new(Update),
+        ))
+        .init_resource::<RefactoredRuns>()
+        .persist_resource::<RefactoredRuns>("runs")
+        .persist_component::<SavedOwner>("owners");
+    target
+        .world_mut()
+        .resource_mut::<Assets<StateTreeDefinition>>()
+        .add(definition);
+    checkpoint.restore(target.world_mut()).unwrap();
+    let runs = target.world().resource::<RefactoredRuns>();
+    let new = *runs.progress.keys().next().unwrap();
+    assert_eq!(runs.progress[&new].work, 18);
+    assert_eq!(runs.nested, [Some(new)]);
+    assert!(
+        target
+            .world()
+            .get::<StateTreeInstance<RefactoredDomain>>(new.entity())
+            .is_some()
+    );
 }

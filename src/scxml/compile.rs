@@ -770,6 +770,12 @@ impl<'a> Compiler<'a> {
         }
         .at(transition.span.start)
         .actions(actions);
+        if let Some(id) = transition.attributes.iter().find(|attribute| {
+            attribute.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
+                && attribute.local_name == "id"
+        }) {
+            specification = specification.timer_id(id.value.clone());
+        }
         if let Some(condition) = transition.condition.as_deref() {
             specification = specification.condition_at(condition, transition.span.start);
         }
@@ -1055,6 +1061,7 @@ impl<'a> Compiler<'a> {
         if let Some(id) = id {
             return id.to_owned();
         }
+        self.builder.mark_anonymous_name();
         loop {
             let candidate = format!("#anonymous{}", self.next_anonymous);
             self.next_anonymous += 1;
@@ -1286,7 +1293,7 @@ fn has_unsupported_transition_attributes(attributes: &[Attribute]) -> bool {
             && attribute.name != "xmlns"
             && !attribute.name.starts_with("xmlns:")
             && !(attribute.namespace.as_deref() == Some(super::BEVY_STATE_TREE_NAMESPACE)
-                && attribute.local_name == "after")
+                && matches!(attribute.local_name.as_str(), "after" | "id"))
     })
 }
 

@@ -335,7 +335,6 @@ struct EventRequirement {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct CompiledLuauDataModel {
     pub names: Box<[Box<str>]>,
     pub initializers: Box<[Option<ExpressionId>]>,
@@ -343,9 +342,7 @@ pub(crate) struct CompiledLuauDataModel {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "persistence", derive(serde::Serialize))]
 pub(crate) struct CompiledDefinition {
-    #[cfg_attr(feature = "persistence", serde(skip))]
     pub identity: u64,
     pub name: Box<str>,
     pub domain: Option<Box<str>>,
@@ -368,6 +365,13 @@ pub(crate) struct CompiledDefinition {
     pub has_parallel: bool,
     pub datamodel: Option<CompiledLuauDataModel>,
     pub timers: Box<[Duration]>,
+    #[cfg(feature = "persistence")]
+    pub timer_names: Box<[Option<Box<str>>]>,
+    #[cfg(feature = "persistence")]
+    pub has_anonymous_names: bool,
+    #[cfg(feature = "persistence")]
+    pub persistence_layout:
+        std::sync::OnceLock<Result<crate::instance::persistence::DefinitionLayout, String>>,
     events: Box<[EventPattern]>,
     event_requirements: Box<[EventRequirement]>,
     internal_events: Box<[EventId]>,
@@ -779,7 +783,7 @@ struct DraftHistory {
 enum DraftTransitionTrigger {
     Event(EventPattern),
     Eventless,
-    After(Duration),
+    After(Duration, Option<Box<str>>),
 }
 
 #[derive(Clone, Debug)]
@@ -1027,6 +1031,7 @@ pub struct StateTreeTransition {
     internal: bool,
     actions: Vec<StateTreeAction>,
     span_start: usize,
+    timer_name: Option<Box<str>>,
 }
 
 impl StateTreeTransition {
@@ -1049,6 +1054,7 @@ impl StateTreeTransition {
             internal: false,
             actions: Vec::new(),
             span_start: 0,
+            timer_name: None,
         }
     }
 
@@ -1061,6 +1067,7 @@ impl StateTreeTransition {
             internal: false,
             actions: Vec::new(),
             span_start: 0,
+            timer_name: None,
         }
     }
 
@@ -1077,7 +1084,16 @@ impl StateTreeTransition {
             internal: false,
             actions: Vec::new(),
             span_start: 0,
+            timer_name: None,
         }
+    }
+
+    /// Stable identity of an after transition, unique within its source state.
+    /// Required when persisting a definition; independent of duration and target.
+    /// SCXML uses `bst:id="finish"` alongside `bst:after="1s"`.
+    pub fn timer_id(mut self, name: impl Into<Box<str>>) -> Self {
+        self.timer_name = Some(name.into());
+        self
     }
 
     /// Adds a Luau guard expression.
@@ -1146,6 +1162,8 @@ pub struct StateTreeBuilder {
     names: HashSet<Box<str>>,
     root: Option<StateId>,
     datamodel: Option<DraftLuauDataModel>,
+    #[cfg(feature = "persistence")]
+    has_anonymous_names: bool,
 }
 
 impl StateTreeBuilder {
@@ -1161,6 +1179,8 @@ impl StateTreeBuilder {
             names: HashSet::new(),
             root: None,
             datamodel: None,
+            #[cfg(feature = "persistence")]
+            has_anonymous_names: false,
         }
     }
 
@@ -1444,6 +1464,19 @@ impl StateTreeBuilder {
             }
             StateTreeTransitionTrigger::After(_) => {}
         }
+        if let Some(name) = &transition.timer_name {
+            if !matches!(transition.trigger, StateTreeTransitionTrigger::After(_)) {
+                return Err(BuildError::TimerIdOnNonTimer);
+            }
+            if !is_activity_id(name) {
+                return Err(BuildError::InvalidTimerId(name.clone()));
+            }
+            if self.states[source.index()].transitions.iter().any(|other| {
+                matches!(&other.trigger, DraftTransitionTrigger::After(_, Some(other)) if other == name)
+            }) {
+                return Err(BuildError::DuplicateTimerId(name.clone()));
+            }
+        }
         let expression_checkpoint = self.expression_count();
         let condition = transition
             .condition
@@ -1495,7 +1528,7 @@ impl StateTreeBuilder {
             StateTreeTransitionTrigger::After(duration) => {
                 self.push_transition(
                     source,
-                    DraftTransitionTrigger::After(duration),
+                    DraftTransitionTrigger::After(duration, transition.timer_name),
                     condition,
                     transition
                         .target
@@ -1841,6 +1874,8 @@ impl StateTreeBuilder {
         let mut transition_entries = Vec::new();
         let mut transition_actions = Vec::new();
         let mut timers = Vec::new();
+        #[cfg(feature = "persistence")]
+        let mut timer_names = Vec::new();
         let mut effects = Vec::<Box<str>>::new();
         let mut effect_ids = HashMap::<Box<str>, EffectId>::new();
         let mut effect_arguments = Vec::new();
@@ -1937,11 +1972,13 @@ impl StateTreeBuilder {
                         TransitionTrigger::Event(event)
                     }
                     DraftTransitionTrigger::Eventless => TransitionTrigger::Eventless,
-                    DraftTransitionTrigger::After(duration) => {
+                    DraftTransitionTrigger::After(duration, _name) => {
                         let timer = TimerId(
                             u32::try_from(timers.len()).map_err(|_| BuildError::TooManyTimers)?,
                         );
                         timers.push(*duration);
+                        #[cfg(feature = "persistence")]
+                        timer_names.push(_name.clone());
                         TransitionTrigger::After(timer)
                     }
                 };
@@ -2291,6 +2328,12 @@ impl StateTreeBuilder {
                 has_parallel,
                 datamodel,
                 timers: timers.into_boxed_slice(),
+                #[cfg(feature = "persistence")]
+                timer_names: timer_names.into_boxed_slice(),
+                #[cfg(feature = "persistence")]
+                has_anonymous_names: self.has_anonymous_names,
+                #[cfg(feature = "persistence")]
+                persistence_layout: std::sync::OnceLock::new(),
                 events: events.into_boxed_slice(),
                 event_requirements: event_requirements.into_boxed_slice(),
                 internal_events: internal_events.into_boxed_slice(),
@@ -2316,6 +2359,13 @@ impl StateTreeBuilder {
             return Err(BuildError::FinalChildOfParallel(parent));
         }
         self.add_state(name, Some(parent), kind)
+    }
+
+    pub(crate) fn mark_anonymous_name(&mut self) {
+        #[cfg(feature = "persistence")]
+        {
+            self.has_anonymous_names = true;
+        }
     }
 
     fn add_state(
@@ -2879,6 +2929,12 @@ pub enum BuildError {
     EmptyTransition,
     #[error("an after transition requires a positive duration")]
     ZeroTimerDuration,
+    #[error("a timer id may only be assigned to an after transition")]
+    TimerIdOnNonTimer,
+    #[error("timer id `{0}` must be a non-empty ASCII event-name segment")]
+    InvalidTimerId(Box<str>),
+    #[error("timer id `{0}` is duplicated within its source state")]
+    DuplicateTimerId(Box<str>),
     #[error("an effect name cannot be empty")]
     EmptyEffectName,
     #[error("an effect argument name cannot be empty")]
@@ -3079,7 +3135,8 @@ struct DataModelSemantics {
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 struct ExpressionSemantics {
-    bytecode: Box<[u8]>,
+    source: Box<str>,
+    boolean: bool,
     reads_event_data: bool,
 }
 
@@ -3229,7 +3286,8 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
                     .expressions
                     .iter()
                     .map(|expression| ExpressionSemantics {
-                        bytecode: expression.bytecode.clone(),
+                        source: expression.source.clone(),
+                        boolean: expression.boolean,
                         reads_event_data: expression.reads_event_data,
                     })
                     .collect(),
@@ -3616,6 +3674,42 @@ mod tests {
                 .unwrap_err(),
             BuildError::ZeroTimerDuration
         );
+    }
+
+    #[test]
+    fn timer_ids_are_validated_and_scoped_to_the_source_state() {
+        let mut builder = StateTreeBuilder::new("timer-identities");
+        let root = builder.compound_root("root").unwrap();
+        let first = builder.atomic("first", root).unwrap();
+        let second = builder.atomic("second", root).unwrap();
+        builder.initial(root, first).unwrap();
+        let timer = || StateTreeTransition::after(Duration::from_secs(1)).timer_id("finish");
+        builder
+            .add_transition(first, timer().target(second))
+            .unwrap();
+        builder
+            .add_transition(second, timer().target(first))
+            .unwrap();
+        assert_eq!(
+            builder.add_transition(first, timer()).unwrap_err(),
+            BuildError::DuplicateTimerId("finish".into())
+        );
+        assert_eq!(
+            builder
+                .add_transition(first, StateTreeTransition::on("kick").timer_id("wrong"))
+                .unwrap_err(),
+            BuildError::TimerIdOnNonTimer
+        );
+        assert_eq!(
+            builder
+                .add_transition(
+                    first,
+                    StateTreeTransition::after(Duration::from_secs(1)).timer_id("bad/id")
+                )
+                .unwrap_err(),
+            BuildError::InvalidTimerId("bad/id".into())
+        );
+        builder.build().unwrap();
     }
 
     #[test]

@@ -299,7 +299,9 @@ mod tests {
             builder
                 .add_transition(
                     active,
-                    StateTreeTransition::after(duration).target(cancelled),
+                    StateTreeTransition::after(duration)
+                        .timer_id("cancel")
+                        .target(cancelled),
                 )
                 .unwrap();
         }

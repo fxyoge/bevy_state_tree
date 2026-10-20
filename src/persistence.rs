@@ -1,5 +1,8 @@
 //! State-tree's transaction participant. Ordinary resources/components and their
 //! lifecycles are owned by Gigasaver, including backend-independent checkpoints.
+pub use crate::instance::persistence::{
+    RuntimeSnapshot, SavedActivity, SavedHistory, SavedState, SavedStateKind, SavedTimer,
+};
 use crate::{
     StateTreeActivity, StateTreeActivityToken, StateTreeDomain, activity::ErasedActivityToken,
 };
@@ -9,7 +12,7 @@ pub(crate) use bevy_gigasaver::adapter::Apply;
 pub use bevy_gigasaver::{AppSaveExt as AppPersistenceExt, Checkpoint, Error};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    any::type_name,
+    any::TypeId,
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -19,49 +22,95 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidData(message.into())
 }
 
+/// Transform the symbolic state-tree payload inside a Gigasaver application migration.
+/// The staged payload is replaced only when the transformation and encoding succeed.
+/// Checkpoint-local run references must be preserved or remapped together with their
+/// references in consumer data when changing live activities.
+///
+/// ```no_run
+/// use bevy_gigasaver::SavePlugin;
+/// use bevy_state_tree::persistence::migrate_runtime;
+///
+/// let saves = SavePlugin::default().version(2).migrate(1, |data| {
+///     migrate_runtime(data, |snapshot| {
+///         for domain in snapshot.domains.values_mut() {
+///             for tree in &mut domain.trees {
+///                 if let Some(value) = tree.runtime.data.remove("old_balance") {
+///                     tree.runtime.data.insert("balance".into(), value);
+///                 }
+///             }
+///         }
+///         Ok(())
+///     })
+/// });
+/// ```
+pub fn migrate_runtime(
+    data: &mut bevy_gigasaver::MigrationData,
+    migrate: impl FnOnce(&mut RuntimeCheckpoint) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(saved) = data.get_mut("bevy_state_tree.runtime") else {
+        return Ok(());
+    };
+    let bevy_gigasaver::SavedType::Resource(Some(value)) = saved else {
+        return Err("invalid state-tree runtime migration payload".into());
+    };
+    let mut snapshot: RuntimeCheckpoint =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if snapshot.format != 1 {
+        return Err("unsupported state-tree snapshot format".into());
+    }
+    migrate(&mut snapshot)?;
+    if snapshot.format != 1 {
+        return Err("migration changed the state-tree format version".into());
+    }
+    *value = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RuntimeCheckpoint {
-    runs: Vec<RunReference>,
-    domains: BTreeMap<String, DomainSnapshot>,
-    data: BTreeMap<String, Vec<u8>>,
+pub struct RuntimeCheckpoint {
+    /// State-tree wire format, independent of the application's migration version.
+    pub format: u32,
+    /// Checkpoint-local identities. Removing a run must not renumber other runs.
+    pub runs: BTreeMap<usize, RunReference>,
+    pub domains: BTreeMap<String, DomainSnapshot>,
+    pub data: BTreeMap<String, Vec<u8>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RunReference {
-    owner: usize,
-    domain: String,
-    activity: u32,
-    generation: u64,
-    activity_type: String,
+pub struct RunReference {
+    pub owner: usize,
+    pub domain: String,
+    pub activity: String,
+    pub generation: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct DomainSnapshot {
+pub struct DomainSnapshot {
     pub trees: Vec<TreeSnapshot>,
     pub broadcasts: Vec<SavedEvent>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TreeSnapshot {
+pub struct TreeSnapshot {
     pub owner: usize,
     pub disabled: bool,
     pub definition: String,
     pub path: Option<String>,
-    pub fingerprint: Option<[u8; 32]>,
     pub runtime: crate::instance::persistence::RuntimeSnapshot,
     pub events: Vec<(usize, SavedEvent)>,
     pub outcomes: Vec<SavedOutcome>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct SavedEvent {
+pub struct SavedEvent {
     pub name: String,
     pub payload: Vec<u8>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct SavedOutcome {
+pub struct SavedOutcome {
     pub run: usize,
     pub success: bool,
     pub data: Result<Option<Value>, String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum Value {
+pub enum Value {
     Nil,
     Boolean(bool),
     Integer(i64),
@@ -105,14 +154,15 @@ impl From<Value> for crate::LuauValue {
 pub(crate) struct ResolvedRun {
     pub token: ErasedActivityToken,
     pub domain: String,
-    pub activity_type: String,
+    pub activity: String,
+    pub activity_type: TypeId,
 }
 enum Session {
     Save {
         runs: HashMap<ErasedActivityToken, usize>,
     },
     Load {
-        runs: Vec<ResolvedRun>,
+        runs: BTreeMap<usize, ResolvedRun>,
     },
 }
 thread_local! { static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) }; }
@@ -150,7 +200,7 @@ pub(crate) fn run_id(token: ErasedActivityToken) -> Result<usize, Error> {
 pub(crate) fn loaded_run(id: usize) -> Result<ResolvedRun, Error> {
     SESSION.with(|s| match s.borrow().as_ref() {
         Some(Session::Load { runs, .. }) => runs
-            .get(id)
+            .get(&id)
             .cloned()
             .ok_or_else(|| invalid("dangling activity run reference")),
         _ => Err(invalid("token deserialization requires a restore context")),
@@ -167,7 +217,7 @@ impl<'de, D: StateTreeDomain, A: StateTreeActivity> Deserialize<'de>
     fn deserialize<S: Deserializer<'de>>(deserializer: S) -> Result<Self, S::Error> {
         let run =
             loaded_run(usize::deserialize(deserializer)?).map_err(serde::de::Error::custom)?;
-        if run.domain != D::AUTHORED_NAME || run.activity_type != type_name::<A>() {
+        if run.domain != D::AUTHORED_NAME || run.activity_type != TypeId::of::<A>() {
             return Err(serde::de::Error::custom(
                 "activity run domain/type mismatch",
             ));
@@ -196,7 +246,7 @@ pub mod luau_value {
 }
 pub(crate) trait DomainCodec: Send + Sync {
     fn entities(&self, world: &mut World) -> Vec<Entity>;
-    fn runs(&self, world: &mut World) -> Vec<(ErasedActivityToken, &'static str)>;
+    fn runs(&self, world: &mut World) -> Vec<ResolvedRun>;
     fn capture(&self, world: &mut World) -> Result<DomainSnapshot, Error>;
     fn prepare(
         &self,
@@ -261,18 +311,22 @@ impl bevy_gigasaver::adapter::SaveAdapter for RuntimeAdapter {
     fn capture(&self, world: &mut World) -> Result<bevy_gigasaver::adapter::Captured, Error> {
         let domains = world.resource::<Registry>().domains.clone();
         let codecs = world.resource::<Registry>().data.clone();
-        let mut runs = Vec::new();
+        let mut runs = BTreeMap::new();
         let mut tokens = HashMap::new();
         for (domain, codec) in &domains {
-            for (token, activity_type) in codec.runs(world) {
-                tokens.insert(token, runs.len());
-                runs.push(RunReference {
-                    owner: entity_id(token.entity)?,
-                    domain: domain.clone(),
-                    activity: token.activity.0,
-                    generation: token.generation,
-                    activity_type: activity_type.into(),
-                });
+            for run in codec.runs(world) {
+                let token = run.token;
+                let id = runs.len();
+                tokens.insert(token, id);
+                runs.insert(
+                    id,
+                    RunReference {
+                        owner: entity_id(token.entity)?,
+                        domain: domain.clone(),
+                        activity: run.activity,
+                        generation: token.generation,
+                    },
+                );
             }
         }
         let guard = begin(Session::Save { runs: tokens })?;
@@ -286,6 +340,7 @@ impl bevy_gigasaver::adapter::SaveAdapter for RuntimeAdapter {
             .collect::<Result<_, Error>>()?;
         Ok(bevy_gigasaver::adapter::Captured {
             bytes: serde_json::to_vec(&RuntimeCheckpoint {
+                format: 1,
                 runs,
                 domains,
                 data,
@@ -301,8 +356,18 @@ impl bevy_gigasaver::adapter::SaveAdapter for RuntimeAdapter {
         let snapshot: RuntimeCheckpoint = serde_json::from_slice(bytes)?;
         let domains = world.resource::<Registry>().domains.clone();
         let codecs = world.resource::<Registry>().data.clone();
-        if !domains.keys().eq(snapshot.domains.keys()) || !codecs.keys().eq(snapshot.data.keys()) {
-            return Err(invalid("state-tree runtime schema mismatch"));
+        if snapshot.format != 1 {
+            return Err(invalid("unsupported state-tree snapshot format"));
+        }
+        if snapshot
+            .domains
+            .keys()
+            .any(|key| !domains.contains_key(key))
+            || snapshot.data.keys().any(|key| !codecs.contains_key(key))
+        {
+            return Err(invalid(
+                "migration required: removed state-tree domain or runtime codec",
+            ));
         }
         if let Some(server) = world.get_resource::<bevy_asset::AssetServer>() {
             let paths: std::collections::BTreeSet<_> = snapshot
@@ -318,14 +383,19 @@ impl bevy_gigasaver::adapter::SaveAdapter for RuntimeAdapter {
         let mut live = HashMap::new();
         let mut runtime_ids = BTreeMap::new();
         for (key, codec) in &domains {
-            let (prepared, runs, runtimes) = codec.prepare(world, &snapshot.domains[key])?;
+            let empty = DomainSnapshot {
+                trees: Vec::new(),
+                broadcasts: Vec::new(),
+            };
+            let (prepared, runs, runtimes) =
+                codec.prepare(world, snapshot.domains.get(key).unwrap_or(&empty))?;
             apply.push(prepared);
             runtime_ids.insert(key.clone(), runtimes);
             for run in runs {
                 let key = (
                     run.domain.clone(),
                     run.token.entity,
-                    run.token.activity.0,
+                    run.activity.clone(),
                     run.token.generation,
                 );
                 if live.insert(key, run).is_some() {
@@ -337,11 +407,11 @@ impl bevy_gigasaver::adapter::SaveAdapter for RuntimeAdapter {
         let runs = snapshot
             .runs
             .iter()
-            .map(|reference| {
+            .map(|(id, reference)| {
                 let key = (
                     reference.domain.clone(),
                     loaded_entity(reference.owner)?,
-                    reference.activity,
+                    reference.activity.clone(),
                     reference.generation,
                 );
                 if !seen.insert(key.clone()) {
@@ -350,23 +420,36 @@ impl bevy_gigasaver::adapter::SaveAdapter for RuntimeAdapter {
                 let run = live
                     .get(&key)
                     .ok_or_else(|| invalid("reference to an inactive activity"))?;
-                if run.activity_type != reference.activity_type {
-                    return Err(invalid("activity type changed"));
-                }
-                Ok(run.clone())
+                Ok((*id, run.clone()))
             })
-            .collect::<Result<Vec<_>, Error>>()?;
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
         if runs.len() != live.len() {
             return Err(invalid("missing activity run reference"));
         }
         let guard = begin(Session::Load { runs })?;
         for (key, codec) in &codecs {
-            apply.push(codec.prepare(world, &snapshot.data[key])?);
+            if let Some(bytes) = snapshot.data.get(key) {
+                apply.push(codec.prepare(world, bytes)?);
+            }
         }
         for (key, codec) in &domains {
-            apply.push(codec.prepare_ingress(world, &snapshot.domains[key], &runtime_ids[key])?);
+            let empty = DomainSnapshot {
+                trees: Vec::new(),
+                broadcasts: Vec::new(),
+            };
+            apply.push(codec.prepare_ingress(
+                world,
+                snapshot.domains.get(key).unwrap_or(&empty),
+                &runtime_ids[key],
+            )?);
         }
         Ok(bevy_gigasaver::adapter::Prepared {
+            entities: snapshot
+                .domains
+                .values()
+                .flat_map(|domain| &domain.trees)
+                .map(|tree| loaded_entity(tree.owner))
+                .collect::<Result<_, _>>()?,
             apply: Box::new(move |world| {
                 for apply in apply {
                     apply(world);

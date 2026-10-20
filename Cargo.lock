@@ -340,6 +340,7 @@ dependencies = [
 [[package]]
 name = "bevy_gigasaver"
 version = "0.1.0"
+source = "git+ssh://git@github.com/fxyoge/bevy_gigasaver.git?rev=58feae59a2994695474524d7aa654da266390f56#58feae59a2994695474524d7aa654da266390f56"
 dependencies = [
  "bevy_app",
  "bevy_asset",
@@ -357,6 +358,7 @@ dependencies = [
 [[package]]
 name = "bevy_gigasaver_macros"
 version = "0.1.0"
+source = "git+ssh://git@github.com/fxyoge/bevy_gigasaver.git?rev=58feae59a2994695474524d7aa654da266390f56#58feae59a2994695474524d7aa654da266390f56"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -367,6 +369,7 @@ dependencies = [
 [[package]]
 name = "bevy_luau"
 version = "0.1.0"
+source = "git+ssh://git@github.com/fxyoge/bevy_luau.git?rev=c1e3b048b473f3d68ff2662bddaf06bacb8b1494#c1e3b048b473f3d68ff2662bddaf06bacb8b1494"
 dependencies = [
  "full_moon",
  "mlua",
@@ -485,7 +488,6 @@ dependencies = [
  "bevy_tasks",
  "bevy_time",
  "bevy_utils",
- "blake3",
  "divan",
  "full_moon",
  "quick-xml",

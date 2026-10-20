@@ -63,6 +63,10 @@ pub(crate) fn environment() -> &'static bevy_luau::EnvironmentSpec {
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledLuauExpression {
     engine: EngineExpression,
+    #[cfg(test)]
+    pub source: Box<str>,
+    #[cfg(test)]
+    pub boolean: bool,
     pub span_start: usize,
     pub reads_event_data: bool,
 }
@@ -71,23 +75,6 @@ impl Deref for CompiledLuauExpression {
     type Target = EngineExpression;
     fn deref(&self) -> &Self::Target {
         &self.engine
-    }
-}
-
-#[cfg(feature = "persistence")]
-impl serde::Serialize for CompiledLuauExpression {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Engine identities and worker caches are process-local. Only compiled
-        // semantics contribute to definition compatibility.
-        serde::Serialize::serialize(
-            &(
-                &self.bytecode,
-                &self.dependencies,
-                self.span_start,
-                self.reads_event_data,
-            ),
-            serializer,
-        )
     }
 }
 
@@ -110,6 +97,10 @@ pub(crate) fn compile_expression(
     visitor.visit_ast(&ast);
     Ok(CompiledLuauExpression {
         engine,
+        #[cfg(test)]
+        source: source.into(),
+        #[cfg(test)]
+        boolean,
         span_start,
         reads_event_data: visitor.found,
     })
