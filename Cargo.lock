@@ -369,7 +369,7 @@ dependencies = [
 [[package]]
 name = "bevy_luau"
 version = "0.1.0"
-source = "git+ssh://git@github.com/fxyoge/bevy_luau.git?rev=c1e3b048b473f3d68ff2662bddaf06bacb8b1494#c1e3b048b473f3d68ff2662bddaf06bacb8b1494"
+source = "git+ssh://git@github.com/fxyoge/bevy_luau.git?rev=2fca026a670ba398c72bf2fceec44cf539e1d1d4#2fca026a670ba398c72bf2fceec44cf539e1d1d4"
 dependencies = [
  "full_moon",
  "mlua",
