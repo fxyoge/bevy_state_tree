@@ -128,9 +128,7 @@ impl<D: Send + Sync + 'static, A: StateTreeActivity> Message for StateTreeActivi
 
 pub(crate) trait RegisteredActivity<D: StateTreeDomain>: Send + Sync {
     #[cfg(feature = "persistence")]
-    fn type_id(&self) -> std::any::TypeId;
-    #[cfg(feature = "persistence")]
-    fn clear_lifecycle(&self, world: &mut bevy_ecs::world::World);
+    fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World);
     fn start(
         &self,
         context: StateTreeEffectContext<'_, D>,
@@ -210,17 +208,15 @@ where
         + 'static,
 {
     #[cfg(feature = "persistence")]
-    fn type_id(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<A>()
+    fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World) {
+        let mut messages =
+            world.resource_mut::<bevy_ecs::message::Messages<StateTreeActivityLifecycle<D, A>>>();
+        let cancellations: Vec<_> = messages
+            .drain()
+            .filter(|message| matches!(message, StateTreeActivityLifecycle::Cancelled { .. }))
+            .collect();
+        messages.write_batch(cancellations);
     }
-
-    #[cfg(feature = "persistence")]
-    fn clear_lifecycle(&self, world: &mut bevy_ecs::world::World) {
-        world
-            .resource_mut::<bevy_ecs::message::Messages<StateTreeActivityLifecycle<D, A>>>()
-            .clear();
-    }
-
     fn start(
         &self,
         context: StateTreeEffectContext<'_, D>,
@@ -271,10 +267,11 @@ impl<D: StateTreeDomain> Default for StateTreeActivityRegistry<D> {
 
 impl<D: StateTreeDomain> StateTreeActivityRegistry<D> {
     #[cfg(feature = "persistence")]
-    pub(crate) fn handlers_for_persistence(&self) -> Vec<Arc<dyn RegisteredActivity<D>>> {
-        self.activities.values().cloned().collect()
+    pub(crate) fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World) {
+        for handler in self.activities.values() {
+            handler.discard_pending_starts(world);
+        }
     }
-
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredActivity<D>>> {
         self.activities.get(name).cloned()
     }

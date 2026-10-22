@@ -43,27 +43,6 @@ pub trait StateTreeEvent<D: StateTreeDomain>: Event {
     /// The SCXML event name associated with this payload type.
     const AUTHORED_NAME: &'static str;
 
-    /// Generated automatically by `StateTreeEvent`. Handwritten implementations
-    /// must support these methods if their events can be pending during saves.
-    #[cfg(feature = "persistence")]
-    fn persistence_encode(&self) -> Result<Vec<u8>, crate::persistence::Error> {
-        Err(crate::persistence::Error::InvalidData(format!(
-            "event {} has no persistence codec",
-            Self::AUTHORED_NAME
-        )))
-    }
-
-    #[cfg(feature = "persistence")]
-    fn persistence_decode(_bytes: &[u8]) -> Result<Self, crate::persistence::Error>
-    where
-        Self: Sized,
-    {
-        Err(crate::persistence::Error::InvalidData(format!(
-            "event {} has no persistence codec",
-            Self::AUTHORED_NAME
-        )))
-    }
-
     /// Projects this event's typed payload for lazy Luau `_event.data` access.
     fn event_data(&self) -> Result<Option<LuauValue>, StateTreeEventDataError> {
         Ok(None)
@@ -211,18 +190,6 @@ impl<D: StateTreeDomain> StateTreeEventRegistry<D> {
             authored_name: E::AUTHORED_NAME,
             origin,
             event_data: project_event_data::<D, E>,
-            #[cfg(feature = "persistence")]
-            encode: |value| {
-                value
-                    .downcast_ref::<E>()
-                    .expect("registered event type")
-                    .persistence_encode()
-            },
-            #[cfg(feature = "persistence")]
-            decode: |bytes| {
-                E::persistence_decode(bytes)
-                    .map(|value| Box::new(value) as Box<dyn Any + Send + Sync>)
-            },
         });
         Ok(self)
     }
@@ -411,15 +378,7 @@ pub(crate) struct RegisteredEvent {
     authored_name: &'static str,
     pub(crate) origin: RegistrationOrigin,
     event_data: EventDataProjector,
-    #[cfg(feature = "persistence")]
-    encode: fn(&(dyn Any + Send + Sync)) -> Result<Vec<u8>, crate::persistence::Error>,
-    #[cfg(feature = "persistence")]
-    decode: PersistentEventDecoder,
 }
-
-#[cfg(feature = "persistence")]
-type PersistentEventDecoder =
-    fn(&[u8]) -> Result<Box<dyn Any + Send + Sync>, crate::persistence::Error>;
 
 /// The ownership strategy is deliberately private. `event_storage` benchmarks
 /// show the allocation cost directly; a 16-byte inline prototype increased the
@@ -431,38 +390,6 @@ pub(crate) struct QueuedStateTreeEvent<D: StateTreeDomain> {
 }
 
 impl<D: StateTreeDomain> QueuedStateTreeEvent<D> {
-    #[cfg(feature = "persistence")]
-    pub(crate) fn persistent_snapshot(
-        &self,
-        protocol: &StateTreeEventProtocol<D>,
-    ) -> Result<crate::persistence::SavedEvent, crate::persistence::Error> {
-        let entry = protocol.entry(self.id);
-        Ok(crate::persistence::SavedEvent {
-            name: entry.authored_name.into(),
-            payload: (entry.encode)(self.payload.as_ref())?,
-        })
-    }
-
-    #[cfg(feature = "persistence")]
-    pub(crate) fn from_persistent_snapshot(
-        saved: &crate::persistence::SavedEvent,
-        protocol: &StateTreeEventProtocol<D>,
-    ) -> Result<Self, crate::persistence::Error> {
-        let entry = protocol
-            .inner
-            .entries
-            .iter()
-            .find(|entry| entry.authored_name == saved.name)
-            .ok_or_else(|| {
-                crate::persistence::invalid(format!("unregistered saved event: {}", saved.name))
-            })?;
-        Ok(Self {
-            id: entry.id,
-            payload: (entry.decode)(&saved.payload)?,
-            marker: PhantomData,
-        })
-    }
-
     pub(crate) fn new<E: StateTreeEvent<D>>(id: RegisteredEventId, payload: E) -> Self {
         Self {
             id,

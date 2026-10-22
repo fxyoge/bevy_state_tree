@@ -30,8 +30,34 @@ use crate::{
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(feature = "persistence")]
-pub(crate) mod persistence;
+/// Read-only, nonpersistent expression input exposed as `config`.
+/// Hosts rebuild this component from current assets before initializing a tree.
+#[derive(Component)]
+pub struct StateTreeConfiguration<D: StateTreeDomain> {
+    pub(crate) values: Arc<LuauValue>,
+    marker: PhantomData<fn() -> D>,
+}
+impl<D: StateTreeDomain> Clone for StateTreeConfiguration<D> {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+impl<D: StateTreeDomain> PartialEq for StateTreeConfiguration<D> {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+impl<D: StateTreeDomain> StateTreeConfiguration<D> {
+    pub fn new(values: impl IntoIterator<Item = (String, LuauValue)>) -> Self {
+        Self {
+            values: Arc::new(LuauValue::Record(values.into_iter().collect())),
+            marker: PhantomData,
+        }
+    }
+}
 
 /// Immutable instance-local values applied after authored datamodel initializers.
 #[derive(Clone, Debug, Default)]
@@ -274,13 +300,12 @@ pub enum DatamodelOperation {
 /// `D` identifies an independent runtime domain, allowing an application to
 /// run simulation, UI, or dialogue trees in different schedules.
 ///
-/// Initialization retains an [`Arc`] to the compiled definition, so removing
-/// or replacing the source asset cannot invalidate a running instance. Asset
-/// replacement is not currently applied to running instances; future hot
-/// reload support can migrate that retained definition without reusing the
-/// initial [`InstanceStatus::Pending`] state or replacing the event inbox.
+/// Only declared datamodel values survive reconstruction. Asset replacement
+/// restarts execution from the current initial configuration; activities,
+/// timers, history and queued work are never migrated.
 #[derive(Component, Debug)]
 #[component(on_discard = release_runtime_state::<D>)]
+#[component(on_insert = reconstruct_reinserted::<D>)]
 #[require(PendingStateTree<D>, StateTreeEventInbox<D>)]
 pub struct StateTreeInstance<D: StateTreeDomain> {
     definition: Handle<StateTreeDefinition>,
@@ -301,6 +326,9 @@ struct InstanceRuntime {
     history: Option<Box<HistoryRuntime>>,
     timer_updates: Vec<TimerUpdate>,
     initial_data: StateTreeDataOverrides,
+    preserved_data: Option<std::collections::BTreeMap<Box<str>, LuauValue>>,
+    configuration: Option<Arc<LuauValue>>,
+    teardown_pending: bool,
     data: Vec<LuauValue>,
     status: InstanceStatus,
 }
@@ -329,6 +357,18 @@ impl<D: StateTreeDomain> std::ops::DerefMut for Execution<'_, D> {
 struct ActivitySlot {
     generation: u64,
     active: bool,
+}
+
+fn reconstruct_reinserted<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
+    let fresh = world
+        .get::<StateTreeInstance<D>>(context.entity)
+        .filter(|instance| instance.linked.is_some())
+        .map(|instance| instance.reconstruct(instance.definition().clone()));
+    if let Some(fresh) = fresh {
+        *world
+            .get_mut::<StateTreeInstance<D>>(context.entity)
+            .expect("inserted instance exists") = fresh;
+    }
 }
 
 fn release_runtime_state<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
@@ -399,6 +439,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
                 history: None,
                 timer_updates: Vec::new(),
                 initial_data,
+                preserved_data: None,
+                configuration: None,
+                teardown_pending: false,
                 data: Vec::new(),
                 status: InstanceStatus::Pending,
             },
@@ -415,8 +458,61 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self.definition.id()
     }
 
+    /// Creates a fresh execution, carrying only datamodel values into the current definition.
+    pub fn reconstruct(&self, definition: Handle<StateTreeDefinition>) -> Self {
+        let mut fresh = Self::new(definition).with_preserved_data(self.datamodel_values());
+        fresh.runtime.teardown_pending = true;
+        fresh
+    }
+
+    pub(crate) fn teardown_pending(&self) -> bool {
+        self.runtime.teardown_pending
+    }
+    pub(crate) fn finish_teardown(&mut self) {
+        self.runtime.teardown_pending = false;
+    }
+
     pub(crate) fn runtime_id(&self) -> u64 {
         self.runtime.runtime_id
+    }
+
+    pub(crate) fn datamodel_values(&self) -> std::collections::BTreeMap<Box<str>, LuauValue> {
+        if let Some(datamodel) = self
+            .linked
+            .as_ref()
+            .and_then(|linked| linked.compiled.datamodel.as_ref())
+        {
+            datamodel
+                .names
+                .iter()
+                .cloned()
+                .zip(self.runtime.data.iter().cloned())
+                .collect()
+        } else {
+            self.runtime
+                .preserved_data
+                .clone()
+                .unwrap_or_else(|| self.runtime.initial_data.values.iter().cloned().collect())
+        }
+    }
+
+    pub(crate) fn with_preserved_data(
+        mut self,
+        data: std::collections::BTreeMap<Box<str>, LuauValue>,
+    ) -> Self {
+        self.runtime.preserved_data = Some(data);
+        self
+    }
+
+    pub(crate) fn set_configuration(&mut self, configuration: Option<&StateTreeConfiguration<D>>) {
+        self.runtime.configuration =
+            configuration.map(|configuration| configuration.values.clone());
+    }
+
+    pub(crate) fn uses_definition(&self, definition: &StateTreeDefinition) -> bool {
+        self.linked
+            .as_ref()
+            .is_some_and(|linked| Arc::ptr_eq(&linked.compiled, &definition.compiled))
     }
 
     pub(crate) fn accepts_external_event(&self, event: StateTreeEventRef<'_, D>) -> bool {
@@ -2027,7 +2123,16 @@ impl<D: StateTreeDomain> Execution<'_, D> {
             return Ok(());
         };
         self.data.resize(datamodel.names.len(), LuauValue::Nil);
+        let preserved = self.preserved_data.take().unwrap_or_default();
+        for (index, name) in datamodel.names.iter().enumerate() {
+            if let Some(value) = preserved.get(name) {
+                self.data[index] = value.clone();
+            }
+        }
         for (index, initializer) in datamodel.initializers.iter().enumerate() {
+            if preserved.contains_key(&datamodel.names[index]) {
+                continue;
+            }
             let Some(initializer) = initializer else {
                 continue;
             };
@@ -2112,10 +2217,11 @@ impl<D: StateTreeDomain> Execution<'_, D> {
             None
         };
         let event_data = explicit_event_data.or(projected_event_data.as_ref());
-        luau::evaluate(
+        luau::evaluate_with_configuration(
             expression,
             &datamodel.names,
             &self.data,
+            self.configuration.as_deref(),
             event_name,
             event_data,
         )

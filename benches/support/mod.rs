@@ -74,7 +74,6 @@ impl StateTreeActivity for BenchmarkActivity {
 }
 
 #[derive(Resource, Default)]
-#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 struct BenchmarkActivityTokens(Vec<StateTreeActivityToken<Simulation, BenchmarkActivity>>);
 
 #[derive(Clone, Copy)]
@@ -172,12 +171,6 @@ impl BenchmarkApp {
     }
 
     pub fn register_benchmark_activity(&mut self) {
-        #[cfg(feature = "persistence")]
-        {
-            use bevy_state_tree::persistence::AppPersistenceExt;
-            self.app
-                .persist_resource::<BenchmarkActivityTokens>("benchmark-activity-tokens");
-        }
         self.app
             .init_resource::<BenchmarkActivityTokens>()
             .add_systems(
@@ -303,10 +296,17 @@ fn collect_benchmark_activities(
     mut messages: MessageReader<StateTreeActivityLifecycle<Simulation, BenchmarkActivity>>,
     mut tokens: ResMut<BenchmarkActivityTokens>,
 ) {
+    let mut cancelled = std::collections::HashSet::new();
     for message in messages.read() {
-        if let StateTreeActivityLifecycle::Started { token, .. } = message {
-            tokens.0.push(*token);
+        match message {
+            StateTreeActivityLifecycle::Started { token, .. } => tokens.0.push(*token),
+            StateTreeActivityLifecycle::Cancelled { token } => {
+                cancelled.insert(*token);
+            }
         }
+    }
+    if !cancelled.is_empty() {
+        tokens.0.retain(|token| !cancelled.contains(token));
     }
 }
 

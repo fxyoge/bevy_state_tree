@@ -17,7 +17,6 @@ use bevy_ecs::{
     world::World,
 };
 
-#[cfg(not(feature = "persistence"))]
 use bevy_ecs::prelude::Local;
 
 use crate::{
@@ -32,11 +31,9 @@ use crate::{
 /// [`Self::Value`]. The source runs only while at least one active activity is
 /// listening. Values are compared with [`PartialEq`], so event delivery follows
 /// semantic value changes rather than Bevy component change ticks.
-pub trait StateTreeBinding<D: StateTreeDomain>:
-    crate::PersistenceData + Send + Sync + 'static
-{
+pub trait StateTreeBinding<D: StateTreeDomain>: Send + Sync + 'static {
     /// The complete value sampled from the backing Bevy world.
-    type Value: crate::PersistenceData + PartialEq + Send + Sync + 'static;
+    type Value: PartialEq + Send + Sync + 'static;
     /// The entity-targeted event delivered to each listening state tree.
     type Event: EntityStateTreeEvent<D>;
 
@@ -106,8 +103,6 @@ impl<B: Send + Sync + 'static> StateTreeActivity for GlobalBindingActivity<B> {
     type Error = ();
 }
 
-#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "persistence", serde(bound = "B: StateTreeBinding<D>"))]
 struct GlobalBindingRun<D: StateTreeDomain, B: StateTreeBinding<D>> {
     token: StateTreeActivityToken<D, GlobalBindingActivity<B>>,
     binding: Arc<B>,
@@ -116,28 +111,8 @@ struct GlobalBindingRun<D: StateTreeDomain, B: StateTreeBinding<D>> {
 
 #[derive(Component)]
 #[component(storage = "SparseSet")]
-#[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "persistence", serde(bound = "B: StateTreeBinding<D>"))]
 struct GlobalBindingListeners<D: StateTreeDomain, B: StateTreeBinding<D>> {
     runs: Vec<GlobalBindingRun<D, B>>,
-}
-
-#[cfg(feature = "persistence")]
-#[derive(Resource, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "B: StateTreeBinding<D>")]
-struct BindingPrevious<D: StateTreeDomain, B: StateTreeBinding<D>> {
-    value: Option<B::Value>,
-    marker: PhantomData<fn() -> D>,
-}
-
-#[cfg(feature = "persistence")]
-impl<D: StateTreeDomain, B: StateTreeBinding<D>> Default for BindingPrevious<D, B> {
-    fn default() -> Self {
-        Self {
-            value: None,
-            marker: PhantomData,
-        }
-    }
 }
 
 type PrunableGlobalBindings<'w, 's, D, B> = Query<
@@ -196,19 +171,6 @@ pub(crate) fn register_global_binding<D, B, C, S, M>(
     );
 
     crate::event::ensure_event::<D, B::Event>(app, crate::protocol::RegistrationOrigin::Domain);
-    #[cfg(feature = "persistence")]
-    {
-        use crate::persistence::AppPersistenceExt;
-        app.init_resource::<BindingPrevious<D, B>>();
-        app.persist_resource::<BindingPrevious<D, B>>(&format!(
-            "bst.binding.previous.{}.{name}",
-            D::AUTHORED_NAME
-        ));
-        app.persist_component::<GlobalBindingListeners<D, B>>(&format!(
-            "bst.binding.listeners.{}.{name}",
-            D::AUTHORED_NAME
-        ));
-    }
     crate::activity::register_activity::<D, GlobalBindingActivity<B>, _>(
         app,
         name,
@@ -335,15 +297,12 @@ fn dispatch_global_binding<D, B>(
         &StateTreeInstance<D>,
         &mut GlobalBindingListeners<D, B>,
     )>,
-    #[cfg(not(feature = "persistence"))] mut previous: Local<Option<B::Value>>,
-    #[cfg(feature = "persistence")] mut previous: bevy_ecs::prelude::ResMut<BindingPrevious<D, B>>,
+    mut previous: Local<Option<B::Value>>,
     mut events: EntityStateTreeEventWriter<D>,
 ) where
     D: StateTreeDomain,
     B: StateTreeBinding<D>,
 {
-    #[cfg(feature = "persistence")]
-    let previous = &mut previous.value;
     let changed = previous.as_ref() != Some(&value);
     for (entity, instance, mut listeners) in &mut listeners {
         for run in &mut listeners.runs {
@@ -547,7 +506,7 @@ mod tests {
 
     #[cfg(feature = "persistence")]
     #[test]
-    fn binding_checkpoint_restores_configuration_and_previous_sample_without_redelivery() {
+    fn binding_checkpoint_rebuilds_listener_and_delivers_a_fresh_initial_sample() {
         use crate::persistence::{AppPersistenceExt, Checkpoint};
         let mut source = binding_app();
         source.persist_resource::<SampleSource>("sample-source");
@@ -576,13 +535,14 @@ mod tests {
             .single(target.world())
             .unwrap();
         target.world_mut().run_schedule(Update);
-        assert_binding_data(target.world(), restored, 1, "idle", "first");
+        target.world_mut().run_schedule(Update);
+        assert_binding_data(target.world(), restored, 2, "idle", "first");
         target.world_mut().resource_mut::<SampleSource>().value = SampleValue {
             mode: SampleMode::Busy,
             label: "next".into(),
         };
         target.world_mut().run_schedule(Update);
-        assert_binding_data(target.world(), restored, 2, "busy", "next");
+        assert_binding_data(target.world(), restored, 3, "busy", "next");
         assert_eq!(
             target
                 .world()

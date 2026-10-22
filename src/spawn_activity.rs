@@ -17,8 +17,8 @@ use crate::{
 
 const NAME: &str = "bst.spawn";
 
-#[cfg(feature = "persistence")]
-mod persistence;
+#[derive(bevy_ecs::prelude::Component)]
+pub(crate) struct SpawnedStateTree;
 
 struct SpawnActivity {
     definition: String,
@@ -95,8 +95,6 @@ pub(crate) fn register<D: StateTreeDomain>(app: &mut App, schedule: InternedSche
             .chain()
             .in_set(StateTreeSet::HandleActivities),
     );
-    #[cfg(feature = "persistence")]
-    persistence::register::<D>(app);
 }
 
 fn handle_lifecycle<D: StateTreeDomain>(
@@ -165,7 +163,10 @@ fn monitor_runs<D: StateTreeDomain>(
                     )))
                 } else if definitions.contains(handle.id()) {
                     let child = commands
-                        .spawn(StateTreeInstance::<D>::new(handle.clone()))
+                        .spawn((
+                            StateTreeInstance::<D>::new(handle.clone()),
+                            SpawnedStateTree,
+                        ))
                         .id();
                     runs.runs[index].state = SpawnRunState::Running(child);
                     None
@@ -391,7 +392,7 @@ mod tests {
 
     #[cfg(feature = "persistence")]
     #[test]
-    fn running_spawn_checkpoint_reconnects_child_and_preserves_cancellation() {
+    fn running_spawn_checkpoint_reconstructs_child_and_preserves_cancellation() {
         use crate::persistence::Checkpoint;
         let mut app = app();
         let parent = spawn_parent(&mut app, "loaded.scxml", Some(Duration::from_secs(1)));
@@ -408,6 +409,9 @@ mod tests {
         };
         let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
         checkpoint.restore(app.world_mut()).unwrap();
+        update_state_trees(&mut app);
+        update_state_trees(&mut app);
+        update_state_trees(&mut app);
         assert_eq!(instance_count(&mut app), 2);
         let run = &app.world().resource::<SpawnRuns<TestDomain>>().runs[0];
         let SpawnRunState::Running(child) = run.state else {
@@ -486,13 +490,7 @@ mod tests {
         ));
         // Model a loading checkpoint after the asset subsystem has delivered
         // and retired its notification. Persistent loading state must suffice.
-        let token = app
-            .world()
-            .get::<StateTreeInstance<TestDomain>>(parent)
-            .unwrap()
-            .persistent_runs(parent)[0]
-            .token
-            .typed();
+        let token = app.world().resource::<SpawnRuns<TestDomain>>().runs[0].token;
         app.world_mut().resource_mut::<SpawnRuns<TestDomain>>().runs = vec![SpawnRun {
             token,
             definition: path.into(),
@@ -512,6 +510,19 @@ mod tests {
         let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
         checkpoint.restore(app.world_mut()).unwrap();
         update_state_trees(&mut app);
+        update_state_trees(&mut app);
+        for _ in 0..1_000 {
+            app.update();
+            if app
+                .world()
+                .resource::<SpawnRuns<TestDomain>>()
+                .runs
+                .is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         update_state_trees(&mut app);
         assert!(
             app.world()

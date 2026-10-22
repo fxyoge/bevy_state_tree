@@ -12,12 +12,22 @@ use std::{
 };
 
 use bevy_app::{App, Plugin};
-use bevy_asset::{AssetApp, AssetServer, Assets};
+use bevy_asset::{AssetApp, AssetEvent, AssetServer, Assets};
 use bevy_ecs::{
-    change_detection::DetectChangesMut,
+    change_detection::{DetectChanges, DetectChangesMut},
     entity::{EntityHashMap, EntityHashSet},
-    prelude::{Component, Entity, Mut, Query, Res, ResMut, Resource, With},
-    schedule::{InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemSet},
+    entity_disabling::Disabled,
+    prelude::{
+        Changed, Commands, Component, Entity, MessageReader, Mut, Query, RemovedComponents, Res,
+        ResMut, Resource, With,
+    },
+    query::Allow,
+    schedule::{
+        InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemCondition, SystemSet,
+        common_conditions::{
+            any_component_removed, any_match_filter, on_message, resource_changed,
+        },
+    },
     system::{ParallelCommands, SystemParam},
 };
 use bevy_tasks::ComputeTaskPool;
@@ -25,9 +35,9 @@ use bevy_time::Time;
 use bevy_utils::Parallel;
 
 use crate::{
-    BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeDefinition,
-    StateTreeDomain, StateTreeDomainRegistry, StateTreeEventRef, StateTreeInstance,
-    StateTreeLinkError,
+    BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeConfiguration,
+    StateTreeDefinition, StateTreeDomain, StateTreeDomainRegistry, StateTreeEventRef,
+    StateTreeInstance, StateTreeLinkError,
     activity::{
         BevyActivitySink, StateTreeActivityInbox, StateTreeActivityIngress,
         StateTreeActivityRegistry,
@@ -45,6 +55,9 @@ mod persistence;
 /// Ordered phases installed into each state-tree domain schedule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 pub enum StateTreeSet {
+    /// Rebuilds execution after definition or configuration replacement.
+    /// Hosts must supply current configuration before this phase.
+    Reconstruct,
     /// Delivers timers whose deadlines have elapsed.
     ProcessTimers,
     /// Produces state-tree events that must be delivered in this schedule run.
@@ -163,6 +176,7 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             .configure_sets(
                 self.schedule,
                 (
+                    StateTreeSet::Reconstruct,
                     StateTreeSet::ProcessTimers,
                     StateTreeSet::QueueEvents,
                     StateTreeSet::ProcessActivityOutcomes,
@@ -176,10 +190,24 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             .add_systems(
                 self.schedule,
                 (
+                    reconstruct_changed::<D>
+                        .in_set(StateTreeSet::Reconstruct)
+                        .run_if(
+                            resource_changed::<Assets<StateTreeDefinition>>
+                                .or_eager(on_message::<AssetEvent<StateTreeDefinition>>)
+                                .or_eager(
+                                    any_match_filter::<(
+                                        Changed<StateTreeConfiguration<D>>,
+                                        Allow<Disabled>,
+                                    )>,
+                                )
+                                .or_eager(any_component_removed::<StateTreeConfiguration<D>>),
+                        ),
                     process_timers::<D>.in_set(StateTreeSet::ProcessTimers),
                     process_activity_outcomes::<D>.in_set(StateTreeSet::ProcessActivityOutcomes),
                     initialize_pending::<D>.in_set(StateTreeSet::Initialize),
                     process_events::<D>.in_set(StateTreeSet::ProcessEvents),
+                    finish_teardown::<D>.after(StateTreeSet::HandleEffects),
                 ),
             );
 
@@ -534,6 +562,56 @@ where
     }
 }
 
+fn reconstruct_changed<D: StateTreeDomain>(
+    mut commands: Commands,
+    assets: Res<Assets<StateTreeDefinition>>,
+    mut events: MessageReader<AssetEvent<StateTreeDefinition>>,
+    mut removed: RemovedComponents<StateTreeConfiguration<D>>,
+    changed: Query<Entity, (Changed<StateTreeConfiguration<D>>, Allow<Disabled>)>,
+    instances: Query<(Entity, &StateTreeInstance<D>), Allow<Disabled>>,
+) {
+    let definition_changed = events
+        .read()
+        .filter(|event| matches!(event, AssetEvent::Modified { .. }))
+        .count()
+        > 0;
+    let mut entities: EntityHashSet = changed.iter().chain(removed.read()).collect();
+    if assets.is_changed() || definition_changed {
+        entities.extend(
+            instances
+                .iter()
+                .filter(|(_, instance)| {
+                    assets
+                        .get(instance.definition())
+                        .is_some_and(|asset| !instance.uses_definition(asset))
+                })
+                .map(|(entity, _)| entity),
+        );
+    }
+    for entity in entities {
+        let Ok((_, instance)) = instances.get(entity) else {
+            continue;
+        };
+        if instance.status() == &InstanceStatus::Pending {
+            continue;
+        }
+        commands
+            .entity(entity)
+            .insert(instance.reconstruct(instance.definition().clone()));
+    }
+}
+
+type RetiringStateTrees<'w, 's, D> =
+    Query<'w, 's, &'static mut StateTreeInstance<D>, (With<PendingStateTree<D>>, Allow<Disabled>)>;
+
+fn finish_teardown<D: StateTreeDomain>(mut instances: RetiringStateTrees<'_, '_, D>) {
+    for mut instance in &mut instances {
+        if instance.teardown_pending() {
+            instance.finish_teardown();
+        }
+    }
+}
+
 type PendingStateTrees<'w, 's, D> = Query<
     'w,
     's,
@@ -541,6 +619,7 @@ type PendingStateTrees<'w, 's, D> = Query<
         Entity,
         &'static mut StateTreeInstance<D>,
         Option<&'static StateTreeLinkFailure<D>>,
+        Option<&'static StateTreeConfiguration<D>>,
     ),
     With<PendingStateTree<D>>,
 >;
@@ -567,7 +646,13 @@ fn initialize_pending<D: StateTreeDomain>(
     mut instances: PendingStateTrees<'_, '_, D>,
 ) {
     let (time, mut timers, settings, traces) = runtime;
-    for (entity, mut instance, previous_failure) in &mut instances {
+    for (entity, mut instance, previous_failure, configuration) in &mut instances {
+        // Let every consumer process cancellation before fresh entry actions
+        // and activities can run. Execution is absent during this boundary;
+        // no outgoing SCXML is allowed to execute.
+        if instance.teardown_pending() {
+            continue;
+        }
         let Some(definition) = definitions.get(instance.definition()) else {
             if previous_failure.is_some() {
                 commands.command_scope(|mut commands| {
@@ -595,6 +680,7 @@ fn initialize_pending<D: StateTreeDomain>(
                 continue;
             }
         };
+        instance.set_configuration(configuration);
         instance.set_time(time.elapsed());
         let has_activities = !linked.compiled.activities.is_empty();
         if let Some(traces) = traces.as_deref() {
@@ -1743,6 +1829,7 @@ mod tests {
                 .unwrap()
         );
         app.update();
+        app.update();
         assert_eq!(active_leaf(&app, entity), "active");
     }
 
@@ -1788,6 +1875,7 @@ mod tests {
                 .contains(&entity)
         );
         app.world_mut().entity_mut(entity).insert(instance);
+        app.update();
         app.update();
         assert_eq!(active_leaf(&app, entity), "active");
     }
@@ -2635,6 +2723,7 @@ mod tests {
 
         app.world_mut().entity_mut(entity).insert(instance);
         queue_reset_all(&mut app);
+        app.update();
         app.update();
 
         assert_eq!(active_leaf(&app, entity), "idle");

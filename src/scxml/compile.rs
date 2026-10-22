@@ -1061,7 +1061,6 @@ impl<'a> Compiler<'a> {
         if let Some(id) = id {
             return id.to_owned();
         }
-        self.builder.mark_anonymous_name();
         loop {
             let candidate = format!("#anonymous{}", self.next_anonymous);
             self.next_anonymous += 1;

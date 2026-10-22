@@ -13,7 +13,7 @@ resolver = "3"
 
 [features]
 default = []
-persistence = ["dep:bevy_gigasaver", "dep:serde", "dep:serde_json", "bevy_state_tree_macros/persistence", "bevy_luau/serde"]
+persistence = ["dep:bevy_gigasaver", "dep:serde", "dep:serde_json", "bevy_luau/serde"]
 
 [dependencies]
 bevy_gigasaver = { git = "ssh://git@github.com/fxyoge/bevy_gigasaver.git", rev = "58feae59a2994695474524d7aa654da266390f56", optional = true }
@@ -36,6 +36,9 @@ serde_json = { version = "1", optional = true }
 tempfile = "3"
 bevy_ecs = { version = "0.20.0", features = ["bevy_reflect", "multi_threaded"] }
 divan = "0.1.21"
+
+[patch."ssh://git@github.com/fxyoge/bevy_luau.git"]
+bevy_luau = { path = "../bevy_luau" }
 
 [[example]]
 name = "save_slots"

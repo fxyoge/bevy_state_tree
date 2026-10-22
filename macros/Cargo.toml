@@ -9,9 +9,6 @@ license = "MIT OR Apache-2.0"
 [lib]
 proc-macro = true
 
-[features]
-persistence = []
-
 [dependencies]
 proc-macro2 = "1"
 proc-macro-crate = "3"

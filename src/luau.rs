@@ -106,10 +106,11 @@ pub(crate) fn compile_expression(
     })
 }
 
-pub(crate) fn evaluate(
+pub(crate) fn evaluate_with_configuration(
     expression: &CompiledLuauExpression,
     names: &[Box<str>],
     values: &[LuauValue],
+    configuration: Option<&LuauValue>,
     event_name: Option<&str>,
     event_data: Option<&LuauValue>,
 ) -> Result<LuauValue, Error> {
@@ -124,6 +125,17 @@ pub(crate) fn evaluate(
             }
             LuauValue::Record(record)
         });
+    if expression.dependencies.iter().any(|root| root == "config") {
+        let empty = LuauValue::Record(BTreeMap::new());
+        return bevy_luau::evaluate(
+            expression,
+            names,
+            values,
+            Some(("config", configuration.unwrap_or(&empty)))
+                .into_iter()
+                .chain(event.as_ref().map(|event| ("_event", event))),
+        );
+    }
     bevy_luau::evaluate(
         expression,
         names,

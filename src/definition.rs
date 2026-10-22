@@ -365,13 +365,6 @@ pub(crate) struct CompiledDefinition {
     pub has_parallel: bool,
     pub datamodel: Option<CompiledLuauDataModel>,
     pub timers: Box<[Duration]>,
-    #[cfg(feature = "persistence")]
-    pub timer_names: Box<[Option<Box<str>>]>,
-    #[cfg(feature = "persistence")]
-    pub has_anonymous_names: bool,
-    #[cfg(feature = "persistence")]
-    pub persistence_layout:
-        std::sync::OnceLock<Result<crate::instance::persistence::DefinitionLayout, String>>,
     events: Box<[EventPattern]>,
     event_requirements: Box<[EventRequirement]>,
     internal_events: Box<[EventId]>,
@@ -379,22 +372,6 @@ pub(crate) struct CompiledDefinition {
 }
 
 impl CompiledDefinition {
-    #[cfg(feature = "persistence")]
-    pub(crate) fn persistent_state(&self, index: u32) -> Option<StateId> {
-        self.states.get(index as usize).map(|_| StateId {
-            definition: self.identity,
-            index,
-        })
-    }
-
-    #[cfg(feature = "persistence")]
-    pub(crate) fn persistent_event(&self, name: &str) -> Option<EventId> {
-        self.events
-            .iter()
-            .position(|event| matches!(event, EventPattern::Exact(value) if value.as_ref() == name))
-            .map(|index| EventId(index as u32))
-    }
-
     pub fn state(&self, target: impl Into<StateTreeTarget>) -> &StateNode {
         let id = match target.into() {
             StateTreeTarget::State(state) => state,
@@ -1162,8 +1139,6 @@ pub struct StateTreeBuilder {
     names: HashSet<Box<str>>,
     root: Option<StateId>,
     datamodel: Option<DraftLuauDataModel>,
-    #[cfg(feature = "persistence")]
-    has_anonymous_names: bool,
 }
 
 impl StateTreeBuilder {
@@ -1179,8 +1154,6 @@ impl StateTreeBuilder {
             names: HashSet::new(),
             root: None,
             datamodel: None,
-            #[cfg(feature = "persistence")]
-            has_anonymous_names: false,
         }
     }
 
@@ -1874,8 +1847,6 @@ impl StateTreeBuilder {
         let mut transition_entries = Vec::new();
         let mut transition_actions = Vec::new();
         let mut timers = Vec::new();
-        #[cfg(feature = "persistence")]
-        let mut timer_names = Vec::new();
         let mut effects = Vec::<Box<str>>::new();
         let mut effect_ids = HashMap::<Box<str>, EffectId>::new();
         let mut effect_arguments = Vec::new();
@@ -1977,8 +1948,6 @@ impl StateTreeBuilder {
                             u32::try_from(timers.len()).map_err(|_| BuildError::TooManyTimers)?,
                         );
                         timers.push(*duration);
-                        #[cfg(feature = "persistence")]
-                        timer_names.push(_name.clone());
                         TransitionTrigger::After(timer)
                     }
                 };
@@ -2328,12 +2297,6 @@ impl StateTreeBuilder {
                 has_parallel,
                 datamodel,
                 timers: timers.into_boxed_slice(),
-                #[cfg(feature = "persistence")]
-                timer_names: timer_names.into_boxed_slice(),
-                #[cfg(feature = "persistence")]
-                has_anonymous_names: self.has_anonymous_names,
-                #[cfg(feature = "persistence")]
-                persistence_layout: std::sync::OnceLock::new(),
                 events: events.into_boxed_slice(),
                 event_requirements: event_requirements.into_boxed_slice(),
                 internal_events: internal_events.into_boxed_slice(),
@@ -2359,13 +2322,6 @@ impl StateTreeBuilder {
             return Err(BuildError::FinalChildOfParallel(parent));
         }
         self.add_state(name, Some(parent), kind)
-    }
-
-    pub(crate) fn mark_anonymous_name(&mut self) {
-        #[cfg(feature = "persistence")]
-        {
-            self.has_anonymous_names = true;
-        }
     }
 
     fn add_state(
@@ -2819,7 +2775,7 @@ pub(crate) fn is_luau_identifier(value: &str) -> bool {
 pub(crate) fn is_scxml_system_name(value: &str) -> bool {
     matches!(
         value,
-        "_event" | "_sessionid" | "_name" | "_ioprocessors" | "_x" | "In"
+        "config" | "_event" | "_sessionid" | "_name" | "_ioprocessors" | "_x" | "In"
     )
 }
 

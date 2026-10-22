@@ -43,17 +43,6 @@ mod trace;
 #[cfg(feature = "persistence")]
 pub mod persistence;
 
-/// Ordinary serializable data when persistence is enabled.
-#[cfg(feature = "persistence")]
-pub trait PersistenceData: serde::Serialize + serde::de::DeserializeOwned {}
-#[cfg(feature = "persistence")]
-impl<T: serde::Serialize + serde::de::DeserializeOwned> PersistenceData for T {}
-#[doc(hidden)]
-#[cfg(not(feature = "persistence"))]
-pub trait PersistenceData {}
-#[cfg(not(feature = "persistence"))]
-impl<T> PersistenceData for T {}
-
 #[cfg(test)]
 mod test_harness;
 
@@ -78,8 +67,8 @@ pub use event::{
     StateTreeEventDataError, StateTreeEventRef,
 };
 pub use instance::{
-    DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeDataOverrideError,
-    StateTreeDataOverrides, StateTreeInstance,
+    DatamodelOperation, InstanceStatus, RuntimeFault, StateTreeConfiguration,
+    StateTreeDataOverrideError, StateTreeDataOverrides, StateTreeInstance,
 };
 pub use luau::LuauValue;
 pub use plugin::{
@@ -105,14 +94,14 @@ pub mod prelude {
         StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityDefinition,
         StateTreeActivityError, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
         StateTreeActivityToken, StateTreeArgs, StateTreeArgument, StateTreeBinding,
-        StateTreeBindingSet, StateTreeBuilder, StateTreeConfig, StateTreeContext, StateTreeData,
-        StateTreeDataOverrideError, StateTreeDataOverrides, StateTreeDefinition, StateTreeDomain,
-        StateTreeDomainInventory, StateTreeDomainRegistry, StateTreeEffectArgs,
-        StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError, StateTreeEvent,
-        StateTreeEventDataError, StateTreeEventLog, StateTreeEventRef, StateTreeInstance,
-        StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue, StateTreePlugin,
-        StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTraceLog, StateTreeTracePlugin,
-        StateTreeTransition,
+        StateTreeBindingSet, StateTreeBuilder, StateTreeConfig, StateTreeConfiguration,
+        StateTreeContext, StateTreeData, StateTreeDataOverrideError, StateTreeDataOverrides,
+        StateTreeDefinition, StateTreeDomain, StateTreeDomainInventory, StateTreeDomainRegistry,
+        StateTreeEffectArgs, StateTreeEffectArgument, StateTreeEffectContext, StateTreeEffectError,
+        StateTreeEvent, StateTreeEventDataError, StateTreeEventLog, StateTreeEventRef,
+        StateTreeInstance, StateTreeLinkError, StateTreeLinkFailure, StateTreeLinkIssue,
+        StateTreePlugin, StateTreeSet, StateTreeSettings, StateTreeTarget, StateTreeTraceLog,
+        StateTreeTracePlugin, StateTreeTransition,
     };
 }
 pub use activity::{
