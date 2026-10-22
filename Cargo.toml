@@ -25,7 +25,7 @@ bevy_tasks = "0.20.0"
 bevy_time = "0.20.0"
 bevy_utils = "0.20.0"
 bevy_state_tree_macros = { version = "0.1.0", path = "macros" }
-bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "2fca026a670ba398c72bf2fceec44cf539e1d1d4" }
+bevy_luau = { git = "ssh://git@github.com/fxyoge/bevy_luau.git", rev = "359fd3beae41eaf88022650e385188d9b7629447" }
 full_moon = { version = "2.2.0", features = ["luau"] }
 quick-xml = "0.41"
 thiserror = "2.0"
@@ -36,9 +36,6 @@ serde_json = { version = "1", optional = true }
 tempfile = "3"
 bevy_ecs = { version = "0.20.0", features = ["bevy_reflect", "multi_threaded"] }
 divan = "0.1.21"
-
-[patch."ssh://git@github.com/fxyoge/bevy_luau.git"]
-bevy_luau = { path = "../bevy_luau" }
 
 [[example]]
 name = "save_slots"
