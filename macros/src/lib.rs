@@ -4,7 +4,7 @@ use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Error, LitStr, Path, parse_macro_input, spanned::Spanned};
 
 #[proc_macro_derive(StateTreeEvent, attributes(state_tree, serde))]
-/// Declares one external event payload for a state-tree domain.
+/// Declares one typed external state-tree event payload.
 pub fn derive_state_tree_event(input: TokenStream) -> TokenStream {
     expand_state_tree_event(parse_macro_input!(input as DeriveInput))
         .unwrap_or_else(Error::into_compile_error)
@@ -34,7 +34,6 @@ fn expand_state_tree_event_with_runtime(
 
     let options = parse_options(&input)?;
     let payload = &input.ident;
-    let domain = options.domain;
     let authored_name = options.name;
     let event_data = if let Some(projector) = options.data {
         quote! {
@@ -52,16 +51,16 @@ fn expand_state_tree_event_with_runtime(
     };
     let routing_impl = if options.broadcast {
         quote! {
-            impl #runtime::BroadcastStateTreeEvent<#domain> for #payload {}
+            impl #runtime::BroadcastStateTreeEvent for #payload {}
         }
     } else {
         quote! {
-            impl #runtime::EntityStateTreeEvent<#domain> for #payload {}
+            impl #runtime::EntityStateTreeEvent for #payload {}
         }
     };
 
     Ok(quote! {
-        impl #runtime::StateTreeEvent<#domain> for #payload {
+        impl #runtime::StateTreeEvent for #payload {
             const AUTHORED_NAME: &'static str = #authored_name;
 
             #event_data
@@ -83,14 +82,12 @@ fn runtime_crate() -> syn::Result<proc_macro2::TokenStream> {
 }
 
 struct Options {
-    domain: Path,
     name: LitStr,
     broadcast: bool,
     data: Option<Path>,
 }
 
 fn parse_options(input: &DeriveInput) -> syn::Result<Options> {
-    let mut domain = None;
     let mut name = None;
     let mut broadcast = false;
     let mut data = None;
@@ -109,13 +106,7 @@ fn parse_options(input: &DeriveInput) -> syn::Result<Options> {
         }
         found = true;
         attribute.parse_nested_meta(|meta| {
-            if meta.path.is_ident("domain") {
-                if domain.is_some() {
-                    return Err(meta.error("`domain` was specified more than once"));
-                }
-                domain = Some(meta.value()?.parse()?);
-                Ok(())
-            } else if meta.path.is_ident("name") {
+            if meta.path.is_ident("name") {
                 if name.is_some() {
                     return Err(meta.error("`name` was specified more than once"));
                 }
@@ -134,19 +125,11 @@ fn parse_options(input: &DeriveInput) -> syn::Result<Options> {
                 data = Some(meta.value()?.parse()?);
                 Ok(())
             } else {
-                Err(meta.error(
-                    "expected `domain = DomainType`, `name = \"...\"`, `broadcast`, or `data = path`",
-                ))
+                Err(meta.error("expected `name = \"...\"`, `broadcast`, or `data = path`"))
             }
         })?;
     }
 
-    let domain = domain.ok_or_else(|| {
-        Error::new(
-            input.ident.span(),
-            "missing `domain` in `#[state_tree(...)]`",
-        )
-    })?;
     let name = name
         .ok_or_else(|| Error::new(input.ident.span(), "missing `name` in `#[state_tree(...)]`"))?;
     if name.value().is_empty() {
@@ -157,7 +140,6 @@ fn parse_options(input: &DeriveInput) -> syn::Result<Options> {
     }
 
     Ok(Options {
-        domain,
         name,
         broadcast,
         data,
@@ -178,7 +160,7 @@ mod tests {
     #[test]
     fn expands_entity_payload() {
         let input: DeriveInput = parse_quote! {
-            #[state_tree(domain = Simulation, name = "damage")]
+            #[state_tree(name = "damage")]
             struct Damage {
                 amount: u32,
             }
@@ -186,8 +168,8 @@ mod tests {
 
         let output = expand(input).unwrap().to_string();
 
-        assert!(output.contains("StateTreeEvent < Simulation > for Damage"));
-        assert!(output.contains("EntityStateTreeEvent < Simulation > for Damage"));
+        assert!(output.contains("StateTreeEvent for Damage"));
+        assert!(output.contains("EntityStateTreeEvent for Damage"));
         assert!(output.contains("AUTHORED_NAME"));
         assert!(output.contains("damage"));
         assert!(!output.contains("BroadcastStateTreeEvent"));
@@ -197,7 +179,6 @@ mod tests {
     fn expands_broadcast_payload_with_data_projector() {
         let input: DeriveInput = parse_quote! {
             #[state_tree(
-                domain = Simulation,
                 name = "reset",
                 broadcast,
                 data = project_reset
@@ -210,7 +191,7 @@ mod tests {
 
         let output = expand(input).unwrap().to_string();
 
-        assert!(output.contains("BroadcastStateTreeEvent < Simulation > for Reset"));
+        assert!(output.contains("BroadcastStateTreeEvent for Reset"));
         assert!(output.contains("project_reset (self)"));
         assert!(output.contains("Option :: Some"));
         assert!(!output.contains("EntityStateTreeEvent"));
@@ -219,7 +200,7 @@ mod tests {
     #[test]
     fn rejects_generic_payloads() {
         let input: DeriveInput = parse_quote! {
-            #[state_tree(domain = Simulation, name = "payload")]
+            #[state_tree(name = "payload")]
             struct Payload<T>(T);
         };
 
@@ -231,7 +212,7 @@ mod tests {
     #[test]
     fn rejects_unions() {
         let input: DeriveInput = parse_quote! {
-            #[state_tree(domain = Simulation, name = "payload")]
+            #[state_tree(name = "payload")]
             union Payload {
                 integer: u32,
                 float: f32,
@@ -244,27 +225,31 @@ mod tests {
     }
 
     #[test]
-    fn requires_domain_and_name() {
-        let missing_domain: DeriveInput = parse_quote! {
-            #[state_tree(name = "payload")]
-            struct Payload;
-        };
+    fn requires_name() {
         let missing_name: DeriveInput = parse_quote! {
-            #[state_tree(domain = Simulation)]
+            #[state_tree(broadcast)]
             struct Payload;
         };
 
-        assert!(
-            expand(missing_domain)
-                .unwrap_err()
-                .to_string()
-                .contains("missing `domain`")
-        );
         assert!(
             expand(missing_name)
                 .unwrap_err()
                 .to_string()
                 .contains("missing `name`")
+        );
+    }
+
+    #[test]
+    fn rejects_removed_domain_option() {
+        let input: DeriveInput = parse_quote! {
+            #[state_tree(domain = Simulation, name = "payload")]
+            struct Payload;
+        };
+        assert!(
+            expand(input)
+                .unwrap_err()
+                .to_string()
+                .contains("expected `name")
         );
     }
 }

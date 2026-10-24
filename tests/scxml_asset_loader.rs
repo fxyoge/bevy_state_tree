@@ -7,13 +7,7 @@ use bevy_time::TimePlugin;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ScheduleLabel)]
 struct StateTreeUpdate;
 
-struct TestDomain;
-
-impl StateTreeDomain for TestDomain {
-    const AUTHORED_NAME: &'static str = "test";
-
-    fn configure(_config: &mut StateTreeConfig<'_, Self>) {}
-}
+fn configure_test(_config: &mut StateTreeConfig<'_>) {}
 
 fn test_app() -> App {
     let mut app = App::new();
@@ -28,7 +22,7 @@ fn test_app() -> App {
         },
     ))
     .init_schedule(StateTreeUpdate)
-    .add_plugins(StateTreePlugin::<TestDomain>::new(StateTreeUpdate));
+    .add_plugins(StateTreePlugin::new(StateTreeUpdate).configure(configure_test));
     app
 }
 
@@ -47,14 +41,14 @@ fn plugin_loads_scxml_assets_and_initializes_instances() {
         .load::<StateTreeDefinition>("loaded.scxml");
     let entity = app
         .world_mut()
-        .spawn(StateTreeInstance::<TestDomain>::new(handle.clone()))
+        .spawn(StateTreeInstance::new(handle.clone()))
         .id();
 
     for _ in 0..1_000 {
         update(&mut app);
         if app
             .world()
-            .get::<StateTreeInstance<TestDomain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .is_some_and(|instance| instance.status() == &InstanceStatus::Running)
         {
             break;
@@ -67,58 +61,14 @@ fn plugin_loads_scxml_assets_and_initializes_instances() {
         .get(&handle)
         .expect("SCXML definition should load");
     assert_eq!(definition.name(), "loaded");
-    assert_eq!(definition.domain(), Some("test"));
     assert_eq!(definition.state_count(), 2);
 
     let instance = app
         .world()
-        .get::<StateTreeInstance<TestDomain>>(entity)
+        .get::<StateTreeInstance>(entity)
         .expect("state-tree instance should remain present");
     assert_eq!(instance.status(), &InstanceStatus::Running);
     assert_eq!(instance.active_state_names().last(), Some("idle"));
-}
-
-#[test]
-fn declared_domain_mismatch_is_reported_during_linking() {
-    let mut app = test_app();
-    let handle = app
-        .world()
-        .resource::<AssetServer>()
-        .load::<StateTreeDefinition>("mismatched-domain.scxml");
-    let entity = app
-        .world_mut()
-        .spawn(StateTreeInstance::<TestDomain>::new(handle.clone()))
-        .id();
-
-    for _ in 0..1_000 {
-        update(&mut app);
-        if app
-            .world()
-            .get::<StateTreeLinkFailure<TestDomain>>(entity)
-            .is_some()
-        {
-            break;
-        }
-    }
-
-    assert!(
-        app.world()
-            .resource::<Assets<StateTreeDefinition>>()
-            .contains(&handle),
-        "domain-independent definition should load successfully"
-    );
-    let failure = app
-        .world()
-        .get::<StateTreeLinkFailure<TestDomain>>(entity)
-        .expect("domain linking should reject the declaration");
-    assert!(matches!(
-        failure.error().issues(),
-        [StateTreeLinkIssue::DomainMismatch {
-            declared,
-            expected,
-            ..
-        }] if declared.as_ref() == "other" && expected.as_ref() == "test"
-    ));
 }
 
 #[test]
@@ -168,16 +118,12 @@ fn event_protocol_linking_remains_deferred_until_initialization() {
         .load::<StateTreeDefinition>("unlinked.scxml");
     let entity = app
         .world_mut()
-        .spawn(StateTreeInstance::<TestDomain>::new(handle.clone()))
+        .spawn(StateTreeInstance::new(handle.clone()))
         .id();
 
     for _ in 0..1_000 {
         update(&mut app);
-        if app
-            .world()
-            .get::<StateTreeLinkFailure<TestDomain>>(entity)
-            .is_some()
-        {
+        if app.world().get::<StateTreeLinkFailure>(entity).is_some() {
             break;
         }
     }
@@ -186,18 +132,18 @@ fn event_protocol_linking_remains_deferred_until_initialization() {
         app.world()
             .resource::<Assets<StateTreeDefinition>>()
             .contains(&handle),
-        "domain-independent definition should load successfully"
+        "compiled definition should load successfully"
     );
     let instance = app
         .world()
-        .get::<StateTreeInstance<TestDomain>>(entity)
+        .get::<StateTreeInstance>(entity)
         .expect("state-tree instance should remain present");
     assert_eq!(instance.status(), &InstanceStatus::Pending);
 
     let failure = app
         .world()
-        .get::<StateTreeLinkFailure<TestDomain>>(entity)
-        .expect("domain linking should reject the unknown event");
+        .get::<StateTreeLinkFailure>(entity)
+        .expect("protocol linking should reject the unknown event");
     assert!(matches!(
         failure.error().issues(),
         [StateTreeLinkIssue::UnmatchedEventDescriptor { descriptor, .. }]

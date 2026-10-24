@@ -36,7 +36,6 @@ definition_parity_test!(history_parity, "history", history_definition);
 
 fn history_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("history");
-    builder.domain("test");
     let root = builder.compound_root("#document")?;
     let owner = builder.compound("owner", root)?;
     let first = builder.atomic("first", owner)?;
@@ -58,7 +57,6 @@ fn history_definition() -> Result<StateTreeDefinition, BuildError> {
 
 fn activity_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("activity");
-    builder.domain("test");
     builder.luau_datamodel([StateTreeData::new("target").with_initializer("'north'")])?;
     let root = builder.compound_root("#document")?;
     let active = builder.atomic("active", root)?;
@@ -75,7 +73,6 @@ fn activity_definition() -> Result<StateTreeDefinition, BuildError> {
 
 fn hierarchy_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("hierarchy");
-    builder.domain("test");
     let root = builder.compound_root("#document")?;
     let parent = builder.compound("parent", root)?;
     let idle = builder.atomic("idle", parent)?;
@@ -101,7 +98,6 @@ fn hierarchy_definition() -> Result<StateTreeDefinition, BuildError> {
 
 fn transition_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("transitions");
-    builder.domain("test");
     builder.luau_datamodel([
         StateTreeData::new("count").with_initializer("0"),
         StateTreeData::new("last"),
@@ -139,7 +135,6 @@ fn transition_definition() -> Result<StateTreeDefinition, BuildError> {
 
 fn action_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("actions");
-    builder.domain("test");
     builder.luau_datamodel([StateTreeData::new("value").with_initializer("1")])?;
     let root = builder.compound_root("#document")?;
     let parent = builder.compound("parent", root)?;
@@ -182,7 +177,6 @@ fn action_definition() -> Result<StateTreeDefinition, BuildError> {
 
 fn minimal_luau_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("minimal-luau");
-    builder.domain("test");
     builder.luau_datamodel([])?;
     let root = builder.compound_root("#document")?;
     let state = builder.atomic("#anonymous0", root)?;
@@ -193,7 +187,6 @@ fn minimal_luau_definition() -> Result<StateTreeDefinition, BuildError> {
 
 fn after_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("after-transitions");
-    builder.domain("test");
     let root = builder.compound_root("#document")?;
     let waiting = builder.atomic("waiting", root)?;
     let done = builder.final_state("done", root)?;
@@ -207,7 +200,6 @@ fn after_definition() -> Result<StateTreeDefinition, BuildError> {
 
 fn internal_definition() -> Result<StateTreeDefinition, BuildError> {
     let mut builder = StateTreeBuilder::new("internal-transition");
-    builder.domain("test");
     let root = builder.compound_root("#document")?;
     let parent = builder.compound("parent", root)?;
     let first = builder.atomic("first", parent)?;

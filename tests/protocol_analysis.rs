@@ -3,42 +3,31 @@ use bevy_asset::AssetPlugin;
 use bevy_ecs::{event::Event, message::Message};
 use bevy_state_tree::{
     StateTreeAction, StateTreeActivity, StateTreeActivityDefinition, StateTreeBuilder,
-    StateTreeConfig, StateTreeDefinition, StateTreeDomain, StateTreeDomainRegistry, StateTreeEvent,
-    StateTreePlugin, StateTreeProtocolIssue, StateTreeTransition, analyze_state_tree_protocol,
+    StateTreeConfig, StateTreeDefinition, StateTreeEvent, StateTreePlugin,
+    StateTreeProtocolInventory, StateTreeProtocolIssue, StateTreeTransition,
+    analyze_state_tree_protocol,
 };
 use bevy_time::TimePlugin;
 
-struct TestDomain;
-
-impl StateTreeDomain for TestDomain {
-    const AUTHORED_NAME: &'static str = "test";
-
-    fn configure(config: &mut StateTreeConfig<'_, Self>) {
-        config
-            .event::<UsedEvent>()
-            .event::<UnusedEvent>()
-            .effect::<EffectMessage, _>("used.effect", |_context, _arguments| Ok(EffectMessage))
-            .effect::<EffectMessage, _>("unused.effect", |_context, _arguments| Ok(EffectMessage))
-            .activity::<TestActivity, _>("used.activity", |_context, _arguments| Ok(TestActivity))
-            .activity::<TestActivity, _>("unused.activity", |_context, _arguments| {
-                Ok(TestActivity)
-            });
-    }
+fn configure(config: &mut StateTreeConfig<'_>) {
+    config
+        .event::<UsedEvent>()
+        .event::<UnusedEvent>()
+        .effect("used.effect", |_, _| Ok(EffectMessage))
+        .effect("unused.effect", |_, _| Ok(EffectMessage))
+        .activity("used.activity", |_, _| Ok(TestActivity))
+        .activity("unused.activity", |_, _| Ok(TestActivity));
 }
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = TestDomain, name = "used.event", broadcast)]
+#[state_tree(name = "used.event", broadcast)]
 struct UsedEvent;
-
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = TestDomain, name = "unused.event", broadcast)]
+#[state_tree(name = "unused.event", broadcast)]
 struct UnusedEvent;
-
 #[derive(Message)]
 struct EffectMessage;
-
 struct TestActivity;
-
 impl StateTreeActivity for TestActivity {
     type Output = ();
     type Error = ();
@@ -46,23 +35,22 @@ impl StateTreeActivity for TestActivity {
 
 fn app() -> App {
     let mut app = App::new();
-    app.add_plugins((TimePlugin, AssetPlugin::default()));
-    app.add_plugins(StateTreePlugin::<TestDomain>::new(Update));
+    app.add_plugins((
+        TimePlugin,
+        AssetPlugin::default(),
+        StateTreePlugin::new(Update).configure(configure),
+    ));
     app
 }
 
 fn definition(
     name: &str,
-    domain: Option<&str>,
     event: Option<&str>,
     effect: Option<&str>,
     activity: Option<&str>,
     internal_event: Option<&str>,
 ) -> StateTreeDefinition {
     let mut builder = StateTreeBuilder::new(name);
-    if let Some(domain) = domain {
-        builder.domain(domain);
-    }
     let root = builder.compound_root("root").unwrap();
     let active = builder.atomic("active", root).unwrap();
     builder.initial(root, active).unwrap();
@@ -94,47 +82,39 @@ fn definition(
 }
 
 #[test]
-fn inventory_and_generated_definition_usage_cover_all_registration_kinds() {
+fn inventory_and_generated_usage_cover_all_registration_kinds() {
     let app = app();
-    let registry = app.world().resource::<StateTreeDomainRegistry>();
-    let domain = registry.get("test").unwrap();
-    assert_eq!(domain.authored_name(), "test");
+    let inventory = app.world().resource::<StateTreeProtocolInventory>();
     assert_eq!(
-        domain.events().collect::<Vec<_>>(),
+        inventory.events().collect::<Vec<_>>(),
         ["unused.event", "used.event"]
     );
     assert_eq!(
-        domain.effects().collect::<Vec<_>>(),
+        inventory.effects().collect::<Vec<_>>(),
         ["unused.effect", "used.effect"]
     );
     assert_eq!(
-        domain.activities().collect::<Vec<_>>(),
+        inventory.activities().collect::<Vec<_>>(),
         ["bst.spawn", "unused.activity", "used.activity"]
     );
-
     let generated = definition(
         "generated",
-        Some("test"),
         Some("used.event"),
         Some("used.effect"),
         Some("used.activity"),
         None,
     );
-    let analysis = analyze_state_tree_protocol(registry, [("generated", &generated)]);
     assert_eq!(
-        analysis.issues(),
+        analyze_state_tree_protocol(inventory, [("generated", &generated)]).issues(),
         [
             StateTreeProtocolIssue::UnusedEvent {
-                domain: "test".into(),
-                event: "unused.event".into(),
+                event: "unused.event".into()
             },
             StateTreeProtocolIssue::UnusedEffect {
-                domain: "test".into(),
-                effect: "unused.effect".into(),
+                effect: "unused.effect".into()
             },
             StateTreeProtocolIssue::UnusedActivity {
-                domain: "test".into(),
-                activity: "unused.activity".into(),
+                activity: "unused.activity".into()
             },
         ]
     );
@@ -143,124 +123,73 @@ fn inventory_and_generated_definition_usage_cover_all_registration_kinds() {
 #[test]
 fn built_in_activity_validates_but_is_never_reported_unused() {
     let app = app();
-    let registry = app.world().resource::<StateTreeDomainRegistry>();
-    let spawn = definition("spawn", Some("test"), None, None, Some("bst.spawn"), None);
-    let analysis = analyze_state_tree_protocol(registry, [("spawn", &spawn)]);
-    assert!(!analysis.issues().iter().any(|issue| matches!(
-        issue,
-        StateTreeProtocolIssue::MissingActivity { activity, .. }
-            | StateTreeProtocolIssue::UnusedActivity { activity, .. }
-            if activity.as_ref() == "bst.spawn"
-    )));
+    let inventory = app.world().resource::<StateTreeProtocolInventory>();
+    let spawn = definition("spawn", None, None, Some("bst.spawn"), None);
+    let analysis = analyze_state_tree_protocol(inventory, [("spawn", &spawn)]);
+    assert!(!analysis.issues().iter().any(|issue| matches!(issue,
+        StateTreeProtocolIssue::MissingActivity { activity, .. } | StateTreeProtocolIssue::UnusedActivity { activity }
+        if activity.as_ref() == "bst.spawn")));
 }
 
 #[test]
-fn reports_domain_and_missing_registration_issues_without_requiring_internal_events() {
+fn missing_registrations_are_reported_without_requiring_internal_events() {
     let app = app();
-    let registry = app.world().resource::<StateTreeDomainRegistry>();
-    let domainless = definition("domainless", None, None, None, None, None);
-    let unknown = definition("unknown", Some("other"), None, None, None, None);
+    let inventory = app.world().resource::<StateTreeProtocolInventory>();
     let missing = definition(
         "missing",
-        Some("test"),
         Some("missing.event"),
         Some("missing.effect"),
         Some("missing.activity"),
         Some("local.event"),
     );
-
-    let analysis = analyze_state_tree_protocol(
-        registry,
-        [
-            ("unknown.asset", &unknown),
-            ("missing.asset", &missing),
-            ("domainless.asset", &domainless),
-        ],
-    );
-    assert!(
-        analysis
-            .issues()
-            .contains(&StateTreeProtocolIssue::DomainlessDefinition {
-                label: "domainless.asset".into(),
-            })
-    );
-    assert!(
-        analysis
-            .issues()
-            .contains(&StateTreeProtocolIssue::UnknownDomain {
-                label: "unknown.asset".into(),
-                domain: "other".into(),
-            })
-    );
-    assert!(
-        analysis
-            .issues()
-            .contains(&StateTreeProtocolIssue::MissingEvent {
-                label: "missing.asset".into(),
-                domain: "test".into(),
-                event: "missing.event".into(),
-            })
-    );
-    assert!(
-        analysis
-            .issues()
-            .contains(&StateTreeProtocolIssue::MissingEffect {
-                label: "missing.asset".into(),
-                domain: "test".into(),
-                effect: "missing.effect".into(),
-            })
-    );
-    assert!(
-        analysis
-            .issues()
-            .contains(&StateTreeProtocolIssue::MissingActivity {
-                label: "missing.asset".into(),
-                domain: "test".into(),
-                activity: "missing.activity".into(),
-            })
-    );
-    assert!(!analysis.issues().iter().any(|issue| matches!(
-        issue,
-        StateTreeProtocolIssue::MissingEvent { event, .. } if event.as_ref() == "local.event"
-    )));
+    let analysis = analyze_state_tree_protocol(inventory, [("missing.asset", &missing)]);
+    for expected in [
+        StateTreeProtocolIssue::MissingEvent {
+            label: "missing.asset".into(),
+            event: "missing.event".into(),
+        },
+        StateTreeProtocolIssue::MissingEffect {
+            label: "missing.asset".into(),
+            effect: "missing.effect".into(),
+        },
+        StateTreeProtocolIssue::MissingActivity {
+            label: "missing.asset".into(),
+            activity: "missing.activity".into(),
+        },
+    ] {
+        assert!(analysis.issues().contains(&expected));
+    }
+    assert!(!analysis.issues().iter().any(|issue| matches!(issue,
+        StateTreeProtocolIssue::MissingEvent { event, .. } if event.as_ref() == "local.event")));
 }
 
 #[test]
-fn results_are_deterministic_and_duplicate_references_do_not_duplicate_usage() {
+fn results_are_deterministic_and_duplicate_references_do_not_duplicate_findings() {
     let app = app();
-    let registry = app.world().resource::<StateTreeDomainRegistry>();
+    let inventory = app.world().resource::<StateTreeProtocolInventory>();
     let used = definition(
         "used",
-        Some("test"),
         Some("used.event"),
         Some("used.effect"),
         Some("used.activity"),
         None,
     );
-    let domainless = definition("domainless", None, None, None, None, None);
-
+    let missing = definition("missing", Some("missing.event"), None, None, None);
     let first = analyze_state_tree_protocol(
-        registry,
+        inventory,
         [
-            ("used.asset", &used),
-            ("domainless.asset", &domainless),
-            ("used.asset", &used),
+            ("used", &used),
+            ("missing", &missing),
+            ("missing", &missing),
         ],
     );
-    let second = analyze_state_tree_protocol(
-        registry,
-        [
-            ("used.asset", &used),
-            ("used.asset", &used),
-            ("domainless.asset", &domainless),
-        ],
-    );
+    let second = analyze_state_tree_protocol(inventory, [("missing", &missing), ("used", &used)]);
     assert_eq!(first, second);
     assert_eq!(
         first
             .issues()
             .iter()
-            .filter(|issue| matches!(issue, StateTreeProtocolIssue::DomainlessDefinition { .. }))
+            .filter(|issue| matches!(issue, StateTreeProtocolIssue::MissingEvent { .. }))
             .count(),
         1
     );

@@ -10,22 +10,31 @@ use bevy_time::{Time, TimePlugin};
 
 use crate::{
     BroadcastStateTreeEvent, InstanceStatus, LuauValue, StateTreeDataOverrides,
-    StateTreeDefinition, StateTreeDomain, StateTreeInstance, StateTreePlugin, StateTreeSettings,
-    StateTreeTraceLog, StateTreeTracePlugin,
+    StateTreeDefinition, StateTreeInstance, StateTreePlugin, StateTreeSettings, StateTreeTraceLog,
+    StateTreeTracePlugin,
 };
 
-pub(crate) struct TestApp<D: StateTreeDomain> {
+pub(crate) struct TestApp {
     app: App,
     entity: bevy_ecs::entity::Entity,
-    marker: std::marker::PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> TestApp<D> {
-    pub(crate) fn new(definition: StateTreeDefinition, limit: NonZeroUsize) -> Self {
-        Self::with_initial_data(definition, limit, StateTreeDataOverrides::default())
+impl TestApp {
+    pub(crate) fn new(
+        configure: fn(&mut crate::StateTreeConfig<'_>),
+        definition: StateTreeDefinition,
+        limit: NonZeroUsize,
+    ) -> Self {
+        Self::with_initial_data(
+            configure,
+            definition,
+            limit,
+            StateTreeDataOverrides::default(),
+        )
     }
 
     pub(crate) fn with_initial_data(
+        configure: fn(&mut crate::StateTreeConfig<'_>),
         definition: StateTreeDefinition,
         limit: NonZeroUsize,
         initial_data: StateTreeDataOverrides,
@@ -34,30 +43,26 @@ impl<D: StateTreeDomain> TestApp<D> {
         app.add_plugins((
             TimePlugin,
             AssetPlugin::default(),
-            StateTreeTracePlugin::<D>::default(),
-            StateTreePlugin::<D>::new(Update),
+            StateTreeTracePlugin,
+            StateTreePlugin::new(Update).configure(configure),
         ));
-        app.insert_resource(StateTreeSettings::<D>::new(limit));
+        app.insert_resource(StateTreeSettings::new(limit));
         let handle = app
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition);
         let entity = app
             .world_mut()
-            .spawn(StateTreeInstance::<D>::new_with_initial_data(
+            .spawn(StateTreeInstance::new_with_initial_data(
                 handle,
                 initial_data,
             ))
             .id();
         app.update();
-        Self {
-            app,
-            entity,
-            marker: std::marker::PhantomData,
-        }
+        Self { app, entity }
     }
 
-    pub(crate) fn instance(&self) -> &StateTreeInstance<D> {
+    pub(crate) fn instance(&self) -> &StateTreeInstance {
         self.app
             .world()
             .get(self.entity)
@@ -78,12 +83,12 @@ impl<D: StateTreeDomain> TestApp<D> {
 
     pub(crate) fn process_event<E>(&mut self, event: E) -> bool
     where
-        E: BroadcastStateTreeEvent<D>,
+        E: BroadcastStateTreeEvent,
     {
         let before = self.trace().as_str().matches("transition ").count();
         self.app
             .world_mut()
-            .run_system_once_with(queue_broadcast::<D, E>, event)
+            .run_system_once_with(queue_broadcast::<E>, event)
             .expect("test event writer system runs");
         self.app.world_mut().run_schedule(Update);
         before != self.trace().as_str().matches("transition ").count()
@@ -102,7 +107,7 @@ impl<D: StateTreeDomain> TestApp<D> {
     pub(crate) fn trace(&self) -> crate::StateTreeEventLog {
         self.app
             .world()
-            .resource::<StateTreeTraceLog<D>>()
+            .resource::<StateTreeTraceLog>()
             .get(self.entity)
             .expect("test instance has a trace")
     }
@@ -120,10 +125,9 @@ impl<D: StateTreeDomain> TestApp<D> {
     }
 }
 
-fn queue_broadcast<D, E>(In(event): In<E>, mut writer: crate::BroadcastStateTreeEventWriter<D>)
+fn queue_broadcast<E>(In(event): In<E>, mut writer: crate::BroadcastStateTreeEventWriter)
 where
-    D: StateTreeDomain,
-    E: BroadcastStateTreeEvent<D> + Event,
+    E: BroadcastStateTreeEvent + Event,
 {
     writer.write(event);
 }

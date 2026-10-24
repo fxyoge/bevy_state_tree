@@ -6,23 +6,19 @@ use bevy_state_tree::{persistence::Checkpoint, prelude::*};
 use bevy_time::{Time, TimePlugin};
 use std::time::Duration;
 
-struct Domain;
-impl StateTreeDomain for Domain {
-    const AUTHORED_NAME: &'static str = "test";
-    fn configure(config: &mut StateTreeConfig<'_, Self>) {
-        config
-            .event::<Advance>()
-            .activity("work", |_, args| Ok(Work(args.take("setting")?)));
-    }
+fn configure(config: &mut StateTreeConfig<'_>) {
+    config
+        .event::<Advance>()
+        .activity("work", |_, args| Ok(Work(args.take("setting")?)));
 }
 struct Work(i64);
 impl StateTreeActivity for Work {
     type Output = ();
     type Error = ();
 }
-type Token = StateTreeActivityToken<Domain, Work>;
+type Token = StateTreeActivityToken<Work>;
 #[derive(EntityEvent, StateTreeEvent)]
-#[state_tree(domain = Domain, name = "advance")]
+#[state_tree(name = "advance")]
 struct Advance {
     entity: Entity,
 }
@@ -33,7 +29,7 @@ struct Starts(usize);
 #[derive(Resource)]
 struct ConsumersEnabled(bool);
 fn lifecycle(
-    mut messages: MessageReader<StateTreeActivityLifecycle<Domain, Work>>,
+    mut messages: MessageReader<StateTreeActivityLifecycle<Work>>,
     mut runs: ResMut<Runs>,
     mut starts: ResMut<Starts>,
 ) {
@@ -55,7 +51,7 @@ fn app() -> App {
         TaskPoolPlugin::default(),
         TimePlugin,
         AssetPlugin::default(),
-        StateTreePlugin::<Domain>::new(Update),
+        StateTreePlugin::new(Update).configure(configure),
     ))
     .init_resource::<Runs>()
     .init_resource::<Starts>()
@@ -91,12 +87,12 @@ fn definition(updated: bool) -> StateTreeDefinition {
 }
 fn xml(body: &str) -> StateTreeDefinition {
     let source = format!(
-        r#"<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" bst:domain="test" datamodel="luau">{body}</scxml>"#
+        r#"<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" datamodel="luau">{body}</scxml>"#
     );
     bevy_state_tree::scxml::compile(&bevy_state_tree::scxml::parse("test.scxml", &source).unwrap())
         .unwrap()
 }
-fn configuration(extra: i64) -> StateTreeConfiguration<Domain> {
+fn configuration(extra: i64) -> StateTreeConfiguration {
     StateTreeConfiguration::new([("extra".into(), LuauValue::Integer(extra))])
 }
 fn spawn(app: &mut App, definition: StateTreeDefinition) -> (Entity, Handle<StateTreeDefinition>) {
@@ -106,17 +102,14 @@ fn spawn(app: &mut App, definition: StateTreeDefinition) -> (Entity, Handle<Stat
         .add(definition);
     let entity = app
         .world_mut()
-        .spawn((
-            StateTreeInstance::<Domain>::new(handle.clone()),
-            configuration(2),
-        ))
+        .spawn((StateTreeInstance::new(handle.clone()), configuration(2)))
         .id();
     app.world_mut().run_schedule(Update);
     (entity, handle)
 }
 fn advance(app: &mut App, entity: Entity) {
     app.world_mut()
-        .run_system_once(move |mut writer: EntityStateTreeEventWriter<Domain>| {
+        .run_system_once(move |mut writer: EntityStateTreeEventWriter| {
             writer.write(Advance { entity })
         })
         .unwrap();
@@ -124,7 +117,7 @@ fn advance(app: &mut App, entity: Entity) {
 }
 fn data(app: &App, entity: Entity, name: &str) -> Option<LuauValue> {
     app.world()
-        .get::<StateTreeInstance<Domain>>(entity)
+        .get::<StateTreeInstance>(entity)
         .unwrap()
         .data(name)
         .cloned()
@@ -147,7 +140,7 @@ fn checkpoint_only_restores_datamodel_then_enters_current_initial_configuration(
     checkpoint.restore(target.world_mut()).unwrap();
     let entity = target
         .world_mut()
-        .query_filtered::<Entity, With<StateTreeInstance<Domain>>>()
+        .query_filtered::<Entity, With<StateTreeInstance>>()
         .single(target.world())
         .unwrap();
     target
@@ -174,7 +167,7 @@ fn checkpoint_only_restores_datamodel_then_enters_current_initial_configuration(
     assert_eq!(
         target
             .world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .active_state_names()
             .last(),
@@ -192,14 +185,12 @@ fn hot_reload_restarts_timers_and_activities_and_drops_old_outcomes_and_events()
         .advance_by(Duration::from_secs(7));
     app.world_mut().run_schedule(Update);
     app.world_mut()
-        .run_system_once(
-            move |mut writer: StateTreeActivityOutcomeWriter<Domain, Work>| {
-                assert!(writer.complete(old, ()))
-            },
-        )
+        .run_system_once(move |mut writer: StateTreeActivityOutcomeWriter<Work>| {
+            assert!(writer.complete(old, ()))
+        })
         .unwrap();
     app.world_mut()
-        .run_system_once(move |mut writer: EntityStateTreeEventWriter<Domain>| {
+        .run_system_once(move |mut writer: EntityStateTreeEventWriter| {
             writer.write(Advance { entity })
         })
         .unwrap();
@@ -216,8 +207,7 @@ fn hot_reload_restarts_timers_and_activities_and_drops_old_outcomes_and_events()
     assert!(
         !app.world_mut()
             .run_system_once(
-                move |mut writer: StateTreeActivityOutcomeWriter<Domain, Work>| writer
-                    .complete(old, ())
+                move |mut writer: StateTreeActivityOutcomeWriter<Work>| writer.complete(old, ())
             )
             .unwrap()
     );
@@ -227,7 +217,7 @@ fn hot_reload_restarts_timers_and_activities_and_drops_old_outcomes_and_events()
     app.world_mut().run_schedule(Update);
     assert_eq!(
         app.world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .status(),
         &InstanceStatus::Running
@@ -238,7 +228,7 @@ fn hot_reload_restarts_timers_and_activities_and_drops_old_outcomes_and_events()
     app.world_mut().run_schedule(Update);
     assert_eq!(
         app.world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .status(),
         &InstanceStatus::Complete
@@ -275,7 +265,7 @@ fn sqlite_restore_restarts_completed_execution_and_replays_current_entry_actions
     assert_eq!(
         first
             .world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .status(),
         &InstanceStatus::Complete
@@ -290,7 +280,7 @@ fn sqlite_restore_restarts_completed_execution_and_replays_current_entry_actions
     second.world_mut().load().unwrap();
     let entity = second
         .world_mut()
-        .query_filtered::<Entity, With<StateTreeInstance<Domain>>>()
+        .query_filtered::<Entity, With<StateTreeInstance>>()
         .single(second.world())
         .unwrap();
     second
@@ -306,7 +296,7 @@ fn sqlite_restore_restarts_completed_execution_and_replays_current_entry_actions
     assert_eq!(
         second
             .world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .status(),
         &InstanceStatus::Running
@@ -327,12 +317,12 @@ fn boot_routing_is_ordinary_scxml_using_persistent_data() {
     app.world_mut().run_schedule(Update);
     let entity = app
         .world_mut()
-        .query_filtered::<Entity, With<StateTreeInstance<Domain>>>()
+        .query_filtered::<Entity, With<StateTreeInstance>>()
         .single(app.world())
         .unwrap();
     assert_eq!(
         app.world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .active_state_names()
             .last(),
@@ -360,8 +350,8 @@ fn configuration_is_recursively_read_only_inside_expressions() {
     let entity = app
         .world_mut()
         .spawn((
-            StateTreeInstance::<Domain>::new(handle),
-            StateTreeConfiguration::<Domain>::new([(
+            StateTreeInstance::new(handle),
+            StateTreeConfiguration::new([(
                 "nested".into(),
                 LuauValue::Record([("value".into(), LuauValue::Integer(1))].into()),
             )]),
@@ -370,7 +360,7 @@ fn configuration_is_recursively_read_only_inside_expressions() {
     app.world_mut().run_schedule(Update);
     assert!(matches!(
         app.world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .status(),
         InstanceStatus::Faulted(_)
@@ -401,7 +391,7 @@ fn disabled_instances_discard_old_execution_before_they_are_enabled_again() {
     app.world_mut().run_schedule(Update);
     assert_eq!(
         app.world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .status(),
         &InstanceStatus::Pending
@@ -410,7 +400,7 @@ fn disabled_instances_discard_old_execution_before_they_are_enabled_again() {
     app.world_mut().run_schedule(Update);
     assert_eq!(
         app.world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .active_state_names()
             .last(),
@@ -429,7 +419,7 @@ fn restore_discards_unconsumed_activity_starts_from_the_outgoing_execution() {
     checkpoint.restore(app.world_mut()).unwrap();
     let entity = app
         .world_mut()
-        .query_filtered::<Entity, With<StateTreeInstance<Domain>>>()
+        .query_filtered::<Entity, With<StateTreeInstance>>()
         .single(app.world())
         .unwrap();
     app.world_mut().entity_mut(entity).insert(configuration(4));
@@ -446,7 +436,7 @@ fn reinserting_a_detached_instance_reconstructs_against_current_content() {
     let detached = app
         .world_mut()
         .entity_mut(entity)
-        .take::<StateTreeInstance<Domain>>()
+        .take::<StateTreeInstance>()
         .unwrap();
     app.world_mut()
         .resource_mut::<Assets<StateTreeDefinition>>()
@@ -459,7 +449,7 @@ fn reinserting_a_detached_instance_reconstructs_against_current_content() {
     app.world_mut().run_schedule(Update);
     assert_eq!(
         app.world()
-            .get::<StateTreeInstance<Domain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .active_state_names()
             .last(),

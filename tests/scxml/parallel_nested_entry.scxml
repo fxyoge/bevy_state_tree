@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" bst:domain="test" initial="p">
+<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" initial="p">
   <parallel id="p">
     <state id="left" initial="left_outer">
       <state id="left_outer" initial="left_leaf">

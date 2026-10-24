@@ -19,8 +19,8 @@ use bevy_ecs::{
 
 use crate::{
     LuauValue, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
-    StateTreeDomain, StateTreeEffectContext, StateTreeEffectError, StateTreeEventDataError,
-    StateTreeInstance, definition::ActivityId, protocol::RegistrationOrigin,
+    StateTreeEffectContext, StateTreeEffectError, StateTreeEventDataError, StateTreeInstance,
+    definition::ActivityId, protocol::RegistrationOrigin,
 };
 
 /// A typed long-running request owned by one active state.
@@ -38,22 +38,22 @@ pub trait StateTreeActivity: Send + Sync + 'static {
 }
 
 /// A generation-safe handle to one activity run on one entity.
-pub struct StateTreeActivityToken<D, A> {
+pub struct StateTreeActivityToken<A> {
     pub(crate) entity: Entity,
     pub(crate) runtime_id: u64,
     pub(crate) activity: ActivityId,
     pub(crate) generation: u64,
-    marker: PhantomData<fn() -> (D, A)>,
+    marker: PhantomData<fn() -> A>,
 }
 
-impl<D, A> Copy for StateTreeActivityToken<D, A> {}
-impl<D, A> Clone for StateTreeActivityToken<D, A> {
+impl<A> Copy for StateTreeActivityToken<A> {}
+impl<A> Clone for StateTreeActivityToken<A> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<D, A> std::fmt::Debug for StateTreeActivityToken<D, A> {
+impl<A> std::fmt::Debug for StateTreeActivityToken<A> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StateTreeActivityToken")
@@ -65,7 +65,7 @@ impl<D, A> std::fmt::Debug for StateTreeActivityToken<D, A> {
     }
 }
 
-impl<D, A> PartialEq for StateTreeActivityToken<D, A> {
+impl<A> PartialEq for StateTreeActivityToken<A> {
     fn eq(&self, other: &Self) -> bool {
         self.entity == other.entity
             && self.runtime_id == other.runtime_id
@@ -73,8 +73,8 @@ impl<D, A> PartialEq for StateTreeActivityToken<D, A> {
             && self.generation == other.generation
     }
 }
-impl<D, A> Eq for StateTreeActivityToken<D, A> {}
-impl<D, A> std::hash::Hash for StateTreeActivityToken<D, A> {
+impl<A> Eq for StateTreeActivityToken<A> {}
+impl<A> std::hash::Hash for StateTreeActivityToken<A> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.entity.hash(state);
         self.runtime_id.hash(state);
@@ -82,12 +82,12 @@ impl<D, A> std::hash::Hash for StateTreeActivityToken<D, A> {
         self.generation.hash(state);
     }
 }
-impl<D, A> PartialOrd for StateTreeActivityToken<D, A> {
+impl<A> PartialOrd for StateTreeActivityToken<A> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl<D, A> Ord for StateTreeActivityToken<D, A> {
+impl<A> Ord for StateTreeActivityToken<A> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.entity, self.runtime_id, self.activity, self.generation).cmp(&(
             other.entity,
@@ -98,7 +98,7 @@ impl<D, A> Ord for StateTreeActivityToken<D, A> {
     }
 }
 
-impl<D, A> StateTreeActivityToken<D, A> {
+impl<A> StateTreeActivityToken<A> {
     pub fn entity(self) -> Entity {
         self.entity
     }
@@ -114,24 +114,24 @@ impl<D, A> StateTreeActivityToken<D, A> {
 }
 
 /// Typed lifecycle messages for one registered activity request type.
-pub enum StateTreeActivityLifecycle<D, A: StateTreeActivity> {
+pub enum StateTreeActivityLifecycle<A: StateTreeActivity> {
     Started {
-        token: StateTreeActivityToken<D, A>,
+        token: StateTreeActivityToken<A>,
         activity: A,
     },
     Cancelled {
-        token: StateTreeActivityToken<D, A>,
+        token: StateTreeActivityToken<A>,
     },
 }
 
-impl<D: Send + Sync + 'static, A: StateTreeActivity> Message for StateTreeActivityLifecycle<D, A> {}
+impl<A: StateTreeActivity> Message for StateTreeActivityLifecycle<A> {}
 
-pub(crate) trait RegisteredActivity<D: StateTreeDomain>: Send + Sync {
+pub(crate) trait RegisteredActivity: Send + Sync {
     #[cfg(feature = "persistence")]
     fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World);
     fn start(
         &self,
-        context: StateTreeEffectContext<'_, D>,
+        context: StateTreeEffectContext<'_>,
         arguments: StateTreeActivityArgs,
         token: ErasedActivityToken,
         commands: &ParallelCommands<'_, '_>,
@@ -140,14 +140,14 @@ pub(crate) trait RegisteredActivity<D: StateTreeDomain>: Send + Sync {
     fn cancel_deferred(&self, token: ErasedActivityToken, world: &mut DeferredWorld<'_>);
 }
 
-pub(crate) trait RuntimeActivitySink<D: StateTreeDomain> {
-    fn start(&mut self, request: RuntimeActivityStart<'_, D>) -> Result<(), StateTreeEffectError>;
-    fn cancel(&mut self, handler: &Arc<dyn RegisteredActivity<D>>, token: ErasedActivityToken);
+pub(crate) trait RuntimeActivitySink {
+    fn start(&mut self, request: RuntimeActivityStart<'_>) -> Result<(), StateTreeEffectError>;
+    fn cancel(&mut self, handler: &Arc<dyn RegisteredActivity>, token: ErasedActivityToken);
 }
 
-pub(crate) struct RuntimeActivityStart<'a, D: StateTreeDomain> {
-    pub handler: &'a Arc<dyn RegisteredActivity<D>>,
-    pub context: StateTreeEffectContext<'a, D>,
+pub(crate) struct RuntimeActivityStart<'a> {
+    pub handler: &'a Arc<dyn RegisteredActivity>,
+    pub context: StateTreeEffectContext<'a>,
     pub arguments: StateTreeActivityArgs,
     pub token: ErasedActivityToken,
 }
@@ -156,8 +156,8 @@ pub(crate) struct BevyActivitySink<'a, 'w, 's> {
     pub commands: &'a ParallelCommands<'w, 's>,
 }
 
-impl<D: StateTreeDomain> RuntimeActivitySink<D> for BevyActivitySink<'_, '_, '_> {
-    fn start(&mut self, request: RuntimeActivityStart<'_, D>) -> Result<(), StateTreeEffectError> {
+impl RuntimeActivitySink for BevyActivitySink<'_, '_, '_> {
+    fn start(&mut self, request: RuntimeActivityStart<'_>) -> Result<(), StateTreeEffectError> {
         request.handler.start(
             request.context,
             request.arguments,
@@ -165,7 +165,7 @@ impl<D: StateTreeDomain> RuntimeActivitySink<D> for BevyActivitySink<'_, '_, '_>
             self.commands,
         )
     }
-    fn cancel(&mut self, handler: &Arc<dyn RegisteredActivity<D>>, token: ErasedActivityToken) {
+    fn cancel(&mut self, handler: &Arc<dyn RegisteredActivity>, token: ErasedActivityToken) {
         handler.cancel(token, self.commands);
     }
 }
@@ -179,7 +179,7 @@ pub(crate) struct ErasedActivityToken {
 }
 
 impl ErasedActivityToken {
-    pub(crate) fn typed<D, A>(self) -> StateTreeActivityToken<D, A> {
+    pub(crate) fn typed<A>(self) -> StateTreeActivityToken<A> {
         StateTreeActivityToken {
             entity: self.entity,
             runtime_id: self.runtime_id,
@@ -190,17 +190,16 @@ impl ErasedActivityToken {
     }
 }
 
-struct TypedActivity<D, A, F> {
+struct TypedActivity<A, F> {
     constructor: F,
-    marker: PhantomData<fn() -> (D, A)>,
+    marker: PhantomData<fn() -> A>,
 }
 
-impl<D, A, F> RegisteredActivity<D> for TypedActivity<D, A, F>
+impl<A, F> RegisteredActivity for TypedActivity<A, F>
 where
-    D: StateTreeDomain,
     A: StateTreeActivity,
     F: Fn(
-            StateTreeActivityContext<'_, D>,
+            StateTreeActivityContext<'_>,
             &mut StateTreeActivityArgs,
         ) -> Result<A, StateTreeActivityError>
         + Send
@@ -210,7 +209,7 @@ where
     #[cfg(feature = "persistence")]
     fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World) {
         let mut messages =
-            world.resource_mut::<bevy_ecs::message::Messages<StateTreeActivityLifecycle<D, A>>>();
+            world.resource_mut::<bevy_ecs::message::Messages<StateTreeActivityLifecycle<A>>>();
         let cancellations: Vec<_> = messages
             .drain()
             .filter(|message| matches!(message, StateTreeActivityLifecycle::Cancelled { .. }))
@@ -219,7 +218,7 @@ where
     }
     fn start(
         &self,
-        context: StateTreeEffectContext<'_, D>,
+        context: StateTreeEffectContext<'_>,
         mut arguments: StateTreeActivityArgs,
         token: ErasedActivityToken,
         commands: &ParallelCommands<'_, '_>,
@@ -227,7 +226,7 @@ where
         let activity = (self.constructor)(context, &mut arguments)?;
         arguments.finish()?;
         commands.command_scope(move |mut commands| {
-            commands.write_message(StateTreeActivityLifecycle::<D, A>::Started {
+            commands.write_message(StateTreeActivityLifecycle::<A>::Started {
                 token: token.typed(),
                 activity,
             });
@@ -237,42 +236,33 @@ where
 
     fn cancel(&self, token: ErasedActivityToken, commands: &ParallelCommands<'_, '_>) {
         commands.command_scope(move |mut commands| {
-            commands.write_message(StateTreeActivityLifecycle::<D, A>::Cancelled {
+            commands.write_message(StateTreeActivityLifecycle::<A>::Cancelled {
                 token: token.typed(),
             });
         });
     }
 
     fn cancel_deferred(&self, token: ErasedActivityToken, world: &mut DeferredWorld<'_>) {
-        world.write_message(StateTreeActivityLifecycle::<D, A>::Cancelled {
+        world.write_message(StateTreeActivityLifecycle::<A>::Cancelled {
             token: token.typed(),
         });
     }
 }
 
-#[derive(Resource)]
-pub(crate) struct StateTreeActivityRegistry<D: StateTreeDomain> {
-    activities: HashMap<Box<str>, Arc<dyn RegisteredActivity<D>>>,
+#[derive(Resource, Default)]
+pub(crate) struct StateTreeActivityRegistry {
+    activities: HashMap<Box<str>, Arc<dyn RegisteredActivity>>,
     origins: HashMap<Box<str>, RegistrationOrigin>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeActivityRegistry<D> {
-    fn default() -> Self {
-        Self {
-            activities: HashMap::new(),
-            origins: HashMap::new(),
-        }
-    }
-}
-
-impl<D: StateTreeDomain> StateTreeActivityRegistry<D> {
+impl StateTreeActivityRegistry {
     #[cfg(feature = "persistence")]
     pub(crate) fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World) {
         for handler in self.activities.values() {
             handler.discard_pending_starts(world);
         }
     }
-    pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredActivity<D>>> {
+    pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredActivity>> {
         self.activities.get(name).cloned()
     }
 
@@ -295,57 +285,46 @@ pub(crate) struct ActivityOutcome {
 }
 
 #[derive(Component)]
-pub(crate) struct StateTreeActivityInbox<D: StateTreeDomain> {
+pub(crate) struct StateTreeActivityInbox {
     pub outcomes: Mutex<Vec<ActivityOutcome>>,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeActivityInbox<D> {
+impl Default for StateTreeActivityInbox {
     fn default() -> Self {
         Self {
             outcomes: Mutex::new(Vec::new()),
-            marker: PhantomData,
         }
     }
 }
 
 #[derive(Resource)]
-pub(crate) struct StateTreeActivityIngress<D: StateTreeDomain> {
+pub(crate) struct StateTreeActivityIngress {
     pub dirty: Mutex<bevy_ecs::entity::EntityHashSet>,
     pub dirty_hint: AtomicBool,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeActivityIngress<D> {
+impl Default for StateTreeActivityIngress {
     fn default() -> Self {
         Self {
             dirty: Mutex::new(bevy_ecs::entity::EntityHashSet::default()),
             dirty_hint: AtomicBool::new(false),
-            marker: PhantomData,
         }
     }
 }
 
 /// Writes terminal outcomes for one typed activity request.
 #[derive(SystemParam)]
-pub struct StateTreeActivityOutcomeWriter<'w, 's, D: StateTreeDomain, A: StateTreeActivity> {
-    ingress: Res<'w, StateTreeActivityIngress<D>>,
-    instances: Query<
-        'w,
-        's,
-        (
-            &'static StateTreeInstance<D>,
-            &'static StateTreeActivityInbox<D>,
-        ),
-    >,
+pub struct StateTreeActivityOutcomeWriter<'w, 's, A: StateTreeActivity> {
+    ingress: Res<'w, StateTreeActivityIngress>,
+    instances: Query<'w, 's, (&'static StateTreeInstance, &'static StateTreeActivityInbox)>,
     marker: PhantomData<A>,
 }
 
-impl<D: StateTreeDomain, A: StateTreeActivity> StateTreeActivityOutcomeWriter<'_, '_, D, A> {
+impl<A: StateTreeActivity> StateTreeActivityOutcomeWriter<'_, '_, A> {
     /// Projects and enqueues a completion when `token` still names an active run.
     ///
     /// Returns `true` only when the outcome was accepted and enqueued.
-    pub fn complete(&mut self, token: StateTreeActivityToken<D, A>, output: A::Output) -> bool {
+    pub fn complete(&mut self, token: StateTreeActivityToken<A>, output: A::Output) -> bool {
         self.write(token, ActivityOutcomeKind::Complete, || {
             A::output_data(&output)
         })
@@ -354,13 +333,13 @@ impl<D: StateTreeDomain, A: StateTreeActivity> StateTreeActivityOutcomeWriter<'_
     /// Projects and enqueues a failure when `token` still names an active run.
     ///
     /// Returns `true` only when the outcome was accepted and enqueued.
-    pub fn fail(&mut self, token: StateTreeActivityToken<D, A>, error: A::Error) -> bool {
+    pub fn fail(&mut self, token: StateTreeActivityToken<A>, error: A::Error) -> bool {
         self.write(token, ActivityOutcomeKind::Fail, || A::error_data(&error))
     }
 
     fn write<F>(
         &mut self,
-        token: StateTreeActivityToken<D, A>,
+        token: StateTreeActivityToken<A>,
         kind: ActivityOutcomeKind,
         project: F,
     ) -> bool
@@ -402,16 +381,15 @@ impl<D: StateTreeDomain, A: StateTreeActivity> StateTreeActivityOutcomeWriter<'_
     }
 }
 
-pub(crate) fn register_activity<D, A, F>(
+pub(crate) fn register_activity<A, F>(
     app: &mut App,
     name: Box<str>,
     constructor: F,
     origin: RegistrationOrigin,
 ) where
-    D: StateTreeDomain,
     A: StateTreeActivity,
     F: Fn(
-            StateTreeActivityContext<'_, D>,
+            StateTreeActivityContext<'_>,
             &mut StateTreeActivityArgs,
         ) -> Result<A, StateTreeActivityError>
         + Send
@@ -422,11 +400,9 @@ pub(crate) fn register_activity<D, A, F>(
         !name.is_empty(),
         "state-tree activity names cannot be empty"
     );
-    app.add_message::<StateTreeActivityLifecycle<D, A>>();
-    app.init_resource::<StateTreeActivityRegistry<D>>();
-    let mut registry = app
-        .world_mut()
-        .resource_mut::<StateTreeActivityRegistry<D>>();
+    app.add_message::<StateTreeActivityLifecycle<A>>();
+    app.init_resource::<StateTreeActivityRegistry>();
+    let mut registry = app.world_mut().resource_mut::<StateTreeActivityRegistry>();
     if registry.activities.contains_key(&name) {
         if name.as_ref() == "bst.spawn" {
             panic!(
@@ -437,7 +413,7 @@ pub(crate) fn register_activity<D, A, F>(
     }
     registry.activities.insert(
         name.clone(),
-        Arc::new(TypedActivity::<D, A, F> {
+        Arc::new(TypedActivity::<A, F> {
             constructor,
             marker: PhantomData,
         }),
@@ -449,14 +425,6 @@ pub(crate) fn register_activity<D, A, F>(
 mod tests {
     use super::*;
 
-    struct TestDomain;
-
-    impl StateTreeDomain for TestDomain {
-        const AUTHORED_NAME: &'static str = "test";
-
-        fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
-    }
-
     struct TestActivity;
 
     impl StateTreeActivity for TestActivity {
@@ -466,19 +434,19 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "state-tree activity `duplicate` was registered more than once")]
-    fn activity_names_must_be_unique_within_a_domain() {
+    fn activity_names_must_be_unique() {
         let mut app = App::new();
-        register_activity::<TestDomain, TestActivity, _>(
+        register_activity::<TestActivity, _>(
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestActivity),
-            RegistrationOrigin::Domain,
+            RegistrationOrigin::Application,
         );
-        register_activity::<TestDomain, TestActivity, _>(
+        register_activity::<TestActivity, _>(
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestActivity),
-            RegistrationOrigin::Domain,
+            RegistrationOrigin::Application,
         );
     }
 }

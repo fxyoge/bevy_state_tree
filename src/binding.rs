@@ -22,7 +22,7 @@ use bevy_ecs::prelude::Local;
 use crate::{
     EntityStateTreeEvent, EntityStateTreeEventWriter, StateTreeActivity, StateTreeActivityArgs,
     StateTreeActivityContext, StateTreeActivityError, StateTreeActivityLifecycle,
-    StateTreeActivityToken, StateTreeDomain, StateTreeInstance, StateTreeSet,
+    StateTreeActivityToken, StateTreeInstance, StateTreeSet,
 };
 
 /// Describes one global value observed by state-tree activities.
@@ -31,11 +31,11 @@ use crate::{
 /// [`Self::Value`]. The source runs only while at least one active activity is
 /// listening. Values are compared with [`PartialEq`], so event delivery follows
 /// semantic value changes rather than Bevy component change ticks.
-pub trait StateTreeBinding<D: StateTreeDomain>: Send + Sync + 'static {
+pub trait StateTreeBinding: Send + Sync + 'static {
     /// The complete value sampled from the backing Bevy world.
     type Value: PartialEq + Send + Sync + 'static;
     /// The entity-targeted event delivered to each listening state tree.
-    type Event: EntityStateTreeEvent<D>;
+    type Event: EntityStateTreeEvent;
 
     /// Creates the event for one listening state-tree entity.
     fn event(&self, entity: Entity, value: &Self::Value) -> Self::Event;
@@ -103,54 +103,43 @@ impl<B: Send + Sync + 'static> StateTreeActivity for GlobalBindingActivity<B> {
     type Error = ();
 }
 
-struct GlobalBindingRun<D: StateTreeDomain, B: StateTreeBinding<D>> {
-    token: StateTreeActivityToken<D, GlobalBindingActivity<B>>,
+struct GlobalBindingRun<B: StateTreeBinding> {
+    token: StateTreeActivityToken<GlobalBindingActivity<B>>,
     binding: Arc<B>,
     needs_initial: bool,
 }
 
 #[derive(Component)]
 #[component(storage = "SparseSet")]
-struct GlobalBindingListeners<D: StateTreeDomain, B: StateTreeBinding<D>> {
-    runs: Vec<GlobalBindingRun<D, B>>,
+struct GlobalBindingListeners<B: StateTreeBinding> {
+    runs: Vec<GlobalBindingRun<B>>,
 }
 
-type PrunableGlobalBindings<'w, 's, D, B> = Query<
+type PrunableGlobalBindings<'w, 's, B> = Query<
     'w,
     's,
     (
         Entity,
-        Option<&'static StateTreeInstance<D>>,
-        &'static mut GlobalBindingListeners<D, B>,
+        Option<&'static StateTreeInstance>,
+        &'static mut GlobalBindingListeners<B>,
     ),
 >;
 
-#[derive(Resource)]
-struct RegisteredGlobalBindings<D: StateTreeDomain> {
+#[derive(Resource, Default)]
+struct RegisteredGlobalBindings {
     types: HashSet<TypeId>,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> Default for RegisteredGlobalBindings<D> {
-    fn default() -> Self {
-        Self {
-            types: HashSet::new(),
-            marker: PhantomData,
-        }
-    }
-}
-
-pub(crate) fn register_global_binding<D, B, C, S, M>(
+pub(crate) fn register_global_binding<B, C, S, M>(
     app: &mut App,
     schedule: InternedScheduleLabel,
     name: Box<str>,
     constructor: C,
     source: S,
 ) where
-    D: StateTreeDomain,
-    B: StateTreeBinding<D>,
+    B: StateTreeBinding,
     C: Fn(
-            StateTreeActivityContext<'_, D>,
+            StateTreeActivityContext<'_>,
             &mut StateTreeActivityArgs,
         ) -> Result<B, StateTreeActivityError>
         + Send
@@ -158,10 +147,10 @@ pub(crate) fn register_global_binding<D, B, C, S, M>(
         + 'static,
     S: IntoSystem<(), B::Value, M> + 'static,
 {
-    app.init_resource::<RegisteredGlobalBindings<D>>();
+    app.init_resource::<RegisteredGlobalBindings>();
     let inserted = app
         .world_mut()
-        .resource_mut::<RegisteredGlobalBindings<D>>()
+        .resource_mut::<RegisteredGlobalBindings>()
         .types
         .insert(TypeId::of::<B>());
     assert!(
@@ -170,37 +159,36 @@ pub(crate) fn register_global_binding<D, B, C, S, M>(
         std::any::type_name::<B>()
     );
 
-    crate::event::ensure_event::<D, B::Event>(app, crate::protocol::RegistrationOrigin::Domain);
-    crate::activity::register_activity::<D, GlobalBindingActivity<B>, _>(
+    crate::event::ensure_event::<B::Event>(app, crate::protocol::RegistrationOrigin::Application);
+    crate::activity::register_activity::<GlobalBindingActivity<B>, _>(
         app,
         name,
         move |context, arguments| {
             constructor(context, arguments).map(|binding| GlobalBindingActivity(Arc::new(binding)))
         },
-        crate::protocol::RegistrationOrigin::Domain,
+        crate::protocol::RegistrationOrigin::Application,
     );
     app.add_systems(
         schedule,
         source
-            .pipe(dispatch_global_binding::<D, B>)
-            .run_if(has_active_global_binding::<D, B>)
+            .pipe(dispatch_global_binding::<B>)
+            .run_if(has_active_global_binding::<B>)
             .in_set(StateTreeSet::QueueEvents)
             .in_set(StateTreeBindingSet::<B>::new()),
     )
     .add_systems(
         schedule,
-        (manage_global_binding::<D, B>, prune_global_binding::<D, B>)
+        (manage_global_binding::<B>, prune_global_binding::<B>)
             .chain()
             .in_set(StateTreeSet::HandleActivities),
     );
 }
 
-fn has_active_global_binding<D, B>(
-    listeners: Query<(&StateTreeInstance<D>, &GlobalBindingListeners<D, B>)>,
+fn has_active_global_binding<B>(
+    listeners: Query<(&StateTreeInstance, &GlobalBindingListeners<B>)>,
 ) -> bool
 where
-    D: StateTreeDomain,
-    B: StateTreeBinding<D>,
+    B: StateTreeBinding,
 {
     listeners.iter().any(|(instance, listeners)| {
         listeners
@@ -210,12 +198,11 @@ where
     })
 }
 
-fn manage_global_binding<D, B>(
-    mut lifecycle: MessageReader<StateTreeActivityLifecycle<D, GlobalBindingActivity<B>>>,
+fn manage_global_binding<B>(
+    mut lifecycle: MessageReader<StateTreeActivityLifecycle<GlobalBindingActivity<B>>>,
     mut commands: Commands,
 ) where
-    D: StateTreeDomain,
-    B: StateTreeBinding<D>,
+    B: StateTreeBinding,
 {
     for lifecycle in lifecycle.read() {
         match lifecycle {
@@ -229,9 +216,9 @@ fn manage_global_binding<D, B>(
                     let Ok(mut entity) = world.get_entity_mut(token.entity()) else {
                         return;
                     };
-                    if entity.contains::<GlobalBindingListeners<D, B>>() {
+                    if entity.contains::<GlobalBindingListeners<B>>() {
                         entity
-                            .get_mut::<GlobalBindingListeners<D, B>>()
+                            .get_mut::<GlobalBindingListeners<B>>()
                             .expect("checked binding listener component exists")
                             .runs
                             .push(GlobalBindingRun {
@@ -240,7 +227,7 @@ fn manage_global_binding<D, B>(
                                 needs_initial: true,
                             });
                     } else {
-                        entity.insert(GlobalBindingListeners::<D, B> {
+                        entity.insert(GlobalBindingListeners::<B> {
                             runs: vec![GlobalBindingRun {
                                 token,
                                 binding,
@@ -257,7 +244,7 @@ fn manage_global_binding<D, B>(
                         return;
                     };
                     let empty = {
-                        let Some(mut listeners) = entity.get_mut::<GlobalBindingListeners<D, B>>()
+                        let Some(mut listeners) = entity.get_mut::<GlobalBindingListeners<B>>()
                         else {
                             return;
                         };
@@ -265,7 +252,7 @@ fn manage_global_binding<D, B>(
                         listeners.runs.is_empty()
                     };
                     if empty {
-                        entity.remove::<GlobalBindingListeners<D, B>>();
+                        entity.remove::<GlobalBindingListeners<B>>();
                     }
                 });
             }
@@ -273,10 +260,9 @@ fn manage_global_binding<D, B>(
     }
 }
 
-fn prune_global_binding<D, B>(mut commands: Commands, mut listeners: PrunableGlobalBindings<D, B>)
+fn prune_global_binding<B>(mut commands: Commands, mut listeners: PrunableGlobalBindings<B>)
 where
-    D: StateTreeDomain,
-    B: StateTreeBinding<D>,
+    B: StateTreeBinding,
 {
     for (entity, instance, mut listeners) in &mut listeners {
         listeners.runs.retain(|run| {
@@ -285,23 +271,18 @@ where
         if listeners.runs.is_empty() {
             commands
                 .entity(entity)
-                .remove::<GlobalBindingListeners<D, B>>();
+                .remove::<GlobalBindingListeners<B>>();
         }
     }
 }
 
-fn dispatch_global_binding<D, B>(
+fn dispatch_global_binding<B>(
     In(value): In<B::Value>,
-    mut listeners: Query<(
-        Entity,
-        &StateTreeInstance<D>,
-        &mut GlobalBindingListeners<D, B>,
-    )>,
+    mut listeners: Query<(Entity, &StateTreeInstance, &mut GlobalBindingListeners<B>)>,
     mut previous: Local<Option<B::Value>>,
-    mut events: EntityStateTreeEventWriter<D>,
+    mut events: EntityStateTreeEventWriter,
 ) where
-    D: StateTreeDomain,
-    B: StateTreeBinding<D>,
+    B: StateTreeBinding,
 {
     let changed = previous.as_ref() != Some(&value);
     for (entity, instance, mut listeners) in &mut listeners {
@@ -338,27 +319,21 @@ mod tests {
         scxml,
     };
 
-    struct BindingDomain;
-
-    impl StateTreeDomain for BindingDomain {
-        const AUTHORED_NAME: &'static str = "test";
-
-        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
-            config
-                .global_binding(
-                    "bind.sample",
-                    |_context, _arguments| Ok(SampleBinding),
-                    sample_value,
-                )
-                .event::<SampleChanged>();
-        }
+    fn configure_binding(config: &mut crate::StateTreeConfig<'_>) {
+        config
+            .global_binding(
+                "bind.sample",
+                |_context, _arguments| Ok(SampleBinding),
+                sample_value,
+            )
+            .event::<SampleChanged>();
     }
 
     #[derive(Clone)]
     #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
     struct SampleBinding;
 
-    impl StateTreeBinding<BindingDomain> for SampleBinding {
+    impl StateTreeBinding for SampleBinding {
         type Value = SampleValue;
         type Event = SampleChanged;
 
@@ -410,7 +385,6 @@ mod tests {
 
     #[derive(Clone, EntityEvent, StateTreeEvent)]
     #[state_tree(
-        domain = BindingDomain,
         name = "sample.changed",
         data = project_sample
     )]
@@ -448,7 +422,7 @@ mod tests {
             .add(definition);
         let first = app
             .world_mut()
-            .spawn(StateTreeInstance::<BindingDomain>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
 
         app.update();
@@ -471,7 +445,7 @@ mod tests {
 
         let second = app
             .world_mut()
-            .spawn(StateTreeInstance::<BindingDomain>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
         app.update();
         assert_eq!(app.world().resource::<SampleSource>().reads, 4);
@@ -482,7 +456,7 @@ mod tests {
 
         app.world_mut()
             .entity_mut(first)
-            .insert(StateTreeInstance::<BindingDomain>::new(handle));
+            .insert(StateTreeInstance::new(handle));
         app.update();
         assert_eq!(app.world().resource::<SampleSource>().reads, 6);
         app.update();
@@ -492,12 +466,12 @@ mod tests {
 
         app.world_mut()
             .entity_mut(first)
-            .remove::<StateTreeInstance<BindingDomain>>();
+            .remove::<StateTreeInstance>();
         app.update();
         assert_eq!(app.world().resource::<SampleSource>().reads, 8);
         app.world_mut()
             .entity_mut(second)
-            .remove::<StateTreeInstance<BindingDomain>>();
+            .remove::<StateTreeInstance>();
         app.update();
         assert_eq!(app.world().resource::<SampleSource>().reads, 8);
         app.update();
@@ -516,7 +490,7 @@ mod tests {
             .add(binding_definition());
         let original = source
             .world_mut()
-            .spawn(StateTreeInstance::<BindingDomain>::new(handle))
+            .spawn(StateTreeInstance::new(handle))
             .id();
         source.update();
         source.update();
@@ -531,7 +505,7 @@ mod tests {
         checkpoint.restore(target.world_mut()).unwrap();
         let restored = target
             .world_mut()
-            .query_filtered::<Entity, bevy_ecs::prelude::With<StateTreeInstance<BindingDomain>>>()
+            .query_filtered::<Entity, bevy_ecs::prelude::With<StateTreeInstance>>()
             .single(target.world())
             .unwrap();
         target.world_mut().run_schedule(Update);
@@ -546,7 +520,7 @@ mod tests {
         assert_eq!(
             target
                 .world()
-                .get::<GlobalBindingListeners<BindingDomain, SampleBinding>>(restored)
+                .get::<GlobalBindingListeners<SampleBinding>>(restored)
                 .unwrap()
                 .runs
                 .len(),
@@ -559,7 +533,7 @@ mod tests {
         app.add_plugins((
             TimePlugin,
             AssetPlugin::default(),
-            StateTreePlugin::<BindingDomain>::new(Update),
+            StateTreePlugin::new(Update).configure(configure_binding),
         ));
         app.insert_resource(SampleSource {
             value: SampleValue {
@@ -573,7 +547,7 @@ mod tests {
 
     fn binding_definition() -> StateTreeDefinition {
         let source = r#"
-            <scxml xmlns="http://www.w3.org/2005/07/scxml" bst:domain="test"
+            <scxml xmlns="http://www.w3.org/2005/07/scxml"
                    xmlns:bst="urn:bevy-state-tree"
                    datamodel="luau"
                    initial="active">
@@ -599,8 +573,7 @@ mod tests {
     #[test]
     fn nested_assignments_persist_only_the_root_and_support_event_keys_and_deletion() {
         let source = r#"
-            <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree"
-                   bst:domain="test" datamodel="luau" initial="active">
+            <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" datamodel="luau" initial="active">
               <datamodel>
                 <data id="values" expr="{keep = {current = 5}, old = 1, list = {2, 3}}"/>
                 <data id="key" expr="'unit'"/>
@@ -625,15 +598,12 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition);
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<BindingDomain>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         app.update();
         let values = app
             .world()
-            .get::<StateTreeInstance<BindingDomain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .data("values")
             .unwrap();
@@ -668,8 +638,7 @@ mod tests {
         ] {
             let source = format!(
                 r#"
-                <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree"
-                       bst:domain="test" datamodel="luau">
+                <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" datamodel="luau">
                   <datamodel><data id="values" expr="{{}}"/></datamodel>
                   <state id="active"><onentry><assign location="{location}" expr="1"/></onentry></state>
                 </scxml>"#
@@ -706,8 +675,7 @@ mod tests {
             };
             let source = format!(
                 r#"
-                <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree"
-                       bst:domain="test" datamodel="luau">
+                <scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" datamodel="luau">
                   <datamodel><data id="values" expr="{{keep = {{current = 5}}, list = {{2, 3}}}}"/></datamodel>
                   <state id="active"><onentry><assign location="{location}" expr="{expression}"/></onentry></state>
                 </scxml>"#
@@ -719,15 +687,9 @@ mod tests {
                 .world_mut()
                 .resource_mut::<Assets<StateTreeDefinition>>()
                 .add(definition);
-            let entity = app
-                .world_mut()
-                .spawn(StateTreeInstance::<BindingDomain>::new(handle))
-                .id();
+            let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
             app.update();
-            let instance = app
-                .world()
-                .get::<StateTreeInstance<BindingDomain>>(entity)
-                .unwrap();
+            let instance = app.world().get::<StateTreeInstance>(entity).unwrap();
             assert!(
                 matches!(
                     instance.status(),
@@ -760,7 +722,7 @@ mod tests {
 
     fn assert_binding_data(world: &World, entity: Entity, changes: i64, mode: &str, label: &str) {
         let instance = world
-            .get::<StateTreeInstance<BindingDomain>>(entity)
+            .get::<StateTreeInstance>(entity)
             .expect("binding state tree exists");
         assert_eq!(instance.data("changes"), Some(&LuauValue::Integer(changes)));
         assert_eq!(instance.data("mode"), Some(&LuauValue::String(mode.into())));

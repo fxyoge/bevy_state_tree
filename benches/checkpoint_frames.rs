@@ -13,11 +13,7 @@ use bevy_time::TimePlugin;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-struct Domain;
-impl StateTreeDomain for Domain {
-    const AUTHORED_NAME: &'static str = "checkpoint-profile";
-    fn configure(_: &mut StateTreeConfig<'_, Self>) {}
-}
+fn configure(_: &mut StateTreeConfig<'_>) {}
 
 #[derive(Component, Serialize, Deserialize)]
 struct Sheet {
@@ -31,7 +27,7 @@ fn app(sheets: usize) -> App {
         TaskPoolPlugin::default(),
         TimePlugin,
         AssetPlugin::default(),
-        StateTreePlugin::<Domain>::new(Update),
+        StateTreePlugin::new(Update).configure(configure),
     ))
     .persist_component::<Sheet>("profile.sheet");
     let mut builder = StateTreeBuilder::new("profile-tree");
@@ -44,11 +40,11 @@ fn app(sheets: usize) -> App {
         .add(builder.build().unwrap());
     for _ in 0..32 {
         app.world_mut()
-            .spawn(StateTreeInstance::<Domain>::new(definition.clone()));
+            .spawn(StateTreeInstance::new(definition.clone()));
     }
     for _ in 0..sheets {
         app.world_mut().spawn((
-            StateTreeInstance::<Domain>::new(definition.clone()),
+            StateTreeInstance::new(definition.clone()),
             Sheet {
                 ink: (0..1600).map(|i| i % 3 == 0).collect(),
                 stage: vec![false; 1600],

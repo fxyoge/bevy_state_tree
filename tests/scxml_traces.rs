@@ -8,52 +8,46 @@ use bevy_ecs::{
 };
 use bevy_state_tree::{
     BroadcastStateTreeEvent, BroadcastStateTreeEventWriter, InstanceStatus, StateTreeConfig,
-    StateTreeDefinition, StateTreeDomain, StateTreeEvent, StateTreeInstance, StateTreePlugin,
-    StateTreeSettings, StateTreeTraceLog, StateTreeTracePlugin, scxml,
+    StateTreeDefinition, StateTreeEvent, StateTreeInstance, StateTreePlugin, StateTreeSettings,
+    StateTreeTraceLog, StateTreeTracePlugin, scxml,
 };
 use bevy_time::TimePlugin;
 
 const CASES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/scxml");
 const MICROSTEP_LIMIT: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
-struct HarnessDomain;
-
-impl StateTreeDomain for HarnessDomain {
-    const AUTHORED_NAME: &'static str = "test";
-
-    fn configure(config: &mut StateTreeConfig<'_, Self>) {
-        config
-            .event::<A>()
-            .event::<AB>()
-            .event::<Advance>()
-            .event::<Finish>()
-            .event::<Reset>()
-            .event::<Tick>();
-    }
+fn configure_harness(config: &mut StateTreeConfig<'_>) {
+    config
+        .event::<A>()
+        .event::<AB>()
+        .event::<Advance>()
+        .event::<Finish>()
+        .event::<Reset>()
+        .event::<Tick>();
 }
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = HarnessDomain, name = "a", broadcast)]
+#[state_tree(name = "a", broadcast)]
 struct A;
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = HarnessDomain, name = "a.b", broadcast)]
+#[state_tree(name = "a.b", broadcast)]
 struct AB;
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = HarnessDomain, name = "advance", broadcast)]
+#[state_tree(name = "advance", broadcast)]
 struct Advance;
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = HarnessDomain, name = "finish", broadcast)]
+#[state_tree(name = "finish", broadcast)]
 struct Finish;
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = HarnessDomain, name = "reset", broadcast)]
+#[state_tree(name = "reset", broadcast)]
 struct Reset;
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = HarnessDomain, name = "tick", broadcast)]
+#[state_tree(name = "tick", broadcast)]
 struct Tick;
 
 #[test]
@@ -133,18 +127,15 @@ fn scxml_cases_match_their_semantic_traces() {
         app.add_plugins((
             TimePlugin,
             AssetPlugin::default(),
-            StateTreeTracePlugin::<HarnessDomain>::default(),
-            StateTreePlugin::<HarnessDomain>::new(Update),
+            StateTreeTracePlugin,
+            StateTreePlugin::new(Update).configure(configure_harness),
         ));
-        app.insert_resource(StateTreeSettings::<HarnessDomain>::new(MICROSTEP_LIMIT));
+        app.insert_resource(StateTreeSettings::new(MICROSTEP_LIMIT));
         let handle = app
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition);
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<HarnessDomain>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         let events_path = case.with_extension("events");
         if events_path.exists() {
@@ -156,7 +147,7 @@ fn scxml_cases_match_their_semantic_traces() {
                 }
                 let status = app
                     .world()
-                    .get::<StateTreeInstance<HarnessDomain>>(entity)
+                    .get::<StateTreeInstance>(entity)
                     .unwrap()
                     .status();
                 if status != &InstanceStatus::Running {
@@ -189,7 +180,7 @@ fn scxml_cases_match_their_semantic_traces() {
 
         let log = app
             .world()
-            .resource::<StateTreeTraceLog<HarnessDomain>>()
+            .resource::<StateTreeTraceLog>()
             .get(entity)
             .unwrap();
         let expected = fs::read_to_string(&trace_path).expect("read expected SCXML trace");
@@ -210,16 +201,16 @@ fn scxml_cases_match_their_semantic_traces() {
     }
 }
 
-fn queue<E: BroadcastStateTreeEvent<HarnessDomain>>(app: &mut App, event: E) {
+fn queue<E: BroadcastStateTreeEvent>(app: &mut App, event: E) {
     app.world_mut()
         .run_system_once_with(queue_event::<E>, event)
         .unwrap();
     app.update();
 }
 
-fn queue_event<E: BroadcastStateTreeEvent<HarnessDomain>>(
+fn queue_event<E: BroadcastStateTreeEvent>(
     In(event): In<E>,
-    mut writer: BroadcastStateTreeEventWriter<HarnessDomain>,
+    mut writer: BroadcastStateTreeEventWriter,
 ) {
     writer.write(event);
 }

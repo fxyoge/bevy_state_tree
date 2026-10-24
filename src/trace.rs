@@ -1,14 +1,13 @@
 use std::{
     collections::HashMap,
     fmt::Write,
-    marker::PhantomData,
     sync::{Arc, Mutex},
 };
 
 use bevy_app::{App, Plugin};
 use bevy_ecs::{entity::Entity, prelude::Resource};
 
-use crate::{InstanceStatus, LuauValue, RuntimeFault, StateTreeDomain};
+use crate::{InstanceStatus, LuauValue, RuntimeFault};
 
 /// How a shallow-history target selected its descendant configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,24 +261,22 @@ impl StateTreeTrace for StateTreeEventLog {
 
 /// Opt-in storage for semantic traces produced by Bevy state-tree instances.
 ///
-/// Install [`StateTreeTracePlugin`] for a domain, then inspect or remove each
+/// Install [`StateTreeTracePlugin`], then inspect or remove each
 /// entity's accumulated log through this resource.
 #[derive(Resource)]
-pub struct StateTreeTraceLog<D: StateTreeDomain> {
+pub struct StateTreeTraceLog {
     logs: Mutex<HashMap<Entity, Arc<Mutex<StateTreeEventLog>>>>,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeTraceLog<D> {
+impl Default for StateTreeTraceLog {
     fn default() -> Self {
         Self {
             logs: Mutex::new(HashMap::new()),
-            marker: PhantomData,
         }
     }
 }
 
-impl<D: StateTreeDomain> StateTreeTraceLog<D> {
+impl StateTreeTraceLog {
     /// Returns a snapshot of one entity's accumulated event log.
     pub fn get(&self, entity: Entity) -> Option<StateTreeEventLog> {
         let log = self
@@ -333,21 +330,16 @@ impl<D: StateTreeDomain> StateTreeTraceLog<D> {
     }
 }
 
-/// Enables App-facing semantic trace collection for one domain.
+/// Enables App-facing semantic trace collection.
 ///
 /// Without this plugin, state-tree systems do not allocate, lock, or perform
 /// runtime work for individual trace records.
-pub struct StateTreeTracePlugin<D: StateTreeDomain>(PhantomData<fn() -> D>);
+#[derive(Default)]
+pub struct StateTreeTracePlugin;
 
-impl<D: StateTreeDomain> Default for StateTreeTracePlugin<D> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<D: StateTreeDomain> Plugin for StateTreeTracePlugin<D> {
+impl Plugin for StateTreeTracePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<StateTreeTraceLog<D>>();
+        app.init_resource::<StateTreeTraceLog>();
     }
 }
 
@@ -418,17 +410,9 @@ mod tests {
 
     use super::*;
 
-    struct TestDomain;
-
-    impl StateTreeDomain for TestDomain {
-        const AUTHORED_NAME: &'static str = "test";
-
-        fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
-    }
-
     #[test]
     fn separate_entity_logs_can_be_recorded_concurrently() {
-        let traces = StateTreeTraceLog::<TestDomain>::default();
+        let traces = StateTreeTraceLog::default();
         let mut world = World::new();
         let first = world.spawn_empty().id();
         let second = world.spawn_empty().id();

@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml" bst:domain="test"
+<scxml xmlns="http://www.w3.org/2005/07/scxml"
        xmlns:bst="urn:bevy-state-tree"
        name="after-transitions"
        initial="waiting">

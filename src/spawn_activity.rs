@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::collections::HashMap;
 
 use bevy_app::App;
 use bevy_asset::{AssetLoadFailedEvent, AssetPath, AssetServer, Assets, Handle};
@@ -11,8 +11,8 @@ use bevy_ecs::{
 
 use crate::{
     InstanceStatus, LuauValue, StateTreeActivity, StateTreeActivityLifecycle,
-    StateTreeActivityOutcomeWriter, StateTreeActivityToken, StateTreeDefinition, StateTreeDomain,
-    StateTreeInstance, StateTreeLinkFailure, StateTreeSet,
+    StateTreeActivityOutcomeWriter, StateTreeActivityToken, StateTreeDefinition, StateTreeInstance,
+    StateTreeLinkFailure, StateTreeSet,
 };
 
 const NAME: &str = "bst.spawn";
@@ -40,29 +40,19 @@ enum SpawnRunState {
     Running(Entity),
 }
 
-struct SpawnRun<D: StateTreeDomain> {
-    token: StateTreeActivityToken<D, SpawnActivity>,
+struct SpawnRun {
+    token: StateTreeActivityToken<SpawnActivity>,
     definition: String,
     state: SpawnRunState,
 }
 
-#[derive(Resource)]
-struct SpawnRuns<D: StateTreeDomain> {
-    runs: Vec<SpawnRun<D>>,
-    marker: PhantomData<fn() -> D>,
+#[derive(Resource, Default)]
+struct SpawnRuns {
+    runs: Vec<SpawnRun>,
 }
 
-impl<D: StateTreeDomain> Default for SpawnRuns<D> {
-    fn default() -> Self {
-        Self {
-            runs: Vec::new(),
-            marker: PhantomData,
-        }
-    }
-}
-
-pub(crate) fn register<D: StateTreeDomain>(app: &mut App, schedule: InternedScheduleLabel) {
-    crate::activity::register_activity::<D, SpawnActivity, _>(
+pub(crate) fn register(app: &mut App, schedule: InternedScheduleLabel) {
+    crate::activity::register_activity::<SpawnActivity, _>(
         app,
         NAME.into(),
         |_context, arguments| {
@@ -89,18 +79,18 @@ pub(crate) fn register<D: StateTreeDomain>(app: &mut App, schedule: InternedSche
         },
         crate::protocol::RegistrationOrigin::BuiltIn,
     );
-    app.init_resource::<SpawnRuns<D>>().add_systems(
+    app.init_resource::<SpawnRuns>().add_systems(
         schedule,
-        (handle_lifecycle::<D>, monitor_runs::<D>)
+        (handle_lifecycle, monitor_runs)
             .chain()
             .in_set(StateTreeSet::HandleActivities),
     );
 }
 
-fn handle_lifecycle<D: StateTreeDomain>(
-    mut lifecycle: MessageReader<StateTreeActivityLifecycle<D, SpawnActivity>>,
+fn handle_lifecycle(
+    mut lifecycle: MessageReader<StateTreeActivityLifecycle<SpawnActivity>>,
     asset_server: Res<AssetServer>,
-    mut runs: ResMut<SpawnRuns<D>>,
+    mut runs: ResMut<SpawnRuns>,
     mut commands: Commands,
 ) {
     for message in lifecycle.read() {
@@ -130,14 +120,14 @@ fn handle_lifecycle<D: StateTreeDomain>(
     }
 }
 
-fn monitor_runs<D: StateTreeDomain>(
+fn monitor_runs(
     mut commands: Commands,
     definitions: Res<Assets<StateTreeDefinition>>,
     #[cfg(feature = "persistence")] asset_server: Res<AssetServer>,
-    children: Query<(&StateTreeInstance<D>, Option<&StateTreeLinkFailure<D>>)>,
+    children: Query<(&StateTreeInstance, Option<&StateTreeLinkFailure>)>,
     mut load_failures: MessageReader<AssetLoadFailedEvent<StateTreeDefinition>>,
-    mut runs: ResMut<SpawnRuns<D>>,
-    mut outcomes: StateTreeActivityOutcomeWriter<D, SpawnActivity>,
+    mut runs: ResMut<SpawnRuns>,
+    mut outcomes: StateTreeActivityOutcomeWriter<SpawnActivity>,
 ) {
     let failures: HashMap<_, _> = load_failures
         .read()
@@ -163,10 +153,7 @@ fn monitor_runs<D: StateTreeDomain>(
                     )))
                 } else if definitions.contains(handle.id()) {
                     let child = commands
-                        .spawn((
-                            StateTreeInstance::<D>::new(handle.clone()),
-                            SpawnedStateTree,
-                        ))
+                        .spawn((StateTreeInstance::new(handle.clone()), SpawnedStateTree))
                         .id();
                     runs.runs[index].state = SpawnRunState::Running(child);
                     None
@@ -228,26 +215,14 @@ mod tests {
         StateTreeData, StateTreeTransition,
     };
 
-    struct TestDomain;
+    fn configure_test(_config: &mut StateTreeConfig<'_>) {}
 
-    impl StateTreeDomain for TestDomain {
-        const AUTHORED_NAME: &'static str = "test";
-
-        fn configure(_config: &mut StateTreeConfig<'_, Self>) {}
-    }
-
-    struct ReservedNameDomain;
-
-    impl StateTreeDomain for ReservedNameDomain {
-        const AUTHORED_NAME: &'static str = "reserved-name";
-
-        fn configure(config: &mut StateTreeConfig<'_, Self>) {
-            config.activity::<SpawnActivity, _>(NAME, |_context, arguments| {
-                Ok(SpawnActivity {
-                    definition: arguments.take("definition")?,
-                })
-            });
-        }
+    fn configure_reserved_name(config: &mut StateTreeConfig<'_>) {
+        config.activity::<SpawnActivity, _>(NAME, |_context, arguments| {
+            Ok(SpawnActivity {
+                definition: arguments.take("definition")?,
+            })
+        });
     }
 
     fn app() -> App {
@@ -261,7 +236,7 @@ mod tests {
                 use_asset_processor_override: Some(false),
                 ..Default::default()
             },
-            crate::StateTreePlugin::<TestDomain>::new(Update),
+            crate::StateTreePlugin::new(Update).configure(configure_test),
         ));
         app
     }
@@ -356,15 +331,13 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition);
-        app.world_mut()
-            .spawn(StateTreeInstance::<TestDomain>::new(handle))
-            .id()
+        app.world_mut().spawn(StateTreeInstance::new(handle)).id()
     }
 
     fn insert_for_run(app: &mut App, definition: StateTreeDefinition) {
         let handle = match &app
             .world()
-            .resource::<SpawnRuns<TestDomain>>()
+            .resource::<SpawnRuns>()
             .runs
             .first()
             .expect("spawn run should be tracked")
@@ -381,7 +354,7 @@ mod tests {
 
     fn instance_count(app: &mut App) -> usize {
         app.world_mut()
-            .query::<&StateTreeInstance<TestDomain>>()
+            .query::<&StateTreeInstance>()
             .iter(app.world())
             .count()
     }
@@ -401,7 +374,7 @@ mod tests {
         update_state_trees(&mut app);
         update_state_trees(&mut app);
         let (old_token, old_child) = {
-            let run = &app.world().resource::<SpawnRuns<TestDomain>>().runs[0];
+            let run = &app.world().resource::<SpawnRuns>().runs[0];
             let SpawnRunState::Running(child) = run.state else {
                 panic!("child must be running")
             };
@@ -413,7 +386,7 @@ mod tests {
         update_state_trees(&mut app);
         update_state_trees(&mut app);
         assert_eq!(instance_count(&mut app), 2);
-        let run = &app.world().resource::<SpawnRuns<TestDomain>>().runs[0];
+        let run = &app.world().resource::<SpawnRuns>().runs[0];
         let SpawnRunState::Running(child) = run.state else {
             panic!("child must remain running")
         };
@@ -427,12 +400,7 @@ mod tests {
             .advance_by(Duration::from_secs(1));
         update_state_trees(&mut app);
         assert_eq!(instance_count(&mut app), 1);
-        assert!(
-            app.world()
-                .resource::<SpawnRuns<TestDomain>>()
-                .runs
-                .is_empty()
-        );
+        assert!(app.world().resource::<SpawnRuns>().runs.is_empty());
     }
 
     #[cfg(feature = "persistence")]
@@ -444,18 +412,12 @@ mod tests {
         app.update();
         let checkpoint = Checkpoint::capture(app.world_mut()).unwrap();
         checkpoint.restore(app.world_mut()).unwrap();
-        assert_eq!(
-            app.world().resource::<SpawnRuns<TestDomain>>().runs.len(),
-            1
-        );
+        assert_eq!(app.world().resource::<SpawnRuns>().runs.len(), 1);
         insert_for_run(&mut app, running_child_definition());
         update_state_trees(&mut app);
         update_state_trees(&mut app);
         assert_eq!(instance_count(&mut app), 2);
-        assert_eq!(
-            app.world().resource::<SpawnRuns<TestDomain>>().runs.len(),
-            1
-        );
+        assert_eq!(app.world().resource::<SpawnRuns>().runs.len(), 1);
     }
 
     #[cfg(feature = "persistence")]
@@ -490,14 +452,14 @@ mod tests {
         ));
         // Model a loading checkpoint after the asset subsystem has delivered
         // and retired its notification. Persistent loading state must suffice.
-        let token = app.world().resource::<SpawnRuns<TestDomain>>().runs[0].token;
-        app.world_mut().resource_mut::<SpawnRuns<TestDomain>>().runs = vec![SpawnRun {
+        let token = app.world().resource::<SpawnRuns>().runs[0].token;
+        app.world_mut().resource_mut::<SpawnRuns>().runs = vec![SpawnRun {
             token,
             definition: path.into(),
             state: SpawnRunState::Loading(handle),
         }];
         app.world()
-            .get::<crate::activity::StateTreeActivityInbox<TestDomain>>(parent)
+            .get::<crate::activity::StateTreeActivityInbox>(parent)
             .unwrap()
             .outcomes
             .lock()
@@ -513,26 +475,16 @@ mod tests {
         update_state_trees(&mut app);
         for _ in 0..1_000 {
             app.update();
-            if app
-                .world()
-                .resource::<SpawnRuns<TestDomain>>()
-                .runs
-                .is_empty()
-            {
+            if app.world().resource::<SpawnRuns>().runs.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         update_state_trees(&mut app);
-        assert!(
-            app.world()
-                .resource::<SpawnRuns<TestDomain>>()
-                .runs
-                .is_empty()
-        );
+        assert!(app.world().resource::<SpawnRuns>().runs.is_empty());
         let instance = app
             .world_mut()
-            .query::<&StateTreeInstance<TestDomain>>()
+            .query::<&StateTreeInstance>()
             .single(app.world())
             .unwrap();
         assert_eq!(instance.active_state_names().last(), Some("failed"));
@@ -545,19 +497,14 @@ mod tests {
 
         app.update();
         assert_eq!(instance_count(&mut app), 1);
-        assert_eq!(
-            app.world().resource::<SpawnRuns<TestDomain>>().runs.len(),
-            1
-        );
+        assert_eq!(app.world().resource::<SpawnRuns>().runs.len(), 1);
 
         insert_for_run(&mut app, running_child_definition());
         update_state_trees(&mut app);
         assert_eq!(instance_count(&mut app), 2);
         update_state_trees(&mut app);
 
-        let mut children = app
-            .world_mut()
-            .query::<(Entity, &StateTreeInstance<TestDomain>)>();
+        let mut children = app.world_mut().query::<(Entity, &StateTreeInstance)>();
         let (child, instance) = children
             .iter(app.world())
             .find(|(entity, _)| *entity != parent)
@@ -588,15 +535,10 @@ mod tests {
         app.update();
 
         assert_eq!(instance_count(&mut app), 1);
-        assert!(
-            app.world()
-                .resource::<SpawnRuns<TestDomain>>()
-                .runs
-                .is_empty()
-        );
+        assert!(app.world().resource::<SpawnRuns>().runs.is_empty());
         assert_eq!(
             app.world()
-                .get::<StateTreeInstance<TestDomain>>(parent)
+                .get::<StateTreeInstance>(parent)
                 .unwrap()
                 .active_state_names()
                 .last(),
@@ -614,7 +556,7 @@ mod tests {
 
             assert!(matches!(
                 app.world()
-                    .get::<StateTreeInstance<TestDomain>>(parent)
+                    .get::<StateTreeInstance>(parent)
                     .unwrap()
                     .status(),
                 InstanceStatus::Faulted(crate::RuntimeFault::Activity {
@@ -623,12 +565,7 @@ mod tests {
                     ..
                 }) if activity.as_ref() == NAME && argument.as_ref() == "definition"
             ));
-            assert!(
-                app.world()
-                    .resource::<SpawnRuns<TestDomain>>()
-                    .runs
-                    .is_empty()
-            );
+            assert!(app.world().resource::<SpawnRuns>().runs.is_empty());
         }
     }
 
@@ -647,15 +584,10 @@ mod tests {
         update_state_trees(&mut app);
 
         assert_eq!(instance_count(&mut app), 1);
-        assert!(
-            app.world()
-                .resource::<SpawnRuns<TestDomain>>()
-                .runs
-                .is_empty()
-        );
+        assert!(app.world().resource::<SpawnRuns>().runs.is_empty());
         assert_eq!(
             app.world()
-                .get::<StateTreeInstance<TestDomain>>(parent)
+                .get::<StateTreeInstance>(parent)
                 .unwrap()
                 .active_state_names()
                 .last(),
@@ -674,10 +606,7 @@ mod tests {
             update_state_trees(&mut app);
         }
 
-        let instance = app
-            .world()
-            .get::<StateTreeInstance<TestDomain>>(parent)
-            .unwrap();
+        let instance = app.world().get::<StateTreeInstance>(parent).unwrap();
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(instance.active_state_names().last(), Some("succeeded"));
         assert_eq!(instance_count(&mut app), 1);
@@ -693,10 +622,7 @@ mod tests {
             update_state_trees(&mut app);
         }
 
-        let instance = app
-            .world()
-            .get::<StateTreeInstance<TestDomain>>(parent)
-            .unwrap();
+        let instance = app.world().get::<StateTreeInstance>(parent).unwrap();
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(instance.active_state_names().last(), Some("failed"));
         assert_eq!(instance_count(&mut app), 1);
@@ -722,7 +648,7 @@ mod tests {
 
         let child = match app
             .world()
-            .resource::<SpawnRuns<TestDomain>>()
+            .resource::<SpawnRuns>()
             .runs
             .first()
             .map(|run| &run.state)
@@ -734,10 +660,7 @@ mod tests {
         update_state_trees(&mut app);
         update_state_trees(&mut app);
 
-        let instance = app
-            .world()
-            .get::<StateTreeInstance<TestDomain>>(parent)
-            .unwrap();
+        let instance = app.world().get::<StateTreeInstance>(parent).unwrap();
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(instance.active_state_names().last(), Some("failed"));
     }
@@ -752,17 +675,14 @@ mod tests {
             std::thread::yield_now();
             if app
                 .world()
-                .get::<StateTreeInstance<TestDomain>>(parent)
+                .get::<StateTreeInstance>(parent)
                 .is_some_and(|instance| instance.status() == &InstanceStatus::Complete)
             {
                 break;
             }
         }
 
-        let instance = app
-            .world()
-            .get::<StateTreeInstance<TestDomain>>(parent)
-            .unwrap();
+        let instance = app.world().get::<StateTreeInstance>(parent).unwrap();
         assert_eq!(instance.status(), &InstanceStatus::Complete);
         assert_eq!(instance.active_state_names().last(), Some("failed"));
         assert_eq!(instance_count(&mut app), 1);
@@ -772,13 +692,13 @@ mod tests {
     #[should_panic(
         expected = "state-tree activity `bst.spawn` is reserved for the built-in state-tree spawner"
     )]
-    fn domain_cannot_replace_builtin_spawn_activity() {
+    fn configuration_cannot_replace_builtin_spawn_activity() {
         let mut app = App::new();
         app.add_plugins((
             TaskPoolPlugin::default(),
             TimePlugin,
             AssetPlugin::default(),
-            crate::StateTreePlugin::<ReservedNameDomain>::new(Update),
+            crate::StateTreePlugin::new(Update).configure(configure_reserved_name),
         ));
     }
 }

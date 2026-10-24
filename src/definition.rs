@@ -15,10 +15,7 @@ use thiserror::Error;
 use crate::activity::{RegisteredActivity, StateTreeActivityRegistry};
 use crate::effect::{RegisteredEffect, StateTreeEffectRegistry};
 use crate::event::StateTreeEventProtocol;
-use crate::{
-    StateTreeDomain,
-    luau::{CompiledLuauExpression, compile_expression},
-};
+use crate::luau::{CompiledLuauExpression, compile_expression};
 
 /// A compact state identifier local to one [`StateTreeDefinition`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -345,8 +342,6 @@ pub(crate) struct CompiledLuauDataModel {
 pub(crate) struct CompiledDefinition {
     pub identity: u64,
     pub name: Box<str>,
-    pub domain: Option<Box<str>>,
-    pub domain_span_start: Option<usize>,
     pub root: StateId,
     pub states: Box<[StateNode]>,
     pub children: Box<[StateId]>,
@@ -453,14 +448,14 @@ impl CompiledDefinition {
     }
 }
 
-pub(crate) struct LinkedDefinition<D: StateTreeDomain> {
+pub(crate) struct LinkedDefinition {
     pub compiled: Arc<CompiledDefinition>,
     external_events: Box<[EventSet]>,
-    effects: Box<[Arc<dyn RegisteredEffect<D>>]>,
-    activities: Box<[Arc<dyn RegisteredActivity<D>>]>,
+    effects: Box<[Arc<dyn RegisteredEffect>]>,
+    activities: Box<[Arc<dyn RegisteredActivity>]>,
 }
 
-impl<D: StateTreeDomain> std::fmt::Debug for LinkedDefinition<D> {
+impl std::fmt::Debug for LinkedDefinition {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LinkedDefinition")
@@ -469,25 +464,13 @@ impl<D: StateTreeDomain> std::fmt::Debug for LinkedDefinition<D> {
     }
 }
 
-impl<D: StateTreeDomain> LinkedDefinition<D> {
+impl LinkedDefinition {
     pub fn new(
         compiled: Arc<CompiledDefinition>,
-        events: &StateTreeEventProtocol<D>,
-        effects: &StateTreeEffectRegistry<D>,
-        activities: &StateTreeActivityRegistry<D>,
+        events: &StateTreeEventProtocol,
+        effects: &StateTreeEffectRegistry,
+        activities: &StateTreeActivityRegistry,
     ) -> Result<Self, StateTreeLinkError> {
-        if let Some(declared) = compiled.domain.as_deref()
-            && declared != D::AUTHORED_NAME
-        {
-            return Err(StateTreeLinkError {
-                definition: compiled.name.clone(),
-                issues: Box::new([StateTreeLinkIssue::DomainMismatch {
-                    declared: declared.into(),
-                    expected: D::AUTHORED_NAME.into(),
-                    span_start: compiled.domain_span_start,
-                }]),
-            });
-        }
         let mut issues = Vec::new();
         for requirement in &compiled.event_requirements {
             let pattern = &compiled.events[requirement.event.index()];
@@ -564,11 +547,11 @@ impl<D: StateTreeDomain> LinkedDefinition<D> {
         self.external_events.get(index)
     }
 
-    pub fn effect(&self, effect: EffectId) -> &Arc<dyn RegisteredEffect<D>> {
+    pub fn effect(&self, effect: EffectId) -> &Arc<dyn RegisteredEffect> {
         &self.effects[effect.index()]
     }
 
-    pub fn activity(&self, activity: ActivityId) -> &Arc<dyn RegisteredActivity<D>> {
+    pub fn activity(&self, activity: ActivityId) -> &Arc<dyn RegisteredActivity> {
         &self.activities[activity.index()]
     }
 }
@@ -595,7 +578,7 @@ fn first_effect_span(compiled: &CompiledDefinition, effect: EffectId) -> Option<
         })
 }
 
-/// A definition could not be linked to a domain's typed runtime protocol.
+/// A definition could not be linked to the application's typed runtime protocol.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("state-tree definition `{definition}` has {count} link issue(s)", count = .issues.len())]
 pub struct StateTreeLinkError {
@@ -615,27 +598,21 @@ impl StateTreeLinkError {
     }
 }
 
-/// One domain-dependent state-tree link problem.
+/// One state-tree protocol link problem.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[non_exhaustive]
 pub enum StateTreeLinkIssue {
-    #[error("definition declares domain `{declared}`, but this instance uses `{expected}`")]
-    DomainMismatch {
-        declared: Box<str>,
-        expected: Box<str>,
-        span_start: Option<usize>,
-    },
     #[error("event descriptor `{descriptor}` matches no typed or internal event")]
     UnmatchedEventDescriptor {
         descriptor: Box<str>,
         span_start: Option<usize>,
     },
-    #[error("effect `{effect}` is not registered for this domain")]
+    #[error("effect `{effect}` is not registered")]
     MissingEffect {
         effect: Box<str>,
         span_start: Option<usize>,
     },
-    #[error("activity `{activity}` is not registered for this domain")]
+    #[error("activity `{activity}` is not registered")]
     MissingActivity {
         activity: Box<str>,
         span_start: Option<usize>,
@@ -661,11 +638,6 @@ impl StateTreeDefinition {
     /// Returns the authored definition name.
     pub fn name(&self) -> &str {
         &self.compiled.name
-    }
-
-    /// Returns the stable authored domain identifier, when one was declared.
-    pub fn domain(&self) -> Option<&str> {
-        self.compiled.domain.as_deref()
     }
 
     /// Returns the compiled authored protocol used by this definition.
@@ -1132,8 +1104,6 @@ impl StateTreeTransition {
 pub struct StateTreeBuilder {
     identity: u64,
     name: Box<str>,
-    domain: Option<Box<str>>,
-    domain_span_start: Option<usize>,
     states: Vec<DraftState>,
     histories: Vec<DraftHistory>,
     names: HashSet<Box<str>>,
@@ -1147,33 +1117,12 @@ impl StateTreeBuilder {
         Self {
             identity: NEXT_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
-            domain: None,
-            domain_span_start: None,
             states: Vec::new(),
             histories: Vec::new(),
             names: HashSet::new(),
             root: None,
             datamodel: None,
         }
-    }
-
-    /// Restricts this generated definition to one authored domain identifier.
-    pub fn domain(&mut self, domain: impl Into<Box<str>>) -> &mut Self {
-        self.set_domain(domain, None)
-    }
-
-    pub(crate) fn domain_at(
-        &mut self,
-        domain: impl Into<Box<str>>,
-        span_start: usize,
-    ) -> &mut Self {
-        self.set_domain(domain, Some(span_start))
-    }
-
-    fn set_domain(&mut self, domain: impl Into<Box<str>>, span_start: Option<usize>) -> &mut Self {
-        self.domain = Some(domain.into());
-        self.domain_span_start = span_start;
-        self
     }
 
     /// Adds the single compound root state.
@@ -1818,9 +1767,6 @@ impl StateTreeBuilder {
         if self.name.is_empty() {
             return Err(BuildError::EmptyDefinitionName);
         }
-        if self.domain.as_deref().is_some_and(str::is_empty) {
-            return Err(BuildError::EmptyDomainName);
-        }
         let root = self.root.ok_or(BuildError::MissingRoot)?;
         for (index, history) in self.histories.iter().enumerate() {
             if history.default.is_none() {
@@ -2277,8 +2223,6 @@ impl StateTreeBuilder {
             compiled: Arc::new(CompiledDefinition {
                 identity: self.identity,
                 name: self.name,
-                domain: self.domain,
-                domain_span_start: self.domain_span_start,
                 root,
                 states: states.into_boxed_slice(),
                 children: children.into_boxed_slice(),
@@ -2791,8 +2735,6 @@ pub(crate) fn is_activity_id(value: &str) -> bool {
 pub enum BuildError {
     #[error("the definition name cannot be empty")]
     EmptyDefinitionName,
-    #[error("the authored domain name cannot be empty")]
-    EmptyDomainName,
     #[error("a state name cannot be empty")]
     EmptyStateName,
     #[error("a history name cannot be empty")]
@@ -2938,7 +2880,6 @@ pub enum BuildError {
 #[derive(Debug, Eq, PartialEq)]
 struct DefinitionSemantics {
     name: Box<str>,
-    domain: Option<Box<str>>,
     root: u32,
     states: Vec<StateSemantics>,
     children: Vec<u32>,
@@ -3109,7 +3050,6 @@ fn definition_semantics(definition: &StateTreeDefinition) -> DefinitionSemantics
     let compiled = &definition.compiled;
     DefinitionSemantics {
         name: compiled.name.clone(),
-        domain: compiled.domain.clone(),
         root: compiled.root.index,
         states: compiled
             .states
@@ -3298,24 +3238,6 @@ fn target_semantics(target: StateTreeTarget) -> TargetSemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn generated_definitions_may_declare_a_domain() {
-        let mut builder = StateTreeBuilder::new("generated");
-        builder.domain("simulation");
-        let root = builder.compound_root("root").unwrap();
-        let idle = builder.atomic("idle", root).unwrap();
-        builder.initial(root, idle).unwrap();
-        let definition = builder.build().unwrap();
-        assert_eq!(definition.domain(), Some("simulation"));
-
-        let mut invalid = StateTreeBuilder::new("invalid");
-        invalid.domain("");
-        let root = invalid.compound_root("root").unwrap();
-        let idle = invalid.atomic("idle", root).unwrap();
-        invalid.initial(root, idle).unwrap();
-        assert!(matches!(invalid.build(), Err(BuildError::EmptyDomainName)));
-    }
 
     #[test]
     fn entry_layout_remains_compact_with_history_support() {

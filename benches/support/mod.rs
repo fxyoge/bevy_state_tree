@@ -14,9 +14,8 @@ use bevy_ecs::{
 use bevy_state_tree::{
     BroadcastStateTreeEventWriter, EntityStateTreeEventWriter, StateTreeActivity,
     StateTreeActivityDefinition, StateTreeActivityLifecycle, StateTreeActivityOutcomeWriter,
-    StateTreeActivityToken, StateTreeBuilder, StateTreeConfig, StateTreeDefinition,
-    StateTreeDomain, StateTreeEvent, StateTreeInstance, StateTreePlugin, StateTreeSet,
-    StateTreeTransition,
+    StateTreeActivityToken, StateTreeBuilder, StateTreeConfig, StateTreeDefinition, StateTreeEvent,
+    StateTreeInstance, StateTreePlugin, StateTreeSet, StateTreeTransition,
 };
 use bevy_tasks::{AsyncComputeTaskPool, IoTaskPool, TaskPoolBuilder};
 use bevy_time::{Time, TimePlugin};
@@ -29,38 +28,32 @@ const EFFECT: &str = "benches/assets/benchmark_effect.scxml";
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ScheduleLabel)]
 pub struct AiUpdate;
 
-pub struct Simulation;
-
-impl StateTreeDomain for Simulation {
-    const AUTHORED_NAME: &'static str = "test";
-
-    fn configure(config: &mut StateTreeConfig<'_, Self>) {
-        config
-            .event::<Tick>()
-            .event::<EntityTick>()
-            .event::<Ignored>()
-            .effect::<BenchmarkEffect, _>("benchmark", |_context, arguments| {
-                let _: i64 = arguments.take("amount")?;
-                Ok(BenchmarkEffect)
-            })
-            .activity::<BenchmarkActivity, _>("benchmark", |_context, _arguments| {
-                Ok(BenchmarkActivity)
-            });
-    }
+fn configure_simulation(config: &mut StateTreeConfig<'_>) {
+    config
+        .event::<Tick>()
+        .event::<EntityTick>()
+        .event::<Ignored>()
+        .effect::<BenchmarkEffect, _>("benchmark", |_context, arguments| {
+            let _: i64 = arguments.take("amount")?;
+            Ok(BenchmarkEffect)
+        })
+        .activity::<BenchmarkActivity, _>("benchmark", |_context, _arguments| {
+            Ok(BenchmarkActivity)
+        });
 }
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = Simulation, name = "tick", broadcast)]
+#[state_tree(name = "tick", broadcast)]
 pub struct Tick;
 
 #[derive(EntityEvent, StateTreeEvent)]
-#[state_tree(domain = Simulation, name = "tick.entity")]
+#[state_tree(name = "tick.entity")]
 pub struct EntityTick {
     entity: Entity,
 }
 
 #[derive(Event, StateTreeEvent)]
-#[state_tree(domain = Simulation, name = "ignored", broadcast)]
+#[state_tree(name = "ignored", broadcast)]
 pub struct Ignored;
 
 #[derive(Message)]
@@ -74,7 +67,7 @@ impl StateTreeActivity for BenchmarkActivity {
 }
 
 #[derive(Resource, Default)]
-struct BenchmarkActivityTokens(Vec<StateTreeActivityToken<Simulation, BenchmarkActivity>>);
+struct BenchmarkActivityTokens(Vec<StateTreeActivityToken<BenchmarkActivity>>);
 
 #[derive(Clone, Copy)]
 pub enum Executor {
@@ -121,7 +114,7 @@ impl BenchmarkApp {
             },
         ))
         .init_schedule(AiUpdate)
-        .add_plugins(StateTreePlugin::<Simulation>::new(AiUpdate))
+        .add_plugins(StateTreePlugin::new(AiUpdate).configure(configure_simulation))
         .insert_resource(QueuedEvent::None)
         .add_systems(
             AiUpdate,
@@ -157,9 +150,7 @@ impl BenchmarkApp {
         for _ in 0..instances {
             self.app
                 .world_mut()
-                .spawn(StateTreeInstance::<Simulation>::new(
-                    self.definition.clone(),
-                ));
+                .spawn(StateTreeInstance::new(self.definition.clone()));
         }
     }
 
@@ -251,14 +242,14 @@ fn load_definition(app: &mut App, path: &'static str) -> Handle<StateTreeDefinit
     panic!("timed out loading benchmark definition `{path}`");
 }
 
-fn queue_broadcast_tick(mut events: BroadcastStateTreeEventWriter<Simulation>) {
+fn queue_broadcast_tick(mut events: BroadcastStateTreeEventWriter) {
     events.write(Tick);
 }
 
 fn queue_entity_ticks(
-    instances: Query<Entity, With<StateTreeInstance<Simulation>>>,
+    instances: Query<Entity, With<StateTreeInstance>>,
     count: Res<TargetCount>,
-    mut events: EntityStateTreeEventWriter<Simulation>,
+    mut events: EntityStateTreeEventWriter,
 ) {
     let mut queued = 0;
     for entity in instances.iter().take(count.0) {
@@ -270,9 +261,9 @@ fn queue_entity_ticks(
 
 fn queue_configured_event(
     event: Res<QueuedEvent>,
-    instances: Query<Entity, With<StateTreeInstance<Simulation>>>,
-    mut entity_events: EntityStateTreeEventWriter<Simulation>,
-    mut broadcast_events: BroadcastStateTreeEventWriter<Simulation>,
+    instances: Query<Entity, With<StateTreeInstance>>,
+    mut entity_events: EntityStateTreeEventWriter,
+    mut broadcast_events: BroadcastStateTreeEventWriter,
 ) {
     match *event {
         QueuedEvent::None => {}
@@ -293,7 +284,7 @@ fn clear_benchmark_effects(mut effects: ResMut<Messages<BenchmarkEffect>>) {
 }
 
 fn collect_benchmark_activities(
-    mut messages: MessageReader<StateTreeActivityLifecycle<Simulation, BenchmarkActivity>>,
+    mut messages: MessageReader<StateTreeActivityLifecycle<BenchmarkActivity>>,
     mut tokens: ResMut<BenchmarkActivityTokens>,
 ) {
     let mut cancelled = std::collections::HashSet::new();
@@ -312,7 +303,7 @@ fn collect_benchmark_activities(
 
 fn complete_benchmark_activities(
     tokens: Res<BenchmarkActivityTokens>,
-    mut outcomes: StateTreeActivityOutcomeWriter<Simulation, BenchmarkActivity>,
+    mut outcomes: StateTreeActivityOutcomeWriter<BenchmarkActivity>,
 ) {
     for token in &tokens.0 {
         assert!(outcomes.complete(*token, ()));

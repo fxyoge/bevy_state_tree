@@ -497,8 +497,6 @@ fn decode_root(element: &Element, source_name: &str, source: &str) -> Result<Scx
     Ok(Scxml {
         span: element.span,
         name: attribute(element, "name").map(str::to_owned),
-        domain: namespaced_attribute(element, super::BEVY_STATE_TREE_NAMESPACE, "domain")
-            .map(str::to_owned),
         version: attribute(element, "version").map(str::to_owned),
         initial: idrefs(attribute(element, "initial")),
         initial_raw: attribute(element, "initial").map(str::to_owned),
@@ -1290,17 +1288,6 @@ mod tests {
     use super::*;
 
     const NS: &str = "http://www.w3.org/2005/07/scxml";
-
-    #[test]
-    fn resolves_the_authored_domain_by_namespace() {
-        let source = format!(
-            r#"<scxml xmlns="{NS}" xmlns:state-tree="{}" state-tree:domain="simulation"><state/></scxml>"#,
-            super::super::BEVY_STATE_TREE_NAMESPACE,
-        );
-        let document = parse("domain.scxml", &source).expect("valid domain declaration");
-
-        assert_eq!(document.root.domain.as_deref(), Some("simulation"));
-    }
 
     #[test]
     fn parses_namespaces_order_and_authored_transition_tokens() {

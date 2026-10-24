@@ -22,30 +22,15 @@ Installing `StateTreePlugin` registers `.scxml` as a Bevy asset source for
 loading. Parser diagnostics retain the asset path, byte span, and line and
 column; compiler diagnostics retain the asset path and byte position.
 
-Asset loading is domain-independent. It validates authored SCXML and produces
+Asset loading validates authored SCXML and produces
 the same immutable runtime representation as `StateTreeBuilder::build`, but it
 does not resolve external events, typed effects, or typed activities. Those
-checks depend on the domain declaration consumed by `StateTreePlugin` and occur
+checks depend on the application protocol configured by `StateTreePlugin` and occur
 when a `StateTreeInstance` initializes. A source can load successfully and still
-leave an instance pending with `StateTreeLinkFailure<D>` for a particular
-domain.
+leave an instance pending with `StateTreeLinkFailure`.
 
-Every SCXML document must declare its stable authored domain in the Bevy
-state-tree namespace. The declaration is retained during domain-independent
-asset loading and checked when an instance links:
-
-```xml
-<scxml xmlns="http://www.w3.org/2005/07/scxml"
-       xmlns:bst="urn:bevy-state-tree"
-       bst:domain="simulation">
-```
-
-The value must equal `StateTreeDomain::AUTHORED_NAME`. A mismatch produces a
-single domain link issue before the domain's events, effects, and activities are
-checked. Generated definitions may opt into the same check with
-`StateTreeBuilder::domain`; generated definitions without one remain reusable
-across domains. Each installed domain must have a unique authored name within
-the Bevy application.
+Definitions use one application-wide protocol. SCXML documents do not declare a
+domain; the former `bst:domain` attribute is unsupported.
 
 Definitions constructed programmatically can be inserted directly into
 `Assets<StateTreeDefinition>`; they share the same initialization and linking
@@ -53,15 +38,15 @@ path as file-loaded definitions.
 
 ## Events
 
-Each state-tree domain implements `StateTreeDomain::configure`. Every concrete
-payload derives `StateTreeEvent` with its domain and authored name, then the
-domain declares it with `StateTreeConfig::event`. Entity payloads also derive
+Applications register capabilities through `StateTreePlugin::configure`. Every
+concrete payload derives `StateTreeEvent` with its authored name, then a
+configuration function declares it with `StateTreeConfig::event`. Entity payloads also derive
 `EntityEvent`; broadcast payloads derive Bevy `Event` and use the
 `#[state_tree(..., broadcast)]` option.
 
 `StateTreePlugin` consumes the complete declaration during installation. There
 is no mutable application registration API and no separate portable protocol.
-Each event in a domain must have a unique authored name, including entity and
+Each event must have a unique application-wide authored name, including entity and
 broadcast events.
 
 Authored descriptors are checked against registered authored names when a
@@ -180,7 +165,7 @@ payload, target URI, I/O processor, and private timer semantics do not map
 cleanly to Bevy's typed events, entities, schedules, and time resources. In
 particular, `event="damage"` cannot construct an application-defined Rust value
 such as `Damage { entity, amount }` without adding a second dynamic event system
-that bypasses the domain's registered event protocol.
+that bypasses the application's registered event protocol.
 
 State trees receive external events through `EntityStateTreeEventWriter` and
 `BroadcastStateTreeEventWriter`. Future state-tree outputs should likewise use
@@ -251,7 +236,7 @@ publishes that message through deferred commands. Systems ordered in
 `StateTreeSet::HandleEffects` observe messages after state-tree processing.
 The constructor can use `context.event::<T>()` to borrow a matching concrete
 external payload; it returns `None` for internal events or another payload type.
-Registered effect names are unique within a domain, while definitions may invoke
+Registered effect names are unique application-wide, while definitions may invoke
 the same registered effect any number of times.
 
 Effects are constructed in SCXML action order. Publication across independently
@@ -283,7 +268,7 @@ only. Arguments follow effect rules: unique non-empty names, non-empty Luau
 expressions, no content, and a
 Luau datamodel when arguments are present. Builder definitions use
 `StateTreeActivityDefinition` and `StateTreeBuilder::add_activity`.
-Registered activity names are unique within a domain, while definitions may use
+Registered activity names are unique application-wide, while definitions may use
 the same registered activity for multiple globally unique activity IDs.
 
 Owner entry actions run before starts. A committed exit cancels live activities
@@ -299,8 +284,8 @@ Luau `_event.data`; projection failure faults the instance. Every accepted
 outcome is a separate macrostep. Per-instance writer order is retained while
 concurrent writer order is unspecified, like entity event ingress.
 
-`bst.spawn` is a built-in activity name in every domain and cannot be replaced
-by domain configuration. Its ordinary required `definition` string argument is
+`bst.spawn` is a built-in activity name and cannot be replaced by application
+configuration. Its ordinary required `definition` string argument is
 passed to `AssetServer::load<StateTreeDefinition>`. Once available, the asset is
 run on a separate entity with logical activity ownership only (no `ChildOf`).
 Cancellation is silent and despawns a running child. Completion produces nil

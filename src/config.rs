@@ -1,41 +1,36 @@
-use std::marker::PhantomData;
-
 use bevy_app::App;
 use bevy_ecs::message::Message;
 use bevy_ecs::{schedule::InternedScheduleLabel, system::IntoSystem};
 
 use crate::{
     StateTreeActivity, StateTreeActivityArgs, StateTreeActivityContext, StateTreeActivityError,
-    StateTreeBinding, StateTreeDomain, StateTreeEffectArgs, StateTreeEffectContext,
-    StateTreeEffectError, StateTreeEvent,
+    StateTreeBinding, StateTreeEffectArgs, StateTreeEffectContext, StateTreeEffectError,
+    StateTreeEvent,
 };
 
-/// Declares every typed event, effect, and activity in one state-tree domain.
+/// Declares the application's typed events, effects, activities, and bindings.
 ///
-/// A domain receives this registrar from [`StateTreePlugin`](crate::StateTreePlugin)
-/// through [`StateTreeDomain::configure`]. Applications cannot construct it or
-/// mutate a domain's protocol through another route.
-pub struct StateTreeConfig<'a, D: StateTreeDomain> {
+/// Supplied during [`StateTreePlugin::configure`](crate::StateTreePlugin::configure).
+/// Applications cannot mutate the protocol after plugin installation.
+pub struct StateTreeConfig<'a> {
     app: &'a mut App,
     schedule: InternedScheduleLabel,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
+impl<'a> StateTreeConfig<'a> {
     pub(crate) fn new(app: &'a mut App, schedule: InternedScheduleLabel) -> Self {
-        Self {
-            app,
-            schedule,
-            marker: PhantomData,
-        }
+        Self { app, schedule }
     }
 
     /// Declares one concrete external event payload.
     pub fn event<E>(&mut self) -> &mut Self
     where
-        E: StateTreeEvent<D>,
+        E: StateTreeEvent,
     {
-        crate::event::register_event::<D, E>(self.app, crate::protocol::RegistrationOrigin::Domain);
+        crate::event::register_event::<E>(
+            self.app,
+            crate::protocol::RegistrationOrigin::Application,
+        );
         self
     }
 
@@ -44,18 +39,18 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
     where
         M: Message,
         F: Fn(
-                StateTreeEffectContext<'_, D>,
+                StateTreeEffectContext<'_>,
                 &mut StateTreeEffectArgs,
             ) -> Result<M, StateTreeEffectError>
             + Send
             + Sync
             + 'static,
     {
-        crate::effect::register_effect::<D, M, F>(
+        crate::effect::register_effect::<M, F>(
             self.app,
             name.into(),
             constructor,
-            crate::protocol::RegistrationOrigin::Domain,
+            crate::protocol::RegistrationOrigin::Application,
         );
         self
     }
@@ -65,18 +60,18 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
     where
         A: StateTreeActivity,
         F: Fn(
-                StateTreeActivityContext<'_, D>,
+                StateTreeActivityContext<'_>,
                 &mut StateTreeActivityArgs,
             ) -> Result<A, StateTreeActivityError>
             + Send
             + Sync
             + 'static,
     {
-        crate::activity::register_activity::<D, A, F>(
+        crate::activity::register_activity::<A, F>(
             self.app,
             name.into(),
             constructor,
-            crate::protocol::RegistrationOrigin::Domain,
+            crate::protocol::RegistrationOrigin::Application,
         );
         self
     }
@@ -94,9 +89,9 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
         source: S,
     ) -> &mut Self
     where
-        B: StateTreeBinding<D>,
+        B: StateTreeBinding,
         F: Fn(
-                StateTreeActivityContext<'_, D>,
+                StateTreeActivityContext<'_>,
                 &mut StateTreeActivityArgs,
             ) -> Result<B, StateTreeActivityError>
             + Send
@@ -104,7 +99,7 @@ impl<'a, D: StateTreeDomain> StateTreeConfig<'a, D> {
             + 'static,
         S: IntoSystem<(), B::Value, M> + 'static,
     {
-        crate::binding::register_global_binding::<D, B, F, S, M>(
+        crate::binding::register_global_binding::<B, F, S, M>(
             self.app,
             self.schedule,
             name.into(),

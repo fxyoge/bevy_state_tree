@@ -1,7 +1,6 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
-    marker::PhantomData,
     num::NonZeroUsize,
     ops::Range,
     sync::{
@@ -36,8 +35,7 @@ use bevy_utils::Parallel;
 
 use crate::{
     BroadcastStateTreeEvent, EntityStateTreeEvent, InstanceStatus, StateTreeConfiguration,
-    StateTreeDefinition, StateTreeDomain, StateTreeDomainRegistry, StateTreeEventRef,
-    StateTreeInstance, StateTreeLinkError,
+    StateTreeDefinition, StateTreeEventRef, StateTreeInstance, StateTreeLinkError,
     activity::{
         BevyActivitySink, StateTreeActivityInbox, StateTreeActivityIngress,
         StateTreeActivityRegistry,
@@ -50,9 +48,9 @@ use crate::{
 };
 
 #[cfg(feature = "persistence")]
-mod persistence;
+pub(crate) mod persistence;
 
-/// Ordered phases installed into each state-tree domain schedule.
+/// Ordered phases installed into the state-tree schedule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 pub enum StateTreeSet {
     /// Rebuilds execution after definition or configuration replacement.
@@ -74,24 +72,20 @@ pub enum StateTreeSet {
     HandleEffects,
 }
 
-/// Runtime limits for one state-tree domain.
+/// Application-wide state-tree runtime limits.
 #[derive(Resource)]
-pub struct StateTreeSettings<D: Send + Sync + 'static> {
+pub struct StateTreeSettings {
     max_microsteps: NonZeroUsize,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: Send + Sync + 'static> StateTreeSettings<D> {
+impl StateTreeSettings {
     /// Creates settings with the maximum transition-set microsteps per macrostep.
     ///
     /// An external-event transition set counts as the first microstep. Initial
     /// configuration entry does not count, but subsequent eventless transition
     /// sets do.
     pub fn new(max_microsteps: NonZeroUsize) -> Self {
-        Self {
-            max_microsteps,
-            marker: PhantomData,
-        }
+        Self { max_microsteps }
     }
 
     /// Returns the maximum transition-set microsteps per macrostep.
@@ -100,54 +94,51 @@ impl<D: Send + Sync + 'static> StateTreeSettings<D> {
     }
 }
 
-impl<D: Send + Sync + 'static> Default for StateTreeSettings<D> {
+impl Default for StateTreeSettings {
     fn default() -> Self {
         Self::new(NonZeroUsize::new(64).expect("64 is non-zero"))
     }
 }
 
-/// Installs one independent state-tree domain into a Bevy schedule.
+/// Installs the application-wide state-tree runtime into a Bevy schedule.
 ///
 /// The plugin processes each instance's events sequentially but processes
 /// separate instances in parallel. Event-producing systems should run in
 /// [`StateTreeSet::QueueEvents`] for same-schedule delivery. Events written
 /// later remain queued for the next run.
-pub struct StateTreePlugin<D: StateTreeDomain> {
+pub struct StateTreePlugin {
     schedule: InternedScheduleLabel,
-    marker: PhantomData<fn() -> D>,
+    configuration: Vec<fn(&mut crate::StateTreeConfig<'_>)>,
 }
 
-impl<D: StateTreeDomain> StateTreePlugin<D> {
-    /// Creates a domain that processes events in `schedule`.
+impl StateTreePlugin {
+    /// Creates the runtime that processes events in `schedule`.
     pub fn new(schedule: impl ScheduleLabel) -> Self {
         Self {
             schedule: schedule.intern(),
-            marker: PhantomData,
+            configuration: Vec::new(),
         }
+    }
+
+    /// Adds an application protocol configuration function.
+    ///
+    /// Functions run in registration order during plugin installation, before
+    /// the protocol is frozen. They may compose other configuration functions.
+    pub fn configure(mut self, configure: fn(&mut crate::StateTreeConfig<'_>)) -> Self {
+        self.configuration.push(configure);
+        self
     }
 }
 
-impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
+impl Plugin for StateTreePlugin {
     fn build(&self, app: &mut App) {
         assert!(
-            !D::AUTHORED_NAME.is_empty(),
-            "StateTreeDomain::AUTHORED_NAME cannot be empty"
-        );
-        assert!(
-            !app.world().contains_resource::<StateTreeEventIngress<D>>(),
-            "StateTreePlugin was added more than once for this domain"
+            !app.world().contains_resource::<StateTreeEventIngress>(),
+            "StateTreePlugin was added more than once"
         );
         assert!(
             app.world().contains_resource::<Time>(),
             "StateTreePlugin requires Bevy's TimePlugin to be installed first"
-        );
-        app.init_resource::<StateTreeDomainRegistry>();
-        assert!(
-            app.world_mut()
-                .resource_mut::<StateTreeDomainRegistry>()
-                .reserve(D::AUTHORED_NAME),
-            "state-tree domain `{}` was registered more than once",
-            D::AUTHORED_NAME
         );
 
         if !app.world().contains_resource::<StateTreeAssetsInstalled>() {
@@ -165,14 +156,14 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             app.insert_resource(StateTreeAssetsInstalled);
         }
 
-        app.init_resource::<StateTreeEventIngress<D>>()
-            .init_resource::<StateTreeAppEventRegistry<D>>()
-            .init_resource::<StateTreeTimers<D>>()
-            .init_resource::<LinkedStateTreeDefinitions<D>>()
-            .init_resource::<StateTreeEffectRegistry<D>>()
-            .init_resource::<StateTreeActivityRegistry<D>>()
-            .init_resource::<StateTreeActivityIngress<D>>()
-            .init_resource::<StateTreeSettings<D>>()
+        app.init_resource::<StateTreeEventIngress>()
+            .init_resource::<StateTreeAppEventRegistry>()
+            .init_resource::<StateTreeTimers>()
+            .init_resource::<LinkedStateTreeDefinitions>()
+            .init_resource::<StateTreeEffectRegistry>()
+            .init_resource::<StateTreeActivityRegistry>()
+            .init_resource::<StateTreeActivityIngress>()
+            .init_resource::<StateTreeSettings>()
             .configure_sets(
                 self.schedule,
                 (
@@ -190,66 +181,58 @@ impl<D: StateTreeDomain> Plugin for StateTreePlugin<D> {
             .add_systems(
                 self.schedule,
                 (
-                    reconstruct_changed::<D>
+                    reconstruct_changed
                         .in_set(StateTreeSet::Reconstruct)
                         .run_if(
                             resource_changed::<Assets<StateTreeDefinition>>
                                 .or_eager(on_message::<AssetEvent<StateTreeDefinition>>)
                                 .or_eager(
                                     any_match_filter::<(
-                                        Changed<StateTreeConfiguration<D>>,
+                                        Changed<StateTreeConfiguration>,
                                         Allow<Disabled>,
                                     )>,
                                 )
-                                .or_eager(any_component_removed::<StateTreeConfiguration<D>>),
+                                .or_eager(any_component_removed::<StateTreeConfiguration>),
                         ),
-                    process_timers::<D>.in_set(StateTreeSet::ProcessTimers),
-                    process_activity_outcomes::<D>.in_set(StateTreeSet::ProcessActivityOutcomes),
-                    initialize_pending::<D>.in_set(StateTreeSet::Initialize),
-                    process_events::<D>.in_set(StateTreeSet::ProcessEvents),
-                    finish_teardown::<D>.after(StateTreeSet::HandleEffects),
+                    process_timers.in_set(StateTreeSet::ProcessTimers),
+                    process_activity_outcomes.in_set(StateTreeSet::ProcessActivityOutcomes),
+                    initialize_pending.in_set(StateTreeSet::Initialize),
+                    process_events.in_set(StateTreeSet::ProcessEvents),
+                    finish_teardown.after(StateTreeSet::HandleEffects),
                 ),
             );
 
-        crate::spawn_activity::register::<D>(app, self.schedule);
-        D::configure(&mut crate::StateTreeConfig::new(app, self.schedule));
-        crate::protocol::install_domain::<D>(app);
+        crate::spawn_activity::register(app, self.schedule);
+        for configure in &self.configuration {
+            configure(&mut crate::StateTreeConfig::new(app, self.schedule));
+        }
+        crate::protocol::install(app);
         #[cfg(feature = "persistence")]
-        persistence::register::<D>(app);
+        crate::persistence::ensure_adapter(app);
     }
 }
 
 #[derive(Resource)]
 struct StateTreeAssetsInstalled;
 
-#[derive(Resource)]
-struct LinkedStateTreeDefinitions<D: StateTreeDomain> {
-    definitions: HashMap<u64, CachedLinkedDefinition<D>>,
-    marker: PhantomData<fn() -> D>,
+#[derive(Resource, Default)]
+struct LinkedStateTreeDefinitions {
+    definitions: HashMap<u64, CachedLinkedDefinition>,
 }
 
-enum CachedLinkedDefinition<D: StateTreeDomain> {
-    Linked(Weak<LinkedDefinition<D>>),
+enum CachedLinkedDefinition {
+    Linked(Weak<LinkedDefinition>),
     Failed(Weak<StateTreeLinkError>),
 }
 
-impl<D: StateTreeDomain> Default for LinkedStateTreeDefinitions<D> {
-    fn default() -> Self {
-        Self {
-            definitions: HashMap::new(),
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
+impl LinkedStateTreeDefinitions {
     fn get_or_insert(
         &mut self,
         compiled: Arc<CompiledDefinition>,
-        events: &crate::event::StateTreeEventProtocol<D>,
-        effects: &StateTreeEffectRegistry<D>,
-        activities: &StateTreeActivityRegistry<D>,
-    ) -> Result<Arc<LinkedDefinition<D>>, Arc<StateTreeLinkError>> {
+        events: &crate::event::StateTreeEventProtocol,
+        effects: &StateTreeEffectRegistry,
+        activities: &StateTreeActivityRegistry,
+    ) -> Result<Arc<LinkedDefinition>, Arc<StateTreeLinkError>> {
         self.definitions.retain(|_, cached| match cached {
             CachedLinkedDefinition::Linked(linked) => linked.strong_count() > 0,
             CachedLinkedDefinition::Failed(error) => error.strong_count() > 0,
@@ -286,15 +269,14 @@ impl<D: StateTreeDomain> LinkedStateTreeDefinitions<D> {
     }
 }
 
-/// A pending state-tree instance whose available definition cannot link to its domain.
+/// A pending state-tree instance whose definition cannot link to the protocol.
 #[derive(Component, Clone, Debug)]
-pub struct StateTreeLinkFailure<D: StateTreeDomain> {
+pub struct StateTreeLinkFailure {
     error: Arc<StateTreeLinkError>,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> StateTreeLinkFailure<D> {
-    /// Returns the cached domain-link error.
+impl StateTreeLinkFailure {
+    /// Returns the cached protocol-link error.
     pub fn error(&self) -> &StateTreeLinkError {
         &self.error
     }
@@ -308,21 +290,19 @@ struct EntityEventEntry<E> {
 }
 
 #[derive(Component)]
-pub(crate) struct StateTreeEventInbox<D: StateTreeDomain> {
-    events: Mutex<Vec<EntityEventEntry<QueuedStateTreeEvent<D>>>>,
-    marker: PhantomData<fn() -> D>,
+pub(crate) struct StateTreeEventInbox {
+    events: Mutex<Vec<EntityEventEntry<QueuedStateTreeEvent>>>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeEventInbox<D> {
+impl Default for StateTreeEventInbox {
     fn default() -> Self {
         Self {
             events: Mutex::new(Vec::new()),
-            marker: PhantomData,
         }
     }
 }
 
-impl<D: StateTreeDomain> StateTreeEventInbox<D> {
+impl StateTreeEventInbox {
     pub(crate) fn release_storage(&mut self) {
         *self
             .events
@@ -332,22 +312,20 @@ impl<D: StateTreeDomain> StateTreeEventInbox<D> {
 }
 
 #[derive(Resource)]
-struct StateTreeEventIngress<D: StateTreeDomain> {
-    broadcasts: Mutex<Vec<QueuedStateTreeEvent<D>>>,
+struct StateTreeEventIngress {
+    broadcasts: Mutex<Vec<QueuedStateTreeEvent>>,
     dirty_entities: Mutex<EntityHashSet>,
     batch: AtomicU64,
     published_broadcasts: AtomicUsize,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeEventIngress<D> {
+impl Default for StateTreeEventIngress {
     fn default() -> Self {
         Self {
             broadcasts: Mutex::new(Vec::new()),
             dirty_entities: Mutex::new(EntityHashSet::default()),
             batch: AtomicU64::new(0),
             published_broadcasts: AtomicUsize::new(0),
-            marker: PhantomData,
         }
     }
 }
@@ -371,28 +349,15 @@ struct EntityTimerUpdate {
     update: TimerUpdate,
 }
 
-#[derive(Resource)]
-pub(crate) struct StateTreeTimers<D: StateTreeDomain> {
+#[derive(Resource, Default)]
+pub(crate) struct StateTreeTimers {
     heap: BinaryHeap<Reverse<ScheduledTimer>>,
     active: HashMap<TimerToken, ActiveTimer>,
     staged: Parallel<Vec<EntityTimerUpdate>>,
     merged: Vec<EntityTimerUpdate>,
-    marker: PhantomData<fn() -> D>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeTimers<D> {
-    fn default() -> Self {
-        Self {
-            heap: BinaryHeap::new(),
-            active: HashMap::new(),
-            staged: Parallel::default(),
-            merged: Vec::new(),
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<D: StateTreeDomain> StateTreeTimers<D> {
+impl StateTreeTimers {
     fn apply(&mut self, entity: Entity, update: TimerUpdate) {
         match update {
             TimerUpdate::Arm { token, deadline } => {
@@ -446,30 +411,17 @@ impl<D: StateTreeDomain> StateTreeTimers<D> {
 /// entity's inbox first; configure an explicit Bevy system order when that
 /// ordering must be deterministic.
 #[derive(SystemParam)]
-pub struct EntityStateTreeEventWriter<'w, 's, D>
-where
-    D: StateTreeDomain,
-{
-    ingress: Res<'w, StateTreeEventIngress<D>>,
-    registry: Res<'w, StateTreeAppEventRegistry<D>>,
-    inboxes: Query<
-        'w,
-        's,
-        (
-            &'static StateTreeInstance<D>,
-            &'static StateTreeEventInbox<D>,
-        ),
-    >,
+pub struct EntityStateTreeEventWriter<'w, 's> {
+    ingress: Res<'w, StateTreeEventIngress>,
+    registry: Res<'w, StateTreeAppEventRegistry>,
+    inboxes: Query<'w, 's, (&'static StateTreeInstance, &'static StateTreeEventInbox)>,
 }
 
-impl<D> EntityStateTreeEventWriter<'_, '_, D>
-where
-    D: StateTreeDomain,
-{
+impl EntityStateTreeEventWriter<'_, '_> {
     /// Queues `event` and returns whether its target has a state-tree instance.
     pub fn write<M>(&mut self, event: M) -> bool
     where
-        M: EntityStateTreeEvent<D>,
+        M: EntityStateTreeEvent,
     {
         let protocol = self.registry.protocol();
         let id = protocol
@@ -528,22 +480,16 @@ where
 /// [`Self::write`] is called. Systems that require same-schedule delivery must
 /// run in [`StateTreeSet::QueueEvents`].
 #[derive(SystemParam)]
-pub struct BroadcastStateTreeEventWriter<'w, D>
-where
-    D: StateTreeDomain,
-{
-    ingress: Res<'w, StateTreeEventIngress<D>>,
-    registry: Res<'w, StateTreeAppEventRegistry<D>>,
+pub struct BroadcastStateTreeEventWriter<'w> {
+    ingress: Res<'w, StateTreeEventIngress>,
+    registry: Res<'w, StateTreeAppEventRegistry>,
 }
 
-impl<D> BroadcastStateTreeEventWriter<'_, D>
-where
-    D: StateTreeDomain,
-{
+impl BroadcastStateTreeEventWriter<'_> {
     /// Queues `event` for broadcast.
     pub fn write<M>(&mut self, event: M)
     where
-        M: BroadcastStateTreeEvent<D>,
+        M: BroadcastStateTreeEvent,
     {
         let mut broadcasts = self
             .ingress
@@ -562,13 +508,13 @@ where
     }
 }
 
-fn reconstruct_changed<D: StateTreeDomain>(
+fn reconstruct_changed(
     mut commands: Commands,
     assets: Res<Assets<StateTreeDefinition>>,
     mut events: MessageReader<AssetEvent<StateTreeDefinition>>,
-    mut removed: RemovedComponents<StateTreeConfiguration<D>>,
-    changed: Query<Entity, (Changed<StateTreeConfiguration<D>>, Allow<Disabled>)>,
-    instances: Query<(Entity, &StateTreeInstance<D>), Allow<Disabled>>,
+    mut removed: RemovedComponents<StateTreeConfiguration>,
+    changed: Query<Entity, (Changed<StateTreeConfiguration>, Allow<Disabled>)>,
+    instances: Query<(Entity, &StateTreeInstance), Allow<Disabled>>,
 ) {
     let definition_changed = events
         .read()
@@ -601,10 +547,10 @@ fn reconstruct_changed<D: StateTreeDomain>(
     }
 }
 
-type RetiringStateTrees<'w, 's, D> =
-    Query<'w, 's, &'static mut StateTreeInstance<D>, (With<PendingStateTree<D>>, Allow<Disabled>)>;
+type RetiringStateTrees<'w, 's> =
+    Query<'w, 's, &'static mut StateTreeInstance, (With<PendingStateTree>, Allow<Disabled>)>;
 
-fn finish_teardown<D: StateTreeDomain>(mut instances: RetiringStateTrees<'_, '_, D>) {
+fn finish_teardown(mut instances: RetiringStateTrees<'_, '_>) {
     for mut instance in &mut instances {
         if instance.teardown_pending() {
             instance.finish_teardown();
@@ -612,38 +558,38 @@ fn finish_teardown<D: StateTreeDomain>(mut instances: RetiringStateTrees<'_, '_,
     }
 }
 
-type PendingStateTrees<'w, 's, D> = Query<
+type PendingStateTrees<'w, 's> = Query<
     'w,
     's,
     (
         Entity,
-        &'static mut StateTreeInstance<D>,
-        Option<&'static StateTreeLinkFailure<D>>,
-        Option<&'static StateTreeConfiguration<D>>,
+        &'static mut StateTreeInstance,
+        Option<&'static StateTreeLinkFailure>,
+        Option<&'static StateTreeConfiguration>,
     ),
-    With<PendingStateTree<D>>,
+    With<PendingStateTree>,
 >;
 
-type StateTreeRegistries<'w, D> = (
-    Res<'w, StateTreeAppEventRegistry<D>>,
-    Res<'w, StateTreeEffectRegistry<D>>,
-    Res<'w, StateTreeActivityRegistry<D>>,
+type StateTreeRegistries<'w> = (
+    Res<'w, StateTreeAppEventRegistry>,
+    Res<'w, StateTreeEffectRegistry>,
+    Res<'w, StateTreeActivityRegistry>,
 );
 
-type StateTreeRuntime<'w, D> = (
+type StateTreeRuntime<'w> = (
     Res<'w, Time>,
-    ResMut<'w, StateTreeTimers<D>>,
-    Res<'w, StateTreeSettings<D>>,
-    Option<Res<'w, crate::StateTreeTraceLog<D>>>,
+    ResMut<'w, StateTreeTimers>,
+    Res<'w, StateTreeSettings>,
+    Option<Res<'w, crate::StateTreeTraceLog>>,
 );
 
-fn initialize_pending<D: StateTreeDomain>(
+fn initialize_pending(
     commands: ParallelCommands,
     definitions: Res<Assets<StateTreeDefinition>>,
-    mut linked_definitions: ResMut<LinkedStateTreeDefinitions<D>>,
-    registries: StateTreeRegistries<'_, D>,
-    runtime: StateTreeRuntime<'_, D>,
-    mut instances: PendingStateTrees<'_, '_, D>,
+    mut linked_definitions: ResMut<LinkedStateTreeDefinitions>,
+    registries: StateTreeRegistries<'_>,
+    runtime: StateTreeRuntime<'_>,
+    mut instances: PendingStateTrees<'_, '_>,
 ) {
     let (time, mut timers, settings, traces) = runtime;
     for (entity, mut instance, previous_failure, configuration) in &mut instances {
@@ -656,7 +602,7 @@ fn initialize_pending<D: StateTreeDomain>(
         let Some(definition) = definitions.get(instance.definition()) else {
             if previous_failure.is_some() {
                 commands.command_scope(|mut commands| {
-                    commands.entity(entity).remove::<StateTreeLinkFailure<D>>();
+                    commands.entity(entity).remove::<StateTreeLinkFailure>();
                 });
             }
             continue;
@@ -671,10 +617,9 @@ fn initialize_pending<D: StateTreeDomain>(
             Err(error) => {
                 if previous_failure.is_none_or(|previous| !Arc::ptr_eq(&previous.error, &error)) {
                     commands.command_scope(|mut commands| {
-                        commands.entity(entity).insert(StateTreeLinkFailure::<D> {
-                            error,
-                            marker: PhantomData,
-                        });
+                        commands
+                            .entity(entity)
+                            .insert(StateTreeLinkFailure { error });
                     });
                 }
                 continue;
@@ -717,15 +662,15 @@ fn initialize_pending<D: StateTreeDomain>(
         commands.command_scope(|mut commands| {
             let mut entity_commands = commands.entity(entity);
             if has_activities {
-                entity_commands.insert_if_new(StateTreeActivityInbox::<D>::default());
+                entity_commands.insert_if_new(StateTreeActivityInbox::default());
             }
-            entity_commands.remove::<(PendingStateTree<D>, StateTreeLinkFailure<D>)>();
+            entity_commands.remove::<(PendingStateTree, StateTreeLinkFailure)>();
         });
     }
 }
 
-fn stage_timer_updates<D: StateTreeDomain>(
-    instance: &mut StateTreeInstance<D>,
+fn stage_timer_updates(
+    instance: &mut StateTreeInstance,
     entity: Entity,
     staged: &Parallel<Vec<EntityTimerUpdate>>,
 ) {
@@ -738,25 +683,25 @@ fn stage_timer_updates<D: StateTreeDomain>(
     });
 }
 
-type StateTrees<'w, 's, D> = Query<
+type StateTrees<'w, 's> = Query<
     'w,
     's,
     (
         Entity,
-        &'static mut StateTreeInstance<D>,
-        &'static StateTreeEventInbox<D>,
+        &'static mut StateTreeInstance,
+        &'static StateTreeEventInbox,
     ),
 >;
 
-type TimedStateTrees<'w, 's, D> = Query<'w, 's, (Entity, &'static mut StateTreeInstance<D>)>;
+type TimedStateTrees<'w, 's> = Query<'w, 's, (Entity, &'static mut StateTreeInstance)>;
 
-fn process_timers<D: StateTreeDomain>(
+fn process_timers(
     commands: ParallelCommands,
     time: Res<Time>,
-    settings: Res<StateTreeSettings<D>>,
-    traces: Option<Res<crate::StateTreeTraceLog<D>>>,
-    mut timers: ResMut<StateTreeTimers<D>>,
-    mut instances: TimedStateTrees<'_, '_, D>,
+    settings: Res<StateTreeSettings>,
+    traces: Option<Res<crate::StateTreeTraceLog>>,
+    mut timers: ResMut<StateTreeTimers>,
+    mut instances: TimedStateTrees<'_, '_>,
 ) {
     let now = time.elapsed();
     timers.compact_if_needed();
@@ -806,7 +751,7 @@ fn process_timers<D: StateTreeDomain>(
             }
             let dense = entities.len().saturating_mul(4) >= instances.iter().len();
             let process_instance =
-                |(entity, mut instance): (Entity, Mut<'_, StateTreeInstance<D>>)| {
+                |(entity, mut instance): (Entity, Mut<'_, StateTreeInstance>)| {
                     let Some(range) = by_entity.get(&entity) else {
                         return;
                     };
@@ -872,18 +817,14 @@ fn process_timers<D: StateTreeDomain>(
     timers.apply_staged();
 }
 
-fn process_activity_outcomes<D: StateTreeDomain>(
+fn process_activity_outcomes(
     commands: ParallelCommands,
-    ingress: Res<StateTreeActivityIngress<D>>,
+    ingress: Res<StateTreeActivityIngress>,
     time: Res<Time>,
-    mut timers: ResMut<StateTreeTimers<D>>,
-    settings: Res<StateTreeSettings<D>>,
-    traces: Option<Res<crate::StateTreeTraceLog<D>>>,
-    mut instances: Query<(
-        Entity,
-        &mut StateTreeInstance<D>,
-        &StateTreeActivityInbox<D>,
-    )>,
+    mut timers: ResMut<StateTreeTimers>,
+    settings: Res<StateTreeSettings>,
+    traces: Option<Res<crate::StateTreeTraceLog>>,
+    mut instances: Query<(Entity, &mut StateTreeInstance, &StateTreeActivityInbox)>,
 ) {
     if !ingress
         .dirty_hint
@@ -906,8 +847,8 @@ fn process_activity_outcomes<D: StateTreeDomain>(
         let staged = &timers.staged;
         let process = |(entity, mut instance, inbox): (
             Entity,
-            Mut<'_, StateTreeInstance<D>>,
-            &StateTreeActivityInbox<D>,
+            Mut<'_, StateTreeInstance>,
+            &StateTreeActivityInbox,
         )| {
             let mut changed = false;
             instance.bypass_change_detection().set_time(now);
@@ -969,12 +910,12 @@ fn process_activity_outcomes<D: StateTreeDomain>(
     timers.apply_staged();
 }
 
-fn process_events<D: StateTreeDomain>(
+fn process_events(
     commands: ParallelCommands,
-    mut ingress: ResMut<StateTreeEventIngress<D>>,
-    registry: Res<StateTreeAppEventRegistry<D>>,
-    runtime: StateTreeRuntime<'_, D>,
-    mut instances: StateTrees<'_, '_, D>,
+    mut ingress: ResMut<StateTreeEventIngress>,
+    registry: Res<StateTreeAppEventRegistry>,
+    runtime: StateTreeRuntime<'_>,
+    mut instances: StateTrees<'_, '_>,
 ) {
     let (time, mut timers, settings, traces) = runtime;
     let protocol = registry.protocol();
@@ -997,8 +938,8 @@ fn process_events<D: StateTreeDomain>(
         let staged = &timers.staged;
         let process_instance = |(entity, mut instance, inbox): (
             Entity,
-            Mut<'_, StateTreeInstance<D>>,
-            &StateTreeEventInbox<D>,
+            Mut<'_, StateTreeInstance>,
+            &StateTreeEventInbox,
         )| {
             instance.bypass_change_detection().set_time(now);
             let mut entity_events = inbox
@@ -1085,13 +1026,13 @@ fn process_events<D: StateTreeDomain>(
     timers.apply_staged();
 }
 
-fn process_external_event<D: StateTreeDomain>(
-    instance: &mut Mut<'_, StateTreeInstance<D>>,
-    event: StateTreeEventRef<'_, D>,
+fn process_external_event(
+    instance: &mut Mut<'_, StateTreeInstance>,
+    event: StateTreeEventRef<'_>,
     microstep_limit: usize,
     entity: Entity,
     commands: &ParallelCommands<'_, '_>,
-    traces: Option<&crate::StateTreeTraceLog<D>>,
+    traces: Option<&crate::StateTreeTraceLog>,
 ) {
     let changed = if let Some(traces) = traces {
         traces.record(entity, |trace| {
@@ -1137,40 +1078,19 @@ mod tests {
         StateTreeActivityOutcomeWriter, StateTreeBuilder, StateTreeEvent, StateTreeTransition,
     };
 
-    struct Simulation;
-
-    struct SecondarySimulation;
-
-    impl StateTreeDomain for Simulation {
-        const AUTHORED_NAME: &'static str = "test";
-
-        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
-            config
-                .event::<Advance>()
-                .event::<Reset>()
-                .event::<ResetAll>()
-                .event::<AdvanceAll>()
-                .activity::<FindPath, _>("find_path", |_context, _arguments| Ok(FindPath))
-                .effect::<EffectPublished, _>("publish", |context, arguments| {
-                    Ok(EffectPublished {
-                        entity: context.entity(),
-                        amount: arguments.take("amount")?,
-                    })
-                });
-        }
-    }
-
-    impl StateTreeDomain for SecondarySimulation {
-        const AUTHORED_NAME: &'static str = "secondary-simulation";
-
-        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
-            config
-                .event::<SecondaryAdvance>()
-                .event::<SecondaryReset>()
-                .event::<SecondaryResetAll>()
-                .event::<SecondaryAdvanceAll>()
-                .activity::<FindPath, _>("find_path", |_context, _arguments| Ok(FindPath));
-        }
+    fn configure_simulation(config: &mut crate::StateTreeConfig<'_>) {
+        config
+            .event::<Advance>()
+            .event::<Reset>()
+            .event::<ResetAll>()
+            .event::<AdvanceAll>()
+            .activity::<FindPath, _>("find_path", |_context, _arguments| Ok(FindPath))
+            .effect::<EffectPublished, _>("publish", |context, arguments| {
+                Ok(EffectPublished {
+                    entity: context.entity(),
+                    amount: arguments.take("amount")?,
+                })
+            });
     }
 
     struct FindPath;
@@ -1199,17 +1119,12 @@ mod tests {
 
     #[derive(Resource, Default)]
     struct ActivityMessages {
-        started: Vec<crate::StateTreeActivityToken<Simulation, FindPath>>,
-        cancelled: Vec<crate::StateTreeActivityToken<Simulation, FindPath>>,
-    }
-
-    #[derive(Resource, Default)]
-    struct SecondaryActivityMessages {
-        started: Vec<crate::StateTreeActivityToken<SecondarySimulation, FindPath>>,
+        started: Vec<crate::StateTreeActivityToken<FindPath>>,
+        cancelled: Vec<crate::StateTreeActivityToken<FindPath>>,
     }
 
     fn collect_activities(
-        mut messages: MessageReader<StateTreeActivityLifecycle<Simulation, FindPath>>,
+        mut messages: MessageReader<StateTreeActivityLifecycle<FindPath>>,
         mut recorded: ResMut<ActivityMessages>,
     ) {
         for message in messages.read() {
@@ -1221,40 +1136,22 @@ mod tests {
     }
 
     fn finish_path(
-        In(token): In<crate::StateTreeActivityToken<Simulation, FindPath>>,
-        mut writer: StateTreeActivityOutcomeWriter<Simulation, FindPath>,
-    ) -> bool {
-        writer.complete(token, 7)
-    }
-
-    fn collect_secondary_activities(
-        mut messages: MessageReader<StateTreeActivityLifecycle<SecondarySimulation, FindPath>>,
-        mut recorded: ResMut<SecondaryActivityMessages>,
-    ) {
-        for message in messages.read() {
-            if let StateTreeActivityLifecycle::Started { token, .. } = message {
-                recorded.started.push(*token);
-            }
-        }
-    }
-
-    fn finish_secondary_path(
-        In(token): In<crate::StateTreeActivityToken<SecondarySimulation, FindPath>>,
-        mut writer: StateTreeActivityOutcomeWriter<SecondarySimulation, FindPath>,
+        In(token): In<crate::StateTreeActivityToken<FindPath>>,
+        mut writer: StateTreeActivityOutcomeWriter<FindPath>,
     ) -> bool {
         writer.complete(token, 7)
     }
 
     fn fail_path(
-        In(token): In<crate::StateTreeActivityToken<Simulation, FindPath>>,
-        mut writer: StateTreeActivityOutcomeWriter<Simulation, FindPath>,
+        In(token): In<crate::StateTreeActivityToken<FindPath>>,
+        mut writer: StateTreeActivityOutcomeWriter<FindPath>,
     ) -> bool {
         writer.fail(token, "blocked".to_owned())
     }
 
     fn break_path_projection(
-        In(token): In<crate::StateTreeActivityToken<Simulation, FindPath>>,
-        mut writer: StateTreeActivityOutcomeWriter<Simulation, FindPath>,
+        In(token): In<crate::StateTreeActivityToken<FindPath>>,
+        mut writer: StateTreeActivityOutcomeWriter<FindPath>,
     ) -> bool {
         writer.complete(token, -1)
     }
@@ -1367,53 +1264,33 @@ mod tests {
     }
 
     #[derive(EntityEvent, crate::StateTreeEvent)]
-    #[state_tree(domain = Simulation, name = "advance", data = project_advance)]
+    #[state_tree(name = "advance", data = project_advance)]
     struct Advance {
         entity: Entity,
         steps: u32,
     }
 
     #[derive(EntityEvent, crate::StateTreeEvent)]
-    #[state_tree(domain = Simulation, name = "unregistered")]
+    #[state_tree(name = "unregistered")]
     struct Unregistered {
         entity: Entity,
     }
 
     #[derive(EntityEvent, crate::StateTreeEvent)]
-    #[state_tree(domain = Simulation, name = "reset")]
+    #[state_tree(name = "reset")]
     struct Reset {
         entity: Entity,
     }
 
     #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = Simulation, name = "reset.all", broadcast)]
+    #[state_tree(name = "reset.all", broadcast)]
     struct ResetAll {
         reason: u32,
     }
 
     #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = Simulation, name = "advance.all", broadcast)]
+    #[state_tree(name = "advance.all", broadcast)]
     struct AdvanceAll;
-
-    #[derive(EntityEvent, crate::StateTreeEvent)]
-    #[state_tree(domain = SecondarySimulation, name = "advance")]
-    struct SecondaryAdvance {
-        entity: Entity,
-    }
-
-    #[derive(EntityEvent, crate::StateTreeEvent)]
-    #[state_tree(domain = SecondarySimulation, name = "reset")]
-    struct SecondaryReset {
-        entity: Entity,
-    }
-
-    #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = SecondarySimulation, name = "reset.all", broadcast)]
-    struct SecondaryResetAll;
-
-    #[derive(Event, crate::StateTreeEvent)]
-    #[state_tree(domain = SecondarySimulation, name = "advance.all", broadcast)]
-    struct SecondaryAdvanceAll;
 
     fn project_advance(
         event: &Advance,
@@ -1505,7 +1382,7 @@ mod tests {
                 use_asset_processor_override: Some(false),
                 ..Default::default()
             },
-            StateTreePlugin::<Simulation>::new(Update),
+            StateTreePlugin::new(Update).configure(configure_simulation),
         ));
         app
     }
@@ -1519,37 +1396,6 @@ mod tests {
         app
     }
 
-    fn multi_domain_activity_app(reverse_plugin_order: bool) -> App {
-        let mut app = App::new();
-        app.add_plugins((
-            TaskPoolPlugin::default(),
-            TimePlugin,
-            AssetPlugin {
-                file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets").into(),
-                watch_for_changes_override: Some(false),
-                use_asset_processor_override: Some(false),
-                ..Default::default()
-            },
-        ));
-        if reverse_plugin_order {
-            app.add_plugins(StateTreePlugin::<SecondarySimulation>::new(Update));
-            app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
-        } else {
-            app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
-            app.add_plugins(StateTreePlugin::<SecondarySimulation>::new(Update));
-        }
-        app.init_resource::<ActivityMessages>()
-            .init_resource::<SecondaryActivityMessages>()
-            .add_systems(
-                Update,
-                (
-                    collect_activities.in_set(StateTreeSet::HandleActivities),
-                    collect_secondary_activities.in_set(StateTreeSet::HandleActivities),
-                ),
-            );
-        app
-    }
-
     #[test]
     fn typed_activities_start_complete_and_ignore_duplicate_outcomes() {
         let mut app = activity_app();
@@ -1557,10 +1403,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(activity_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         let token = app.world().resource::<ActivityMessages>().started[0];
         assert_eq!(token.entity(), entity);
@@ -1586,66 +1429,13 @@ mod tests {
     }
 
     #[test]
-    fn activity_outcomes_are_isolated_between_domains_on_one_entity() {
-        for reverse_plugin_order in [false, true] {
-            let mut app = multi_domain_activity_app(reverse_plugin_order);
-            let handle = app
-                .world_mut()
-                .resource_mut::<Assets<StateTreeDefinition>>()
-                .add(activity_definition());
-            let entity = app
-                .world_mut()
-                .spawn((
-                    StateTreeInstance::<Simulation>::new(handle.clone()),
-                    StateTreeInstance::<SecondarySimulation>::new(handle),
-                ))
-                .id();
-            app.update();
-
-            let simulation_token = app.world().resource::<ActivityMessages>().started[0];
-            let secondary_token = app.world().resource::<SecondaryActivityMessages>().started[0];
-            assert!(
-                app.world_mut()
-                    .run_system_once_with(finish_path, simulation_token)
-                    .unwrap()
-            );
-            assert!(
-                app.world_mut()
-                    .run_system_once_with(finish_secondary_path, secondary_token)
-                    .unwrap()
-            );
-
-            app.update();
-            assert_eq!(
-                app.world()
-                    .get::<StateTreeInstance<Simulation>>(entity)
-                    .unwrap()
-                    .active_state_names()
-                    .last(),
-                Some("done")
-            );
-            assert_eq!(
-                app.world()
-                    .get::<StateTreeInstance<SecondarySimulation>>(entity)
-                    .unwrap()
-                    .active_state_names()
-                    .last(),
-                Some("done")
-            );
-        }
-    }
-
-    #[test]
     fn activity_outcome_applies_timer_cancellations_and_arms_from_current_time() {
         let mut app = activity_app();
         let handle = app
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(timed_activity_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         advance_clock(&mut app, Duration::from_secs(5));
         let token = app.world().resource::<ActivityMessages>().started[0];
@@ -1657,13 +1447,7 @@ mod tests {
         app.update();
 
         assert_eq!(active_leaf(&app, entity), "timed");
-        assert_eq!(
-            app.world()
-                .resource::<StateTreeTimers<Simulation>>()
-                .active
-                .len(),
-            1
-        );
+        assert_eq!(app.world().resource::<StateTreeTimers>().active.len(), 1);
         advance_clock(&mut app, Duration::from_millis(999));
         assert_eq!(active_leaf(&app, entity), "timed");
         advance_clock(&mut app, Duration::from_millis(1));
@@ -1677,10 +1461,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(activity_precedence_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         let token = app.world().resource::<ActivityMessages>().started[0];
         assert!(
@@ -1700,10 +1481,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(failing_activity_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         let token = app.world().resource::<ActivityMessages>().started[0];
         assert!(
@@ -1724,12 +1502,9 @@ mod tests {
             .add(activity_definition());
         let faulted = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
-        let running = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let running = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         let token = app
             .world()
@@ -1747,14 +1522,14 @@ mod tests {
         app.update();
         assert!(matches!(
             app.world()
-                .get::<StateTreeInstance<Simulation>>(faulted)
+                .get::<StateTreeInstance>(faulted)
                 .unwrap()
                 .status(),
             InstanceStatus::Faulted(crate::RuntimeFault::ActivityDataProjection { .. })
         ));
         assert_eq!(
             app.world()
-                .get::<StateTreeInstance<Simulation>>(running)
+                .get::<StateTreeInstance>(running)
                 .unwrap()
                 .status(),
             &InstanceStatus::Running
@@ -1770,13 +1545,13 @@ mod tests {
             .add(activity_definition());
         let entity = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
         app.update();
         let token = app.world().resource::<ActivityMessages>().started[0];
         app.world_mut()
             .entity_mut(entity)
-            .remove::<StateTreeInstance<Simulation>>();
+            .remove::<StateTreeInstance>();
         app.update();
         assert_eq!(
             app.world().resource::<ActivityMessages>().cancelled,
@@ -1784,7 +1559,7 @@ mod tests {
         );
         app.world_mut()
             .entity_mut(entity)
-            .insert(StateTreeInstance::<Simulation>::new(handle));
+            .insert(StateTreeInstance::new(handle));
         app.update();
         let replacement = *app
             .world()
@@ -1809,17 +1584,14 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(activity_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         let token = app.world().resource::<ActivityMessages>().started[0];
 
         let instance = app
             .world_mut()
             .entity_mut(entity)
-            .take::<StateTreeInstance<Simulation>>()
+            .take::<StateTreeInstance>()
             .unwrap();
         app.world_mut().entity_mut(entity).insert(instance);
 
@@ -1840,10 +1612,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(activity_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         let token = app.world().resource::<ActivityMessages>().started[0];
         assert!(
@@ -1855,11 +1624,11 @@ mod tests {
         let instance = app
             .world_mut()
             .entity_mut(entity)
-            .take::<StateTreeInstance<Simulation>>()
+            .take::<StateTreeInstance>()
             .unwrap();
         assert!(
             app.world()
-                .get::<StateTreeActivityInbox<Simulation>>(entity)
+                .get::<StateTreeActivityInbox>(entity)
                 .unwrap()
                 .outcomes
                 .lock()
@@ -1868,7 +1637,7 @@ mod tests {
         );
         assert!(
             !app.world()
-                .resource::<StateTreeActivityIngress<Simulation>>()
+                .resource::<StateTreeActivityIngress>()
                 .dirty
                 .lock()
                 .unwrap()
@@ -1881,67 +1650,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "StateTreeDomain::AUTHORED_NAME cannot be empty")]
-    fn domain_authored_name_cannot_be_empty() {
-        struct EmptyName;
-
-        impl StateTreeDomain for EmptyName {
-            const AUTHORED_NAME: &'static str = "";
-
-            fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
-        }
-
+    fn configuration_is_used_to_validate_activities() {
+        fn configure_missing_activity(_config: &mut crate::StateTreeConfig<'_>) {}
         let mut app = App::new();
         app.add_plugins((
             TimePlugin,
             AssetPlugin::default(),
-            StateTreePlugin::<EmptyName>::new(Update),
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "state-tree domain `test` was registered more than once")]
-    fn domain_authored_names_must_be_unique() {
-        struct DuplicateName;
-
-        impl StateTreeDomain for DuplicateName {
-            const AUTHORED_NAME: &'static str = "test";
-
-            fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
-        }
-
-        let mut app = App::new();
-        app.add_plugins((TimePlugin, AssetPlugin::default()));
-        app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
-        app.add_plugins(StateTreePlugin::<DuplicateName>::new(Update));
-    }
-
-    #[test]
-    fn domain_configuration_is_used_to_validate_activities() {
-        struct MissingActivity;
-        impl StateTreeDomain for MissingActivity {
-            const AUTHORED_NAME: &'static str = "missing-activity";
-
-            fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
-        }
-        let mut app = App::new();
-        app.add_plugins((
-            TimePlugin,
-            AssetPlugin::default(),
-            StateTreePlugin::<MissingActivity>::new(Update),
+            StateTreePlugin::new(Update).configure(configure_missing_activity),
         ));
         let handle = app
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(activity_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<MissingActivity>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         assert!(matches!(
             app.world()
-                .get::<StateTreeLinkFailure<MissingActivity>>(entity)
+                .get::<StateTreeLinkFailure>(entity)
                 .unwrap()
                 .error()
                 .issues()[0],
@@ -1966,10 +1691,7 @@ mod tests {
         app.init_resource::<PublishedEffects>()
             .add_systems(Update, collect_effects.in_set(StateTreeSet::HandleEffects));
         let handle = app.world().resource::<AssetServer>().load("effect.scxml");
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
 
         update_until(&mut app, "the entry effect", |app| {
             !app.world().resource::<PublishedEffects>().0.is_empty()
@@ -1995,22 +1717,19 @@ mod tests {
             .add(builder.build().unwrap());
         let entity = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
 
         app.update();
 
         let entity_ref = app.world().entity(entity);
         assert_eq!(
-            entity_ref
-                .get::<StateTreeInstance<Simulation>>()
-                .unwrap()
-                .status(),
+            entity_ref.get::<StateTreeInstance>().unwrap().status(),
             &InstanceStatus::Pending
         );
         assert!(matches!(
             &entity_ref
-                .get::<StateTreeLinkFailure<Simulation>>()
+                .get::<StateTreeLinkFailure>()
                 .unwrap()
                 .error()
                 .issues()[0],
@@ -2026,27 +1745,15 @@ mod tests {
 
         let entity_ref = app.world().entity(entity);
         assert_eq!(
-            entity_ref
-                .get::<StateTreeInstance<Simulation>>()
-                .unwrap()
-                .status(),
+            entity_ref.get::<StateTreeInstance>().unwrap().status(),
             &InstanceStatus::Running
         );
-        assert!(
-            entity_ref
-                .get::<StateTreeLinkFailure<Simulation>>()
-                .is_none()
-        );
+        assert!(entity_ref.get::<StateTreeLinkFailure>().is_none());
     }
 
     #[test]
-    fn domain_configuration_is_used_to_validate_effects() {
-        struct MissingEffect;
-        impl StateTreeDomain for MissingEffect {
-            const AUTHORED_NAME: &'static str = "test";
-
-            fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
-        }
+    fn configuration_is_used_to_validate_effects() {
+        fn configure_missing_effect(_config: &mut crate::StateTreeConfig<'_>) {}
         let mut app = App::new();
         app.add_plugins((
             TimePlugin,
@@ -2056,24 +1763,19 @@ mod tests {
                 use_asset_processor_override: Some(false),
                 ..Default::default()
             },
-            StateTreePlugin::<MissingEffect>::new(Update),
+            StateTreePlugin::new(Update).configure(configure_missing_effect),
         ));
         let handle = app.world().resource::<AssetServer>().load("effect.scxml");
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<MissingEffect>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
 
         update_until(&mut app, "the effect link failure", |app| {
-            app.world()
-                .get::<StateTreeLinkFailure<MissingEffect>>(entity)
-                .is_some()
+            app.world().get::<StateTreeLinkFailure>(entity).is_some()
         });
 
         assert!(matches!(
             &app.world()
                 .entity(entity)
-                .get::<StateTreeLinkFailure<MissingEffect>>()
+                .get::<StateTreeLinkFailure>()
                 .unwrap()
                 .error()
                 .issues()[0],
@@ -2092,7 +1794,7 @@ mod tests {
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition());
 
-        app.add_plugins(StateTreePlugin::<Simulation>::new(Update));
+        app.add_plugins(StateTreePlugin::new(Update).configure(configure_simulation));
         assert!(
             app.world()
                 .resource::<Assets<StateTreeDefinition>>()
@@ -2115,30 +1817,24 @@ mod tests {
         );
     }
 
-    fn write_advance(
-        In(event): In<Advance>,
-        mut writer: EntityStateTreeEventWriter<Simulation>,
-    ) -> bool {
+    fn write_advance(In(event): In<Advance>, mut writer: EntityStateTreeEventWriter) -> bool {
         writer.write(event)
     }
 
-    fn write_reset(
-        In(event): In<Reset>,
-        mut writer: EntityStateTreeEventWriter<Simulation>,
-    ) -> bool {
+    fn write_reset(In(event): In<Reset>, mut writer: EntityStateTreeEventWriter) -> bool {
         writer.write(event)
     }
 
-    fn write_reset_all(mut writer: BroadcastStateTreeEventWriter<Simulation>) {
+    fn write_reset_all(mut writer: BroadcastStateTreeEventWriter) {
         writer.write(ResetAll { reason: 42 });
     }
 
-    fn write_advance_all(mut writer: BroadcastStateTreeEventWriter<Simulation>) {
+    fn write_advance_all(mut writer: BroadcastStateTreeEventWriter) {
         writer.write(AdvanceAll);
     }
 
     fn record_changed_instances(
-        instances: Query<(), Changed<StateTreeInstance<Simulation>>>,
+        instances: Query<(), Changed<StateTreeInstance>>,
         mut changed: ResMut<ChangedInstances>,
     ) {
         changed.0 = instances.iter().count();
@@ -2170,7 +1866,7 @@ mod tests {
 
     fn active_leaf(app: &App, entity: Entity) -> String {
         app.world()
-            .get::<StateTreeInstance<Simulation>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .active_state_names()
             .last()
@@ -2190,10 +1886,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(timeout_definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         advance_clock(&mut app, Duration::from_millis(999));
@@ -2227,10 +1920,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(builder.build().unwrap());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         app.world_mut()
@@ -2251,57 +1941,36 @@ mod tests {
             .add(timeout_definition());
         let removed = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
         let replaced = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
         app.update();
-        assert_eq!(
-            app.world()
-                .resource::<StateTreeTimers<Simulation>>()
-                .active
-                .len(),
-            2
-        );
+        assert_eq!(app.world().resource::<StateTreeTimers>().active.len(), 2);
 
         app.world_mut()
             .entity_mut(removed)
-            .remove::<StateTreeInstance<Simulation>>();
-        assert_eq!(
-            app.world()
-                .resource::<StateTreeTimers<Simulation>>()
-                .active
-                .len(),
-            1
-        );
+            .remove::<StateTreeInstance>();
+        assert_eq!(app.world().resource::<StateTreeTimers>().active.len(), 1);
         app.world_mut()
             .resource_mut::<Time>()
             .advance_by(Duration::from_millis(500));
         app.world_mut()
             .entity_mut(replaced)
-            .insert(StateTreeInstance::<Simulation>::new(handle));
+            .insert(StateTreeInstance::new(handle));
         app.world_mut().run_schedule(Update);
 
         advance_clock(&mut app, Duration::from_millis(500));
 
-        assert!(
-            app.world()
-                .get::<StateTreeInstance<Simulation>>(removed)
-                .is_none()
-        );
+        assert!(app.world().get::<StateTreeInstance>(removed).is_none());
         assert_eq!(active_leaf(&app, replaced), "waiting");
 
         advance_clock(&mut app, Duration::from_millis(500));
 
         assert_eq!(active_leaf(&app, replaced), "elapsed");
-        assert!(
-            app.world()
-                .resource::<StateTreeTimers<Simulation>>()
-                .active
-                .is_empty()
-        );
+        assert!(app.world().resource::<StateTreeTimers>().active.is_empty());
     }
 
     #[test]
@@ -2313,12 +1982,9 @@ mod tests {
             .add(definition());
         let first = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
-        let second = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let second = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         queue_advance(&mut app, first);
@@ -2334,7 +2000,7 @@ mod tests {
         let mut app = app();
 
         app.world_mut()
-            .run_system_once(|mut events: EntityStateTreeEventWriter<Simulation>| {
+            .run_system_once(|mut events: EntityStateTreeEventWriter| {
                 events.write(Unregistered {
                     entity: Entity::PLACEHOLDER,
                 });
@@ -2349,10 +2015,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         assert!(
@@ -2361,10 +2024,7 @@ mod tests {
                 .unwrap()
         );
 
-        let inbox = app
-            .world()
-            .get::<StateTreeEventInbox<Simulation>>(entity)
-            .unwrap();
+        let inbox = app.world().get::<StateTreeEventInbox>(entity).unwrap();
         let events = inbox.events.lock().unwrap();
         let payload = events[0].event.project::<Advance>().unwrap();
         assert_eq!(payload.steps, 7);
@@ -2379,12 +2039,9 @@ mod tests {
             .add(definition());
         let first = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
-        let second = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let second = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
         queue_advance(&mut app, first);
         queue_advance(&mut app, second);
@@ -2402,7 +2059,7 @@ mod tests {
     #[test]
     fn broadcasts_skip_definitions_that_do_not_accept_the_event() {
         let mut app = app();
-        app.add_plugins(crate::StateTreeTracePlugin::<Simulation>::default());
+        app.add_plugins(crate::StateTreeTracePlugin);
         let (interested_handle, uninterested_handle) = {
             let mut definitions = app
                 .world_mut()
@@ -2414,11 +2071,11 @@ mod tests {
         };
         let interested = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(interested_handle))
+            .spawn(StateTreeInstance::new(interested_handle))
             .id();
         let uninterested = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(uninterested_handle))
+            .spawn(StateTreeInstance::new(uninterested_handle))
             .id();
         app.update();
 
@@ -2427,9 +2084,7 @@ mod tests {
 
         assert_eq!(active_leaf(&app, interested), "active");
         assert_eq!(active_leaf(&app, uninterested), "idle");
-        let traces = app
-            .world()
-            .resource::<crate::StateTreeTraceLog<Simulation>>();
+        let traces = app.world().resource::<crate::StateTreeTraceLog>();
         assert!(
             traces
                 .get(interested)
@@ -2452,7 +2107,7 @@ mod tests {
 
         queue_reset_all(&mut app);
 
-        let ingress = app.world().resource::<StateTreeEventIngress<Simulation>>();
+        let ingress = app.world().resource::<StateTreeEventIngress>();
         let broadcasts = ingress.broadcasts.lock().unwrap();
         let payload = broadcasts[0].project::<ResetAll>().unwrap();
         assert_eq!(payload.reason, 42);
@@ -2465,10 +2120,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         queue_advance(&mut app, entity);
@@ -2493,10 +2145,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         queue_reset(&mut app, entity);
@@ -2517,12 +2166,9 @@ mod tests {
             .add(definition());
         let first = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
-        let second = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let second = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         queue_advance(&mut app, first);
@@ -2549,12 +2195,9 @@ mod tests {
             .add(definition());
         let first = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
-        let second = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let second = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
 
         queue_advance(&mut app, first);
         queue_advance_all(&mut app);
@@ -2573,7 +2216,7 @@ mod tests {
             .reserve_handle();
         let entity = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
 
         queue_advance(&mut app, entity);
@@ -2581,7 +2224,7 @@ mod tests {
         app.update();
         assert_eq!(
             app.world()
-                .get::<StateTreeInstance<Simulation>>(entity)
+                .get::<StateTreeInstance>(entity)
                 .unwrap()
                 .status(),
             &InstanceStatus::Pending
@@ -2605,14 +2248,14 @@ mod tests {
             .add(definition());
         let entity = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
         app.update();
 
         queue_advance(&mut app, entity);
         assert!(
             app.world()
-                .get::<StateTreeEventInbox<Simulation>>(entity)
+                .get::<StateTreeEventInbox>(entity)
                 .unwrap()
                 .events
                 .lock()
@@ -2622,10 +2265,10 @@ mod tests {
         );
         app.world_mut()
             .entity_mut(entity)
-            .remove::<StateTreeInstance<Simulation>>();
+            .remove::<StateTreeInstance>();
         assert_eq!(
             app.world()
-                .get::<StateTreeEventInbox<Simulation>>(entity)
+                .get::<StateTreeEventInbox>(entity)
                 .unwrap()
                 .events
                 .lock()
@@ -2635,7 +2278,7 @@ mod tests {
         );
         app.world_mut()
             .entity_mut(entity)
-            .insert(StateTreeInstance::<Simulation>::new(handle));
+            .insert(StateTreeInstance::new(handle));
         app.update();
 
         assert_eq!(active_leaf(&app, entity), "idle");
@@ -2644,50 +2287,48 @@ mod tests {
     #[test]
     fn removing_or_replacing_an_instance_cleans_its_trace_log() {
         let mut app = app();
-        app.add_plugins(crate::StateTreeTracePlugin::<Simulation>::default());
+        app.add_plugins(crate::StateTreeTracePlugin);
         let handle = app
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition());
         let removed = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
         let replaced = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle.clone()))
+            .spawn(StateTreeInstance::new(handle.clone()))
             .id();
         app.update();
 
-        let traces = app
-            .world()
-            .resource::<crate::StateTreeTraceLog<Simulation>>();
+        let traces = app.world().resource::<crate::StateTreeTraceLog>();
         assert!(traces.get(removed).is_some());
         assert!(traces.get(replaced).is_some());
 
         app.world_mut()
             .entity_mut(removed)
-            .remove::<StateTreeInstance<Simulation>>();
+            .remove::<StateTreeInstance>();
         assert!(
             app.world()
-                .resource::<crate::StateTreeTraceLog<Simulation>>()
+                .resource::<crate::StateTreeTraceLog>()
                 .get(removed)
                 .is_none()
         );
 
         app.world_mut()
             .entity_mut(replaced)
-            .insert(StateTreeInstance::<Simulation>::new(handle));
+            .insert(StateTreeInstance::new(handle));
         assert!(
             app.world()
-                .resource::<crate::StateTreeTraceLog<Simulation>>()
+                .resource::<crate::StateTreeTraceLog>()
                 .get(replaced)
                 .is_none()
         );
         app.update();
         let replacement_log = app
             .world()
-            .resource::<crate::StateTreeTraceLog<Simulation>>()
+            .resource::<crate::StateTreeTraceLog>()
             .get(replaced)
             .unwrap();
         assert_eq!(
@@ -2706,10 +2347,7 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StateTreeDefinition>>()
             .add(definition());
-        let entity = app
-            .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(handle))
-            .id();
+        let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
         app.update();
 
         queue_reset_all(&mut app);
@@ -2717,7 +2355,7 @@ mod tests {
         let instance = app
             .world_mut()
             .entity_mut(entity)
-            .take::<StateTreeInstance<Simulation>>()
+            .take::<StateTreeInstance>()
             .unwrap();
         app.update();
 
@@ -2738,7 +2376,7 @@ mod tests {
             .add(definition());
         let ready = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(ready_handle))
+            .spawn(StateTreeInstance::new(ready_handle))
             .id();
         let pending_handle = app
             .world()
@@ -2746,21 +2384,21 @@ mod tests {
             .reserve_handle();
         let pending = app
             .world_mut()
-            .spawn(StateTreeInstance::<Simulation>::new(pending_handle))
+            .spawn(StateTreeInstance::new(pending_handle))
             .id();
 
         app.update();
 
         assert_eq!(
             app.world()
-                .get::<StateTreeInstance<Simulation>>(ready)
+                .get::<StateTreeInstance>(ready)
                 .unwrap()
                 .status(),
             &InstanceStatus::Running
         );
         assert_eq!(
             app.world()
-                .get::<StateTreeInstance<Simulation>>(pending)
+                .get::<StateTreeInstance>(pending)
                 .unwrap()
                 .status(),
             &InstanceStatus::Pending

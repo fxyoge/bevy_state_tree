@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    marker::PhantomData,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -22,9 +21,8 @@ use crate::definition::{
 };
 use crate::effect::{RuntimeEffectSink, StateTreeEffectArgs, StateTreeEffectContext};
 use crate::{
-    LuauValue, NoStateTreeTrace, StateTreeActivityArgs, StateTreeDefinition, StateTreeDomain,
-    StateTreeEventRef, StateTreeHistoryResolution, StateTreeTrace, StateTreeTraceRecord,
-    StateTreeTraceTrigger, luau,
+    LuauValue, NoStateTreeTrace, StateTreeActivityArgs, StateTreeDefinition, StateTreeEventRef,
+    StateTreeHistoryResolution, StateTreeTrace, StateTreeTraceRecord, StateTreeTraceTrigger, luau,
     plugin::{StateTreeEventInbox, StateTreeTimers},
 };
 
@@ -33,28 +31,25 @@ static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// Read-only, nonpersistent expression input exposed as `config`.
 /// Hosts rebuild this component from current assets before initializing a tree.
 #[derive(Component)]
-pub struct StateTreeConfiguration<D: StateTreeDomain> {
+pub struct StateTreeConfiguration {
     pub(crate) values: Arc<LuauValue>,
-    marker: PhantomData<fn() -> D>,
 }
-impl<D: StateTreeDomain> Clone for StateTreeConfiguration<D> {
+impl Clone for StateTreeConfiguration {
     fn clone(&self) -> Self {
         Self {
             values: self.values.clone(),
-            marker: PhantomData,
         }
     }
 }
-impl<D: StateTreeDomain> PartialEq for StateTreeConfiguration<D> {
+impl PartialEq for StateTreeConfiguration {
     fn eq(&self, other: &Self) -> bool {
         self.values == other.values
     }
 }
-impl<D: StateTreeDomain> StateTreeConfiguration<D> {
+impl StateTreeConfiguration {
     pub fn new(values: impl IntoIterator<Item = (String, LuauValue)>) -> Self {
         Self {
             values: Arc::new(LuauValue::Record(values.into_iter().collect())),
-            marker: PhantomData,
         }
     }
 }
@@ -94,14 +89,14 @@ pub enum StateTreeDataOverrideError {
     DuplicateName { name: Box<str> },
 }
 
-enum Trigger<'a, D: StateTreeDomain> {
+enum Trigger<'a> {
     Eventless(
         Option<&'a str>,
-        Option<StateTreeEventRef<'a, D>>,
+        Option<StateTreeEventRef<'a>>,
         Option<&'a LuauValue>,
     ),
     Internal(EventId, Option<&'a LuauValue>),
-    External(&'a EventSet, StateTreeEventRef<'a, D>),
+    External(&'a EventSet, StateTreeEventRef<'a>),
     After(&'a [TimerToken]),
 }
 
@@ -183,22 +178,22 @@ struct HistoryRuntime {
     alternate: Vec<Entry>,
 }
 
-struct ActionContext<'a, D: StateTreeDomain> {
+struct ActionContext<'a> {
     event_name: Option<&'a str>,
-    external_event: Option<StateTreeEventRef<'a, D>>,
+    external_event: Option<StateTreeEventRef<'a>>,
     event_data: Option<&'a LuauValue>,
     entity: Entity,
 }
 
-impl<D: StateTreeDomain> Clone for ActionContext<'_, D> {
+impl Clone for ActionContext<'_> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<D: StateTreeDomain> Copy for ActionContext<'_, D> {}
+impl Copy for ActionContext<'_> {}
 
-impl<'a, D: StateTreeDomain> Trigger<'a, D> {
+impl<'a> Trigger<'a> {
     fn event_name(&self, compiled: &'a CompiledDefinition) -> Option<&'a str> {
         match self {
             Self::Eventless(name, _, _) => *name,
@@ -208,7 +203,7 @@ impl<'a, D: StateTreeDomain> Trigger<'a, D> {
         }
     }
 
-    fn external_event(&self) -> Option<StateTreeEventRef<'a, D>> {
+    fn external_event(&self) -> Option<StateTreeEventRef<'a>> {
         match self {
             Self::Eventless(_, event, _) => *event,
             Self::External(_, event) => Some(*event),
@@ -297,19 +292,16 @@ pub enum DatamodelOperation {
 
 /// Mutable statechart state attached to one Bevy entity.
 ///
-/// `D` identifies an independent runtime domain, allowing an application to
-/// run simulation, UI, or dialogue trees in different schedules.
-///
 /// Only declared datamodel values survive reconstruction. Asset replacement
 /// restarts execution from the current initial configuration; activities,
 /// timers, history and queued work are never migrated.
 #[derive(Component, Debug)]
-#[component(on_discard = release_runtime_state::<D>)]
-#[component(on_insert = reconstruct_reinserted::<D>)]
-#[require(PendingStateTree<D>, StateTreeEventInbox<D>)]
-pub struct StateTreeInstance<D: StateTreeDomain> {
+#[component(on_discard = release_runtime_state)]
+#[component(on_insert = reconstruct_reinserted)]
+#[require(PendingStateTree, StateTreeEventInbox)]
+pub struct StateTreeInstance {
     definition: Handle<StateTreeDefinition>,
-    linked: Option<Arc<LinkedDefinition<D>>>,
+    linked: Option<Arc<LinkedDefinition>>,
     runtime: InstanceRuntime,
 }
 
@@ -334,12 +326,12 @@ struct InstanceRuntime {
 }
 
 /// Borrows definition ownership separately from the mutable execution state.
-struct Execution<'a, D: StateTreeDomain> {
-    linked: Option<&'a LinkedDefinition<D>>,
+struct Execution<'a> {
+    linked: Option<&'a LinkedDefinition>,
     runtime: &'a mut InstanceRuntime,
 }
 
-impl<D: StateTreeDomain> std::ops::Deref for Execution<'_, D> {
+impl std::ops::Deref for Execution<'_> {
     type Target = InstanceRuntime;
 
     fn deref(&self) -> &Self::Target {
@@ -347,7 +339,7 @@ impl<D: StateTreeDomain> std::ops::Deref for Execution<'_, D> {
     }
 }
 
-impl<D: StateTreeDomain> std::ops::DerefMut for Execution<'_, D> {
+impl std::ops::DerefMut for Execution<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.runtime
     }
@@ -359,61 +351,61 @@ struct ActivitySlot {
     active: bool,
 }
 
-fn reconstruct_reinserted<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
+fn reconstruct_reinserted(mut world: DeferredWorld, context: HookContext) {
     let fresh = world
-        .get::<StateTreeInstance<D>>(context.entity)
+        .get::<StateTreeInstance>(context.entity)
         .filter(|instance| instance.linked.is_some())
         .map(|instance| instance.reconstruct(instance.definition().clone()));
     if let Some(fresh) = fresh {
         *world
-            .get_mut::<StateTreeInstance<D>>(context.entity)
+            .get_mut::<StateTreeInstance>(context.entity)
             .expect("inserted instance exists") = fresh;
     }
 }
 
-fn release_runtime_state<D: StateTreeDomain>(mut world: DeferredWorld, context: HookContext) {
+fn release_runtime_state(mut world: DeferredWorld, context: HookContext) {
     let cancellations = world
-        .get::<StateTreeInstance<D>>(context.entity)
+        .get::<StateTreeInstance>(context.entity)
         .map(|instance| instance.active_activity_tokens(context.entity))
         .unwrap_or_default();
     let timer_tokens = world
-        .get::<StateTreeInstance<D>>(context.entity)
+        .get::<StateTreeInstance>(context.entity)
         .map(StateTreeInstance::armed_timer_tokens)
         .unwrap_or_default();
-    if let Some(mut instance) = world.get_mut::<StateTreeInstance<D>>(context.entity) {
+    if let Some(mut instance) = world.get_mut::<StateTreeInstance>(context.entity) {
         instance.invalidate_activity_tokens();
     }
     for (handler, token) in cancellations {
         handler.cancel_deferred(token, &mut world);
     }
-    if let Some(inbox) = world.get::<StateTreeActivityInbox<D>>(context.entity) {
+    if let Some(inbox) = world.get::<StateTreeActivityInbox>(context.entity) {
         inbox
             .outcomes
             .lock()
             .expect("state-tree activity inbox poisoned")
             .clear();
     }
-    if let Some(ingress) = world.get_resource::<crate::activity::StateTreeActivityIngress<D>>() {
+    if let Some(ingress) = world.get_resource::<crate::activity::StateTreeActivityIngress>() {
         ingress
             .dirty
             .lock()
             .expect("state-tree activity dirty set poisoned")
             .remove(&context.entity);
     }
-    if let Some(mut timers) = world.get_resource_mut::<StateTreeTimers<D>>() {
+    if let Some(mut timers) = world.get_resource_mut::<StateTreeTimers>() {
         timers.cancel_tokens(timer_tokens);
     }
-    if let Some(traces) = world.get_resource::<crate::StateTreeTraceLog<D>>() {
+    if let Some(traces) = world.get_resource::<crate::StateTreeTraceLog>() {
         traces.discard(context.entity);
     }
     let mut entity = world.entity_mut(context.entity);
-    let Some(mut inbox) = entity.get_mut::<StateTreeEventInbox<D>>() else {
+    let Some(mut inbox) = entity.get_mut::<StateTreeEventInbox>() else {
         return;
     };
     inbox.release_storage();
 }
 
-impl<D: StateTreeDomain> StateTreeInstance<D> {
+impl StateTreeInstance {
     /// Creates an instance waiting for its definition asset.
     pub fn new(definition: Handle<StateTreeDefinition>) -> Self {
         Self::new_with_initial_data(definition, StateTreeDataOverrides::default())
@@ -504,7 +496,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         self
     }
 
-    pub(crate) fn set_configuration(&mut self, configuration: Option<&StateTreeConfiguration<D>>) {
+    pub(crate) fn set_configuration(&mut self, configuration: Option<&StateTreeConfiguration>) {
         self.runtime.configuration =
             configuration.map(|configuration| configuration.values.clone());
     }
@@ -515,7 +507,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .is_some_and(|linked| Arc::ptr_eq(&linked.compiled, &definition.compiled))
     }
 
-    pub(crate) fn accepts_external_event(&self, event: StateTreeEventRef<'_, D>) -> bool {
+    pub(crate) fn accepts_external_event(&self, event: StateTreeEventRef<'_>) -> bool {
         self.runtime.status == InstanceStatus::Running
             && self
                 .linked
@@ -550,7 +542,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         &self,
         entity: Entity,
     ) -> Vec<(
-        Arc<dyn crate::activity::RegisteredActivity<D>>,
+        Arc<dyn crate::activity::RegisteredActivity>,
         ErasedActivityToken,
     )> {
         let Some(linked) = &self.linked else {
@@ -631,12 +623,9 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .and_then(|index| self.runtime.data.get(index))
     }
 
-    pub(crate) fn initialize<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-    >(
+    pub(crate) fn initialize<S: RuntimeEffectSink + ?Sized, A: RuntimeActivitySink + ?Sized>(
         &mut self,
-        linked: Arc<LinkedDefinition<D>>,
+        linked: Arc<LinkedDefinition>,
         microstep_limit: usize,
         entity: Entity,
         effects: &mut S,
@@ -653,12 +642,12 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn initialize_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
-        linked: Arc<LinkedDefinition<D>>,
+        linked: Arc<LinkedDefinition>,
         microstep_limit: usize,
         entity: Entity,
         effects: &mut S,
@@ -670,19 +659,16 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
             .initialize_traced(microstep_limit, entity, effects, activities, trace);
     }
 
-    fn execution(&mut self) -> Execution<'_, D> {
+    fn execution(&mut self) -> Execution<'_> {
         Execution {
             linked: self.linked.as_deref(),
             runtime: &mut self.runtime,
         }
     }
 
-    pub(crate) fn process_event<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-    >(
+    pub(crate) fn process_event<S: RuntimeEffectSink + ?Sized, A: RuntimeActivitySink + ?Sized>(
         &mut self,
-        event: StateTreeEventRef<'_, D>,
+        event: StateTreeEventRef<'_>,
         microstep_limit: usize,
         entity: Entity,
         effects: &mut S,
@@ -699,12 +685,12 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn process_event_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
-        event: StateTreeEventRef<'_, D>,
+        event: StateTreeEventRef<'_>,
         microstep_limit: usize,
         entity: Entity,
         effects: &mut S,
@@ -721,10 +707,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
         )
     }
 
-    pub(crate) fn process_timers<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
-    >(
+    pub(crate) fn process_timers<S: RuntimeEffectSink + ?Sized, A: RuntimeActivitySink + ?Sized>(
         &mut self,
         tokens: &[TimerToken],
         microstep_limit: usize,
@@ -743,8 +726,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn process_timers_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
@@ -766,8 +749,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn process_activity_outcome<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
     >(
         &mut self,
         outcome: crate::activity::ActivityOutcome,
@@ -787,8 +770,8 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 
     pub(crate) fn process_activity_outcome_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
@@ -810,7 +793,7 @@ impl<D: StateTreeDomain> StateTreeInstance<D> {
     }
 }
 
-impl<D: StateTreeDomain> Execution<'_, D> {
+impl Execution<'_> {
     fn is_state_active(&self, state: StateId) -> bool {
         self.active_states.as_deref().map_or_else(
             || self.active.contains(&state),
@@ -819,8 +802,8 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     fn initialize_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
@@ -939,12 +922,12 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     pub(crate) fn process_event_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
-        event: StateTreeEventRef<'_, D>,
+        event: StateTreeEventRef<'_>,
         microstep_limit: usize,
         entity: Entity,
         effects: &mut S,
@@ -1030,8 +1013,8 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     pub(crate) fn process_timers_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
@@ -1118,8 +1101,8 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     pub(crate) fn process_activity_outcome_traced<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
@@ -1213,14 +1196,14 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     fn stabilize<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
         limit: usize,
         mut transitions_taken: usize,
-        context: ActionContext<'_, D>,
+        context: ActionContext<'_>,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1302,7 +1285,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
 
     fn select_transition(
         &self,
-        trigger: Trigger<'_, D>,
+        trigger: Trigger<'_>,
     ) -> Result<Option<SelectedTransition>, RuntimeFault> {
         let Some(compiled) = self.linked.map(|linked| &linked.compiled) else {
             return Ok(None);
@@ -1346,10 +1329,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         Ok(None)
     }
 
-    fn select_step(
-        &mut self,
-        trigger: Trigger<'_, D>,
-    ) -> Result<Option<SelectedStep>, RuntimeFault> {
+    fn select_step(&mut self, trigger: Trigger<'_>) -> Result<Option<SelectedStep>, RuntimeFault> {
         if self.parallel.is_none() {
             return self
                 .select_transition(trigger)
@@ -1379,7 +1359,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
 
     fn select_parallel_transition_set(
         &self,
-        trigger: &Trigger<'_, D>,
+        trigger: &Trigger<'_>,
         runtime: &mut ParallelRuntime,
     ) -> Result<(), RuntimeFault> {
         runtime.selected.clear();
@@ -1483,13 +1463,13 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     fn take_selected_step<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
         selected: SelectedStep,
-        context: ActionContext<'_, D>,
+        context: ActionContext<'_>,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1514,13 +1494,13 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     fn take_parallel_transition_set<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
         runtime: &mut ParallelRuntime,
-        context: ActionContext<'_, D>,
+        context: ActionContext<'_>,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1679,13 +1659,13 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     fn take_transition<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
         selected: SelectedTransition,
-        context: ActionContext<'_, D>,
+        context: ActionContext<'_>,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1852,14 +1832,14 @@ impl<D: StateTreeDomain> Execution<'_, D> {
     }
 
     fn enter_state<
-        S: RuntimeEffectSink<D> + ?Sized,
-        A: RuntimeActivitySink<D> + ?Sized,
+        S: RuntimeEffectSink + ?Sized,
+        A: RuntimeActivitySink + ?Sized,
         T: StateTreeTrace + ?Sized,
     >(
         &mut self,
         compiled: &CompiledDefinition,
         entry: Entry,
-        context: ActionContext<'_, D>,
+        context: ActionContext<'_>,
         effects: &mut S,
         activities: &mut A,
         trace: &mut T,
@@ -1959,11 +1939,11 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         }
     }
 
-    fn start_state_activities<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+    fn start_state_activities<A: RuntimeActivitySink + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         compiled: &CompiledDefinition,
         state: StateId,
-        context: ActionContext<'_, D>,
+        context: ActionContext<'_>,
         sink: &mut A,
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
@@ -2046,7 +2026,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         Ok(())
     }
 
-    fn cancel_state_activities<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+    fn cancel_state_activities<A: RuntimeActivitySink + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         state: StateId,
         entity: Entity,
@@ -2087,7 +2067,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         }
     }
 
-    fn cancel_all_activities<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+    fn cancel_all_activities<A: RuntimeActivitySink + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         entity: Entity,
         sink: &mut A,
@@ -2099,7 +2079,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         }
     }
 
-    fn set_fault<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+    fn set_fault<A: RuntimeActivitySink + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         fault: RuntimeFault,
         entity: Entity,
@@ -2174,7 +2154,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         compiled: &CompiledDefinition,
         expression: ExpressionId,
         event_name: Option<&str>,
-        external_event: Option<StateTreeEventRef<'_, D>>,
+        external_event: Option<StateTreeEventRef<'_>>,
         event_data: Option<&LuauValue>,
     ) -> Result<bool, RuntimeFault> {
         match self.evaluate_expression(
@@ -2195,7 +2175,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         compiled: &CompiledDefinition,
         expression: ExpressionId,
         event_name: Option<&str>,
-        external_event: Option<StateTreeEventRef<'_, D>>,
+        external_event: Option<StateTreeEventRef<'_>>,
         explicit_event_data: Option<&LuauValue>,
         operation: DatamodelOperation,
     ) -> Result<LuauValue, RuntimeFault> {
@@ -2232,11 +2212,11 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         })
     }
 
-    fn execute_actions<S: RuntimeEffectSink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+    fn execute_actions<S: RuntimeEffectSink + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         compiled: &CompiledDefinition,
         actions: &[Action],
-        context: ActionContext<'_, D>,
+        context: ActionContext<'_>,
         effects: &mut S,
         trace: &mut T,
     ) -> Result<(), RuntimeFault> {
@@ -2322,7 +2302,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         Ok(())
     }
 
-    fn update_completion<A: RuntimeActivitySink<D> + ?Sized, T: StateTreeTrace + ?Sized>(
+    fn update_completion<A: RuntimeActivitySink + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         entity: Entity,
         activities: &mut A,
@@ -2363,10 +2343,7 @@ impl<D: StateTreeDomain> Execution<'_, D> {
         }
     }
 
-    fn update_parallel_completion<
-        A: RuntimeActivitySink<D> + ?Sized,
-        T: StateTreeTrace + ?Sized,
-    >(
+    fn update_parallel_completion<A: RuntimeActivitySink + ?Sized, T: StateTreeTrace + ?Sized>(
         &mut self,
         runtime: &mut ParallelRuntime,
         entity: Entity,
@@ -2725,14 +2702,8 @@ fn transitions_conflict(
     }
 }
 
-#[derive(Component, Debug)]
-pub(crate) struct PendingStateTree<D: StateTreeDomain>(PhantomData<fn() -> D>);
-
-impl<D: StateTreeDomain> Default for PendingStateTree<D> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
+#[derive(Component, Debug, Default)]
+pub(crate) struct PendingStateTree;
 
 #[cfg(test)]
 mod tests {
@@ -2744,24 +2715,18 @@ mod tests {
         test_harness::TestApp,
     };
 
-    struct TestDomain;
-
-    impl crate::StateTreeDomain for TestDomain {
-        const AUTHORED_NAME: &'static str = "test";
-
-        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
-            config.event::<Advance>().event::<Finish>();
-        }
+    fn configure_test(config: &mut crate::StateTreeConfig<'_>) {
+        config.event::<Advance>().event::<Finish>();
     }
 
     struct TestEvents;
 
     #[derive(Clone, Copy, bevy_ecs::event::Event, crate::StateTreeEvent)]
-    #[state_tree(domain = TestDomain, name = "advance", broadcast)]
+    #[state_tree(name = "advance", broadcast)]
     struct Advance;
 
     #[derive(Clone, Copy, bevy_ecs::event::Event, crate::StateTreeEvent)]
-    #[state_tree(domain = TestDomain, name = "finish", broadcast)]
+    #[state_tree(name = "finish", broadcast)]
     struct Finish;
 
     #[allow(non_upper_case_globals)]
@@ -2770,15 +2735,16 @@ mod tests {
         const Finish: Finish = Finish;
     }
 
-    fn instance(definition: &StateTreeDefinition, limit: usize) -> TestApp<TestDomain> {
+    fn instance(definition: &StateTreeDefinition, limit: usize) -> TestApp {
         TestApp::new(
+            configure_test,
             definition.clone(),
             NonZeroUsize::new(limit).expect("test limit is non-zero"),
         )
     }
 
-    fn process_event<E: crate::BroadcastStateTreeEvent<TestDomain> + Clone>(
-        instance: &mut TestApp<TestDomain>,
+    fn process_event<E: crate::BroadcastStateTreeEvent + Clone>(
+        instance: &mut TestApp,
         event: &E,
         limit: usize,
     ) -> bool {
@@ -2786,8 +2752,12 @@ mod tests {
         instance.process_event(event.clone())
     }
 
-    fn execution(definition: &StateTreeDefinition) -> TestApp<TestDomain> {
-        TestApp::new(definition.clone(), NonZeroUsize::new(64).unwrap())
+    fn execution(definition: &StateTreeDefinition) -> TestApp {
+        TestApp::new(
+            configure_test,
+            definition.clone(),
+            NonZeroUsize::new(64).unwrap(),
+        )
     }
 
     #[test]
@@ -2837,7 +2807,8 @@ mod tests {
         let initial_data =
             StateTreeDataOverrides::try_new([("seed", LuauValue::Integer(7))]).unwrap();
 
-        let execution = TestApp::<TestDomain>::with_initial_data(
+        let execution = TestApp::with_initial_data(
+            configure_test,
             definition,
             NonZeroUsize::new(64).unwrap(),
             initial_data,
@@ -2860,7 +2831,8 @@ mod tests {
         let definition = builder.build().unwrap();
         let initial_data =
             StateTreeDataOverrides::try_new([("value", LuauValue::Integer(9))]).unwrap();
-        let instance = TestApp::<TestDomain>::with_initial_data(
+        let instance = TestApp::with_initial_data(
+            configure_test,
             definition,
             NonZeroUsize::new(64).unwrap(),
             initial_data,
@@ -2886,7 +2858,8 @@ mod tests {
         ])
         .unwrap();
 
-        let execution = TestApp::<TestDomain>::with_initial_data(
+        let execution = TestApp::with_initial_data(
+            configure_test,
             definition,
             NonZeroUsize::new(64).unwrap(),
             initial_data,
@@ -2912,7 +2885,8 @@ mod tests {
         let initial_data =
             StateTreeDataOverrides::try_new([("value", LuauValue::Integer(1))]).unwrap();
 
-        let execution = TestApp::<TestDomain>::with_initial_data(
+        let execution = TestApp::with_initial_data(
+            configure_test,
             definition,
             NonZeroUsize::new(64).unwrap(),
             initial_data,
@@ -2927,22 +2901,16 @@ mod tests {
         assert_eq!(execution.active_state_names().next(), None);
     }
 
-    fn advance(execution: &mut TestApp<TestDomain>, duration: Duration) -> bool {
+    fn advance(execution: &mut TestApp, duration: Duration) -> bool {
         execution.advance_time(duration)
     }
 
-    struct DescriptorDomain;
-
-    impl StateTreeDomain for DescriptorDomain {
-        const AUTHORED_NAME: &'static str = "descriptor";
-
-        fn configure(config: &mut crate::StateTreeConfig<'_, Self>) {
-            config.event::<DescriptorEvents>();
-        }
+    fn configure_descriptor(config: &mut crate::StateTreeConfig<'_>) {
+        config.event::<DescriptorEvents>();
     }
 
     #[derive(Clone, Copy, bevy_ecs::event::Event, crate::StateTreeEvent)]
-    #[state_tree(domain = DescriptorDomain, name = "combat.damage", broadcast)]
+    #[state_tree(name = "combat.damage", broadcast)]
     struct DescriptorEvents;
 
     #[test]
@@ -2956,11 +2924,15 @@ mod tests {
             .add_transition(waiting, StateTreeTransition::on("combat").target(done))
             .unwrap();
         let definition = builder.build().unwrap();
-        let execution = TestApp::<DescriptorDomain>::new(definition, NonZeroUsize::new(8).unwrap());
+        let execution = TestApp::new(
+            configure_descriptor,
+            definition,
+            NonZeroUsize::new(8).unwrap(),
+        );
         let error = execution
             .app()
             .world()
-            .get::<crate::StateTreeLinkFailure<DescriptorDomain>>(execution.entity())
+            .get::<crate::StateTreeLinkFailure>(execution.entity())
             .unwrap()
             .error();
 
@@ -4242,7 +4214,7 @@ mod tests {
             .add_transition(second, StateTreeTransition::eventless().target(first))
             .unwrap();
         let definition = fault_builder.build().unwrap();
-        let mut fault = TestApp::<TestDomain>::new(definition, NonZeroUsize::new(2).unwrap());
+        let mut fault = TestApp::new(configure_test, definition, NonZeroUsize::new(2).unwrap());
 
         assert!(fault.advance_time(Duration::from_secs(1)));
         assert_eq!(

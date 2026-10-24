@@ -4,7 +4,7 @@ use bevy_ecs::prelude::*;
 pub(crate) use bevy_gigasaver::adapter::Apply;
 pub use bevy_gigasaver::{AppSaveExt as AppPersistenceExt, Checkpoint, Error};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidData(message.into())
@@ -14,7 +14,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     format: u32,
-    domains: BTreeMap<String, Vec<TreeSnapshot>>,
+    trees: Vec<TreeSnapshot>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,15 +98,8 @@ pub mod luau_value {
     }
 }
 
-pub(crate) trait DomainCodec: Send + Sync {
-    fn entities(&self, world: &mut World) -> Vec<Entity>;
-    fn capture(&self, world: &mut World) -> Result<Vec<TreeSnapshot>, Error>;
-    fn prepare(&self, world: &mut World, trees: &[TreeSnapshot]) -> Result<Apply, Error>;
-    fn clear(&self, world: &mut World);
-}
 #[derive(Resource, Default)]
 pub(crate) struct Registry {
-    pub domains: BTreeMap<String, Arc<dyn DomainCodec>>,
     pending_definitions: Vec<bevy_asset::Handle<crate::StateTreeDefinition>>,
 }
 pub(crate) fn ensure_adapter(app: &mut App) {
@@ -128,20 +121,12 @@ pub(crate) fn query_all<Q: bevy_ecs::query::QueryData, F: bevy_ecs::query::Query
 struct DatamodelAdapter;
 impl bevy_gigasaver::adapter::SaveAdapter for DatamodelAdapter {
     fn entities(&self, world: &mut World) -> Vec<Entity> {
-        let domains = world.resource::<Registry>().domains.clone();
-        domains
-            .values()
-            .flat_map(|codec| codec.entities(world))
-            .collect()
+        crate::plugin::persistence::entities(world)
     }
     fn capture(&self, world: &mut World) -> Result<bevy_gigasaver::adapter::Captured, Error> {
-        let domains = world.resource::<Registry>().domains.clone();
-        let domains = domains
-            .iter()
-            .map(|(key, codec)| Ok((key.clone(), codec.capture(world)?)))
-            .collect::<Result<_, Error>>()?;
+        let trees = crate::plugin::persistence::capture(world)?;
         Ok(bevy_gigasaver::adapter::Captured {
-            bytes: serde_json::to_vec(&Snapshot { format: 1, domains })?,
+            bytes: serde_json::to_vec(&Snapshot { format: 2, trees })?,
             context: Box::new(()),
         })
     }
@@ -150,54 +135,59 @@ impl bevy_gigasaver::adapter::SaveAdapter for DatamodelAdapter {
         world: &mut World,
         bytes: &[u8],
     ) -> Result<bevy_gigasaver::adapter::Prepared, Error> {
-        let snapshot: Snapshot = serde_json::from_slice(bytes)?;
-        if snapshot.format != 1 {
+        // Check the version before deserializing the payload so an old save
+        // produces an explicit format error, even though its shape differs.
+        #[derive(Deserialize)]
+        struct Version {
+            format: u32,
+        }
+        if serde_json::from_slice::<Version>(bytes)?.format != 2 {
             return Err(invalid("unsupported datamodel snapshot format"));
         }
-        let domains = world.resource::<Registry>().domains.clone();
-        if snapshot
-            .domains
-            .keys()
-            .any(|key| !domains.contains_key(key))
-        {
-            return Err(invalid("unregistered state-tree domain"));
-        }
+        let snapshot: Snapshot = serde_json::from_slice(bytes)?;
         if let Some(server) = world.get_resource::<bevy_asset::AssetServer>() {
             let handles = snapshot
-                .domains
-                .values()
-                .flatten()
+                .trees
+                .iter()
                 .filter_map(|tree| tree.path.as_ref())
                 .map(|path| server.load(path.clone()))
                 .collect();
             world.resource_mut::<Registry>().pending_definitions = handles;
         }
-        let mut apply = Vec::new();
-        for (key, codec) in &domains {
-            apply.push(codec.prepare(world, snapshot.domains.get(key).map_or(&[], Vec::as_slice))?);
-        }
+        let apply = crate::plugin::persistence::prepare(world, &snapshot.trees)?;
         let entities = snapshot
-            .domains
-            .values()
-            .flatten()
+            .trees
+            .iter()
             .map(|tree| loaded_entity(tree.owner))
             .collect::<Result<_, _>>()?;
         Ok(bevy_gigasaver::adapter::Prepared {
             entities,
             apply: Box::new(move |world| {
-                for apply in apply {
-                    apply(world);
-                }
+                apply(world);
                 world.resource_mut::<Registry>().pending_definitions.clear();
             }),
             context: Box::new(()),
         })
     }
     fn clear(&self, world: &mut World) {
-        let domains = world.resource::<Registry>().domains.clone();
-        for codec in domains.values() {
-            codec.clear(world);
-        }
+        crate::plugin::persistence::clear(world);
         world.resource_mut::<Registry>().pending_definitions.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_gigasaver::adapter::SaveAdapter;
+
+    #[test]
+    fn old_domain_grouped_snapshots_are_rejected_before_world_mutation() {
+        let mut world = World::new();
+        let result =
+            DatamodelAdapter.prepare(&mut world, br#"{"format":1,"domains":{"devices":[]}}"#);
+        assert!(
+            matches!(result, Err(Error::InvalidData(message)) if message == "unsupported datamodel snapshot format")
+        );
+        assert!(!world.contains_resource::<Registry>());
     }
 }

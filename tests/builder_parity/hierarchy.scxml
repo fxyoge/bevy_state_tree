@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" bst:domain="test" name="hierarchy" initial="parent">
+<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" name="hierarchy" initial="parent">
   <state id="parent">
     <onentry><raise event="parent.entered"/></onentry>
     <onexit><raise event="parent.exited"/></onexit>

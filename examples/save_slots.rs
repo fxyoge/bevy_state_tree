@@ -9,11 +9,7 @@ use bevy_state_tree::prelude::*;
 use bevy_time::TimePlugin;
 use serde::{Deserialize, Serialize};
 
-struct Simulation;
-impl StateTreeDomain for Simulation {
-    const AUTHORED_NAME: &'static str = "example";
-    fn configure(_: &mut StateTreeConfig<'_, Self>) {}
-}
+fn configure_simulation(_: &mut StateTreeConfig<'_>) {}
 
 #[bevy_gigasaver::save(resource, key = "example.score")]
 #[derive(Resource, Default, Serialize, Deserialize)]
@@ -24,7 +20,7 @@ struct Definition(Handle<StateTreeDefinition>);
 fn fresh(status: Res<SaveStatus>, definition: Res<Definition>, mut commands: Commands) {
     if status.load() == Some(&Ok(LoadOutcome::Missing)) {
         commands.insert_resource(Score(10));
-        commands.spawn(StateTreeInstance::<Simulation>::new(definition.0.clone()));
+        commands.spawn(StateTreeInstance::new(definition.0.clone()));
     }
 }
 
@@ -35,7 +31,7 @@ fn main() {
         TaskPoolPlugin::default(),
         TimePlugin,
         AssetPlugin::default(),
-        StateTreePlugin::<Simulation>::new(Update),
+        StateTreePlugin::new(Update).configure(configure_simulation),
     ))
     .insert_resource(SaveSettings { interval: None }) // Never; manual requests still commit.
     .add_plugins(SavePlugin::default())

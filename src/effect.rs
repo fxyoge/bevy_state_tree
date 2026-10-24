@@ -5,7 +5,7 @@ use bevy_ecs::{entity::Entity, message::Message, prelude::Resource, system::Para
 use thiserror::Error;
 
 use crate::{
-    LuauValue, StateTreeDomain,
+    LuauValue,
     event::{StateTreeEvent, StateTreeEventRef},
     protocol::RegistrationOrigin,
 };
@@ -43,15 +43,15 @@ impl StateTreeEffectError {
 }
 
 /// Immutable execution context supplied to a typed state-tree constructor.
-pub struct StateTreeContext<'a, D: StateTreeDomain> {
+pub struct StateTreeContext<'a> {
     pub(crate) entity: Entity,
     pub(crate) event_name: Option<&'a str>,
-    pub(crate) external_event: Option<StateTreeEventRef<'a, D>>,
+    pub(crate) external_event: Option<StateTreeEventRef<'a>>,
     pub(crate) data_names: &'a [Box<str>],
     pub(crate) data: &'a [LuauValue],
 }
 
-impl<'a, D: StateTreeDomain> StateTreeContext<'a, D> {
+impl<'a> StateTreeContext<'a> {
     /// Returns the Bevy entity running the tree.
     pub fn entity(&self) -> Entity {
         self.entity
@@ -63,12 +63,12 @@ impl<'a, D: StateTreeDomain> StateTreeContext<'a, D> {
     }
 
     /// Returns the current external event, if this action is executing in its context.
-    pub fn external_event(&self) -> Option<StateTreeEventRef<'a, D>> {
+    pub fn external_event(&self) -> Option<StateTreeEventRef<'a>> {
         self.external_event
     }
 
     /// Borrows the current external event when it contains `T`.
-    pub fn event<T: StateTreeEvent<D>>(&self) -> Option<&T> {
+    pub fn event<T: StateTreeEvent>(&self) -> Option<&T> {
         self.external_event
             .and_then(StateTreeEventRef::payload::<T>)
     }
@@ -83,9 +83,9 @@ impl<'a, D: StateTreeDomain> StateTreeContext<'a, D> {
 }
 
 /// Effect-specific alias for the shared immutable constructor context.
-pub type StateTreeEffectContext<'a, D> = StateTreeContext<'a, D>;
+pub type StateTreeEffectContext<'a> = StateTreeContext<'a>;
 /// Activity-specific alias for the shared immutable constructor context.
-pub type StateTreeActivityContext<'a, D> = StateTreeContext<'a, D>;
+pub type StateTreeActivityContext<'a> = StateTreeContext<'a>;
 
 /// Evaluated named arguments supplied to one typed state-tree constructor.
 #[derive(Debug, Default)]
@@ -227,30 +227,26 @@ impl FromStateTreeValue for f32 {
     }
 }
 
-pub(crate) trait RegisteredEffect<D: StateTreeDomain>: Send + Sync {
+pub(crate) trait RegisteredEffect: Send + Sync {
     #[cfg(feature = "persistence")]
     fn clear_messages(&self, world: &mut bevy_ecs::world::World);
     fn publish(
         &self,
-        context: StateTreeEffectContext<'_, D>,
+        context: StateTreeEffectContext<'_>,
         arguments: StateTreeEffectArgs,
         commands: &ParallelCommands<'_, '_>,
     ) -> Result<(), StateTreeEffectError>;
 }
 
-struct MessageEffect<D, M, F> {
+struct MessageEffect<M, F> {
     constructor: F,
-    marker: PhantomData<fn() -> (D, M)>,
+    marker: PhantomData<fn() -> M>,
 }
 
-impl<D, M, F> RegisteredEffect<D> for MessageEffect<D, M, F>
+impl<M, F> RegisteredEffect for MessageEffect<M, F>
 where
-    D: StateTreeDomain,
     M: Message,
-    F: Fn(
-            StateTreeEffectContext<'_, D>,
-            &mut StateTreeEffectArgs,
-        ) -> Result<M, StateTreeEffectError>
+    F: Fn(StateTreeEffectContext<'_>, &mut StateTreeEffectArgs) -> Result<M, StateTreeEffectError>
         + Send
         + Sync
         + 'static,
@@ -263,7 +259,7 @@ where
     }
     fn publish(
         &self,
-        context: StateTreeEffectContext<'_, D>,
+        context: StateTreeEffectContext<'_>,
         mut arguments: StateTreeEffectArgs,
         commands: &ParallelCommands<'_, '_>,
     ) -> Result<(), StateTreeEffectError> {
@@ -276,27 +272,18 @@ where
     }
 }
 
-#[derive(Resource)]
-pub(crate) struct StateTreeEffectRegistry<D: StateTreeDomain> {
-    effects: HashMap<Box<str>, Arc<dyn RegisteredEffect<D>>>,
+#[derive(Resource, Default)]
+pub(crate) struct StateTreeEffectRegistry {
+    effects: HashMap<Box<str>, Arc<dyn RegisteredEffect>>,
     origins: HashMap<Box<str>, RegistrationOrigin>,
 }
 
-impl<D: StateTreeDomain> Default for StateTreeEffectRegistry<D> {
-    fn default() -> Self {
-        Self {
-            effects: HashMap::new(),
-            origins: HashMap::new(),
-        }
-    }
-}
-
-impl<D: StateTreeDomain> StateTreeEffectRegistry<D> {
+impl StateTreeEffectRegistry {
     #[cfg(feature = "persistence")]
-    pub(crate) fn handlers_for_persistence(&self) -> Vec<Arc<dyn RegisteredEffect<D>>> {
+    pub(crate) fn handlers_for_persistence(&self) -> Vec<Arc<dyn RegisteredEffect>> {
         self.effects.values().cloned().collect()
     }
-    pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredEffect<D>>> {
+    pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn RegisteredEffect>> {
         self.effects.get(name).cloned()
     }
 
@@ -307,11 +294,11 @@ impl<D: StateTreeDomain> StateTreeEffectRegistry<D> {
     }
 }
 
-pub(crate) trait RuntimeEffectSink<D: StateTreeDomain> {
+pub(crate) trait RuntimeEffectSink {
     fn emit(
         &mut self,
-        handler: &Arc<dyn RegisteredEffect<D>>,
-        context: StateTreeEffectContext<'_, D>,
+        handler: &Arc<dyn RegisteredEffect>,
+        context: StateTreeEffectContext<'_>,
         arguments: StateTreeEffectArgs,
     ) -> Result<(), StateTreeEffectError>;
 }
@@ -320,29 +307,25 @@ pub(crate) struct BevyEffectSink<'a, 'w, 's> {
     pub commands: &'a ParallelCommands<'w, 's>,
 }
 
-impl<D: StateTreeDomain> RuntimeEffectSink<D> for BevyEffectSink<'_, '_, '_> {
+impl RuntimeEffectSink for BevyEffectSink<'_, '_, '_> {
     fn emit(
         &mut self,
-        handler: &Arc<dyn RegisteredEffect<D>>,
-        context: StateTreeEffectContext<'_, D>,
+        handler: &Arc<dyn RegisteredEffect>,
+        context: StateTreeEffectContext<'_>,
         arguments: StateTreeEffectArgs,
     ) -> Result<(), StateTreeEffectError> {
         handler.publish(context, arguments, self.commands)
     }
 }
 
-pub(crate) fn register_effect<D, M, F>(
+pub(crate) fn register_effect<M, F>(
     app: &mut App,
     name: Box<str>,
     constructor: F,
     origin: RegistrationOrigin,
 ) where
-    D: StateTreeDomain,
     M: Message,
-    F: Fn(
-            StateTreeEffectContext<'_, D>,
-            &mut StateTreeEffectArgs,
-        ) -> Result<M, StateTreeEffectError>
+    F: Fn(StateTreeEffectContext<'_>, &mut StateTreeEffectArgs) -> Result<M, StateTreeEffectError>
         + Send
         + Sync
         + 'static,
@@ -351,7 +334,7 @@ pub(crate) fn register_effect<D, M, F>(
     app.add_message::<M>();
     let registry = app
         .world_mut()
-        .resource_mut::<StateTreeEffectRegistry<D>>()
+        .resource_mut::<StateTreeEffectRegistry>()
         .into_inner();
     assert!(
         !registry.effects.contains_key(&name),
@@ -359,7 +342,7 @@ pub(crate) fn register_effect<D, M, F>(
     );
     registry.effects.insert(
         name.clone(),
-        Arc::new(MessageEffect::<D, M, F> {
+        Arc::new(MessageEffect::<M, F> {
             constructor,
             marker: PhantomData,
         }),
@@ -373,33 +356,25 @@ mod tests {
 
     use super::*;
 
-    struct TestDomain;
-
-    impl StateTreeDomain for TestDomain {
-        const AUTHORED_NAME: &'static str = "test";
-
-        fn configure(_config: &mut crate::StateTreeConfig<'_, Self>) {}
-    }
-
     #[derive(Message)]
     struct TestEffect;
 
     #[test]
     #[should_panic(expected = "state-tree effect `duplicate` was registered more than once")]
-    fn effect_names_must_be_unique_within_a_domain() {
+    fn effect_names_must_be_unique() {
         let mut app = App::new();
-        app.init_resource::<StateTreeEffectRegistry<TestDomain>>();
-        register_effect::<TestDomain, TestEffect, _>(
+        app.init_resource::<StateTreeEffectRegistry>();
+        register_effect::<TestEffect, _>(
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestEffect),
-            RegistrationOrigin::Domain,
+            RegistrationOrigin::Application,
         );
-        register_effect::<TestDomain, TestEffect, _>(
+        register_effect::<TestEffect, _>(
             &mut app,
             "duplicate".into(),
             |_context, _arguments| Ok(TestEffect),
-            RegistrationOrigin::Domain,
+            RegistrationOrigin::Application,
         );
     }
 }

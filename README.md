@@ -29,7 +29,6 @@ Author a state tree as an asset:
 ```xml
 <scxml xmlns="http://www.w3.org/2005/07/scxml"
        xmlns:bst="urn:bevy-state-tree"
-       bst:domain="enemy-ai"
        initial="idle">
   <state id="idle">
     <transition event="enemy.spotted" target="chasing"/>
@@ -40,43 +39,37 @@ Author a state tree as an asset:
 </scxml>
 ```
 
-Declare the typed events available to a domain:
+Declare the application's typed events:
 
 ```rust
 use bevy_ecs::prelude::*;
 use bevy_state_tree::prelude::*;
 
-struct EnemyAi;
-
 #[derive(EntityEvent, StateTreeEvent)]
-#[state_tree(domain = EnemyAi, name = "enemy.spotted")]
+#[state_tree(name = "enemy.spotted")]
 struct EnemySpotted {
     entity: Entity,
 }
 
 #[derive(EntityEvent, StateTreeEvent)]
-#[state_tree(domain = EnemyAi, name = "enemy.lost")]
+#[state_tree(name = "enemy.lost")]
 struct EnemyLost {
     entity: Entity,
 }
 
-impl StateTreeDomain for EnemyAi {
-    const AUTHORED_NAME: &'static str = "enemy-ai";
-
-    fn configure(config: &mut StateTreeConfig<'_, Self>) {
-        config.event::<EnemySpotted>();
-        config.event::<EnemyLost>();
-    }
+fn configure(config: &mut StateTreeConfig<'_>) {
+    config.event::<EnemySpotted>();
+    config.event::<EnemyLost>();
 }
 ```
 
 Install the plugin and attach the asset to an entity:
 
 ```rust
-app.add_plugins(StateTreePlugin::<EnemyAi>::new(FixedUpdate));
+app.add_plugins(StateTreePlugin::new(FixedUpdate).configure(configure));
 
 let definition = asset_server.load("state_trees/enemy.scxml");
-commands.spawn(StateTreeInstance::<EnemyAi>::new(definition));
+commands.spawn(StateTreeInstance::new(definition));
 ```
 
 State trees can emit typed messages for instantaneous effects and own typed activities for work that lives as long as a state, such as navigation, animation, or another state tree.

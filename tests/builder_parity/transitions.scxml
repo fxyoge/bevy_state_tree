@@ -1,4 +1,4 @@
-<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" bst:domain="test" name="transitions" datamodel="luau" initial="source">
+<scxml xmlns="http://www.w3.org/2005/07/scxml" xmlns:bst="urn:bevy-state-tree" name="transitions" datamodel="luau" initial="source">
   <datamodel>
     <data id="count" expr="0"/>
     <data id="last"/>

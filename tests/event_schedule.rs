@@ -10,18 +10,12 @@ use bevy_time::TimePlugin;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ScheduleLabel)]
 struct StateTreeUpdate;
 
-struct Simulation;
-
-impl StateTreeDomain for Simulation {
-    const AUTHORED_NAME: &'static str = "simulation";
-
-    fn configure(config: &mut StateTreeConfig<'_, Self>) {
-        config.event::<Advance>();
-    }
+fn configure_simulation(config: &mut StateTreeConfig<'_>) {
+    config.event::<Advance>();
 }
 
 #[derive(EntityEvent, StateTreeEvent)]
-#[state_tree(domain = Simulation, name = "advance")]
+#[state_tree(name = "advance")]
 struct Advance {
     entity: Entity,
 }
@@ -29,7 +23,7 @@ struct Advance {
 #[derive(Resource)]
 struct Target(Entity);
 
-fn queue_advance(target: Res<Target>, mut events: EntityStateTreeEventWriter<Simulation>) {
+fn queue_advance(target: Res<Target>, mut events: EntityStateTreeEventWriter) {
     assert!(events.write(Advance { entity: target.0 }));
 }
 
@@ -38,7 +32,7 @@ fn queue_set_delivers_on_a_single_threaded_schedule_without_task_pool_plugin() {
     let mut app = App::new();
     app.add_plugins((TimePlugin, AssetPlugin::default()))
         .init_schedule(StateTreeUpdate)
-        .add_plugins(StateTreePlugin::<Simulation>::new(StateTreeUpdate))
+        .add_plugins(StateTreePlugin::new(StateTreeUpdate).configure(configure_simulation))
         .add_systems(
             StateTreeUpdate,
             queue_advance.in_set(StateTreeSet::QueueEvents),
@@ -59,17 +53,14 @@ fn queue_set_delivers_on_a_single_threaded_schedule_without_task_pool_plugin() {
         .world_mut()
         .resource_mut::<Assets<StateTreeDefinition>>()
         .add(builder.build().unwrap());
-    let entity = app
-        .world_mut()
-        .spawn(StateTreeInstance::<Simulation>::new(handle))
-        .id();
+    let entity = app.world_mut().spawn(StateTreeInstance::new(handle)).id();
     app.insert_resource(Target(entity));
 
     app.world_mut().run_schedule(StateTreeUpdate);
 
     assert_eq!(
         app.world()
-            .get::<StateTreeInstance<Simulation>>(entity)
+            .get::<StateTreeInstance>(entity)
             .unwrap()
             .active_state_names()
             .last(),

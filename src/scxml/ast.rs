@@ -87,7 +87,6 @@ pub enum Capability {
 pub struct Scxml {
     pub span: Span,
     pub name: Option<String>,
-    pub domain: Option<String>,
     pub version: Option<String>,
     pub initial: Vec<String>,
     pub initial_raw: Option<String>,
