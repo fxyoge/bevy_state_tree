@@ -14,5 +14,9 @@
   "automergeType": "pr",
   "automergeStrategy": "rebase",
   "automerge": true,
-  "platformAutomerge": false
+  "platformAutomerge": false,
+  "packageRules": [{
+    "matchPackageNames": ["bevy_.+"],
+    "groupName": "Bevy"
+  }]
 }
