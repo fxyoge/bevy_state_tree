@@ -16,7 +16,7 @@
   "automerge": true,
   "platformAutomerge": false,
   "packageRules": [{
-    "matchPackageNames": ["bevy_.+"],
+    "matchDepNames": ["bevy_.+"],
     "groupName": "Bevy"
   }]
 }
