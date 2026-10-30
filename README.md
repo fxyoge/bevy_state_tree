@@ -69,5 +69,3 @@ State trees can emit typed messages for instantaneous effects and own typed acti
 ## Scope
 
 This crate implements a Bevy-oriented subset of SCXML. See the [SCXML support policy](SCXML.md) for supported semantics and intentional differences.
-
-`bevy_state_tree` currently targets Bevy 0.19 and is pre-1.0.
