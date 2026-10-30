@@ -19,7 +19,7 @@
     "matchPackageNames": ["/bevy_.+$/"],
     "groupName": "Bevy"
   }, {
-    "matchPackageNames": ["/https:\\/\\/github\\.com\\/fxyoge/"],
+    "matchPackageNames": ["/^https:\\/\\/github\\.com\\/fxyoge/"],
     "minimumReleaseAge": "0 days" // disable
   }]
 }
