@@ -423,6 +423,28 @@ impl EntityStateTreeEventWriter<'_, '_> {
     where
         M: EntityStateTreeEvent,
     {
+        self.enqueue(event, None)
+    }
+
+    /// Queues an event only for this activity run. Cancellation/reentry invalidates
+    /// it, including when an earlier queued event cancels the activity before delivery.
+    pub fn write_for_activity<A, M>(
+        &mut self,
+        token: crate::StateTreeActivityToken<A>,
+        event: M,
+    ) -> bool
+    where
+        A: crate::StateTreeActivity,
+        M: EntityStateTreeEvent,
+    {
+        self.enqueue(event, Some(token.erased()))
+    }
+
+    fn enqueue<M: EntityStateTreeEvent>(
+        &mut self,
+        event: M,
+        scope: Option<crate::activity::ErasedActivityToken>,
+    ) -> bool {
         let protocol = self.registry.protocol();
         let id = protocol
             .registered_event_id(std::any::TypeId::of::<M>())
@@ -436,6 +458,11 @@ impl EntityStateTreeEventWriter<'_, '_> {
         let Ok((instance, inbox)) = self.inboxes.get(target) else {
             return false;
         };
+        if scope
+            .is_some_and(|token| token.entity != target || !instance.accepts_activity_token(token))
+        {
+            return false;
+        }
         let instance = instance.runtime_id();
         let batch = self.ingress.batch.load(Ordering::Acquire);
         let mut events = inbox
@@ -453,7 +480,10 @@ impl EntityStateTreeEventWriter<'_, '_> {
         let broadcasts_before = events
             .last()
             .map_or(published, |event| event.broadcasts_before.max(published));
-        let event = QueuedStateTreeEvent::new(id, event);
+        let event = match scope {
+            Some(scope) => QueuedStateTreeEvent::for_activity(id, event, scope),
+            None => QueuedStateTreeEvent::new(id, event),
+        };
         events.push(EntityEventEntry {
             batch,
             instance,
@@ -971,6 +1001,13 @@ fn process_events(
                         );
                     }
                     broadcast_cursor += 1;
+                }
+                if event
+                    .event
+                    .activity_scope()
+                    .is_some_and(|token| !instance.accepts_activity_token(token))
+                {
+                    continue;
                 }
                 process_external_event(
                     &mut instance,

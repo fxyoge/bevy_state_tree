@@ -49,9 +49,44 @@ pub struct StateTreeContext<'a> {
     pub(crate) external_event: Option<StateTreeEventRef<'a>>,
     pub(crate) data_names: &'a [Box<str>],
     pub(crate) data: &'a [LuauValue],
+    pub(crate) activity_id: Option<&'a str>,
+    pub(crate) activities: Option<(
+        &'a crate::definition::LinkedDefinition,
+        &'a [crate::instance::ActivitySlot],
+        u64,
+    )>,
 }
 
 impl<'a> StateTreeContext<'a> {
+    /// Authored ID of the activity being constructed, absent for effects.
+    pub fn activity_id(&self) -> Option<&str> {
+        self.activity_id
+    }
+
+    /// Captures the current run of a named activity of type `A`.
+    /// A cancelled/reentered activity produces a different token.
+    pub fn activity_token<A: crate::StateTreeActivity>(
+        &self,
+        id: &str,
+    ) -> Option<crate::StateTreeActivityToken<A>> {
+        let (linked, slots, runtime_id) = self.activities?;
+        let activity = linked.activity_by_id(id)?;
+        let slot = slots.get(activity.index())?;
+        if !slot.active
+            || linked.activity(activity).payload_type_id() != std::any::TypeId::of::<A>()
+        {
+            return None;
+        }
+        Some(
+            crate::activity::ErasedActivityToken {
+                entity: self.entity,
+                runtime_id,
+                activity,
+                generation: slot.generation,
+            }
+            .typed(),
+        )
+    }
     /// Returns the Bevy entity running the tree.
     pub fn entity(&self) -> Entity {
         self.entity

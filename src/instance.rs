@@ -346,9 +346,9 @@ impl std::ops::DerefMut for Execution<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct ActivitySlot {
-    generation: u64,
-    active: bool,
+pub(crate) struct ActivitySlot {
+    pub(crate) generation: u64,
+    pub(crate) active: bool,
 }
 
 fn reconstruct_reinserted(mut world: DeferredWorld, context: HookContext) {
@@ -590,6 +590,14 @@ impl StateTreeInstance {
                 .as_deref()
                 .and_then(|activities| activities.get(token.activity.index()))
                 .is_some_and(|slot| slot.active && slot.generation == token.generation)
+    }
+
+    /// Whether this instance still owns the captured activity run.
+    pub fn is_activity_active<A: crate::StateTreeActivity>(
+        &self,
+        token: crate::StateTreeActivityToken<A>,
+    ) -> bool {
+        self.accepts_activity_token(token.erased())
     }
 
     /// Returns the current execution status.
@@ -2000,6 +2008,12 @@ impl Execution<'_> {
                 external_event: context.external_event,
                 data_names,
                 data,
+                activity_id: Some(&definition.id),
+                activities: Some((
+                    self.linked.expect("running instance is linked"),
+                    self.activities.as_deref().unwrap_or(&[]),
+                    self.runtime_id,
+                )),
             };
             if let Err(error) = sink.start(RuntimeActivityStart {
                 handler,
@@ -2284,6 +2298,12 @@ impl Execution<'_> {
                         external_event: context.external_event,
                         data_names,
                         data,
+                        activity_id: None,
+                        activities: Some((
+                            self.linked.expect("running instance is linked"),
+                            self.activities.as_deref().unwrap_or(&[]),
+                            self.runtime_id,
+                        )),
                     };
                     if let Err(error) =
                         effects.emit(handler, context, StateTreeEffectArgs::new(values))

@@ -453,6 +453,7 @@ pub(crate) struct LinkedDefinition {
     external_events: Box<[EventSet]>,
     effects: Box<[Arc<dyn RegisteredEffect>]>,
     activities: Box<[Arc<dyn RegisteredActivity>]>,
+    activity_ids: HashMap<Box<str>, ActivityId>,
 }
 
 impl std::fmt::Debug for LinkedDefinition {
@@ -535,11 +536,18 @@ impl LinkedDefinition {
                     .expect("activities were validated")
             })
             .collect();
+        let activity_ids = compiled
+            .activities
+            .iter()
+            .enumerate()
+            .map(|(index, activity)| (activity.id.clone(), ActivityId(index as u32)))
+            .collect();
         Ok(Self {
             compiled,
             external_events,
             effects: linked_effects,
             activities: linked_activities,
+            activity_ids,
         })
     }
 
@@ -553,6 +561,10 @@ impl LinkedDefinition {
 
     pub fn activity(&self, activity: ActivityId) -> &Arc<dyn RegisteredActivity> {
         &self.activities[activity.index()]
+    }
+
+    pub(crate) fn activity_by_id(&self, id: &str) -> Option<ActivityId> {
+        self.activity_ids.get(id).copied()
     }
 }
 

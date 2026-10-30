@@ -292,7 +292,7 @@ fn dispatch_global_binding<B>(
             {
                 continue;
             }
-            if events.write(run.binding.event(entity, &value)) {
+            if events.write_for_activity(run.token, run.binding.event(entity, &value)) {
                 run.needs_initial = false;
             }
         }

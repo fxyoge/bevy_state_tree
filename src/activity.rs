@@ -127,6 +127,7 @@ pub enum StateTreeActivityLifecycle<A: StateTreeActivity> {
 impl<A: StateTreeActivity> Message for StateTreeActivityLifecycle<A> {}
 
 pub(crate) trait RegisteredActivity: Send + Sync {
+    fn payload_type_id(&self) -> std::any::TypeId;
     #[cfg(feature = "persistence")]
     fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World);
     fn start(
@@ -206,6 +207,9 @@ where
         + Sync
         + 'static,
 {
+    fn payload_type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<A>()
+    }
     #[cfg(feature = "persistence")]
     fn discard_pending_starts(&self, world: &mut bevy_ecs::world::World) {
         let mut messages =

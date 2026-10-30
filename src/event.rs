@@ -271,10 +271,10 @@ impl StateTreeEventProtocol {
         event: &'a QueuedStateTreeEvent,
     ) -> StateTreeEventRef<'a> {
         let entry = self.entry(event.id);
-        debug_assert_eq!(entry.type_id, event.payload.as_ref().type_id());
+        debug_assert_eq!(entry.type_id, event.payload.as_any().type_id());
         StateTreeEventRef {
             entry,
-            payload: event.payload.as_ref(),
+            payload: event.payload.as_any(),
         }
     }
 
@@ -359,15 +359,57 @@ pub(crate) struct RegisteredEvent {
 /// queue stride and did not improve end-to-end entity-event throughput.
 pub(crate) struct QueuedStateTreeEvent {
     id: RegisteredEventId,
-    payload: Box<dyn Any + Send + Sync>,
+    payload: Box<dyn QueuedPayload>,
+}
+
+trait QueuedPayload: Send + Sync {
+    fn as_any(&self) -> &(dyn Any + Send + Sync);
+    fn activity_scope(&self) -> Option<crate::activity::ErasedActivityToken> {
+        None
+    }
+}
+
+struct PlainPayload<E>(E);
+impl<E: StateTreeEvent> QueuedPayload for PlainPayload<E> {
+    fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        &self.0
+    }
+}
+
+struct ActivityPayload<E> {
+    event: E,
+    scope: crate::activity::ErasedActivityToken,
+}
+impl<E: StateTreeEvent> QueuedPayload for ActivityPayload<E> {
+    fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        &self.event
+    }
+    fn activity_scope(&self) -> Option<crate::activity::ErasedActivityToken> {
+        Some(self.scope)
+    }
 }
 
 impl QueuedStateTreeEvent {
     pub(crate) fn new<E: StateTreeEvent>(id: RegisteredEventId, payload: E) -> Self {
         Self {
             id,
-            payload: Box::new(payload),
+            payload: Box::new(PlainPayload(payload)),
         }
+    }
+
+    pub(crate) fn for_activity<E: StateTreeEvent>(
+        id: RegisteredEventId,
+        event: E,
+        scope: crate::activity::ErasedActivityToken,
+    ) -> Self {
+        Self {
+            id,
+            payload: Box::new(ActivityPayload { event, scope }),
+        }
+    }
+
+    pub(crate) fn activity_scope(&self) -> Option<crate::activity::ErasedActivityToken> {
+        self.payload.activity_scope()
     }
 
     pub(crate) fn view<'a>(
@@ -379,7 +421,7 @@ impl QueuedStateTreeEvent {
 
     #[cfg(test)]
     pub(crate) fn project<T: StateTreeEvent>(&self) -> Option<&T> {
-        self.payload.downcast_ref()
+        self.payload.as_any().downcast_ref()
     }
 }
 
