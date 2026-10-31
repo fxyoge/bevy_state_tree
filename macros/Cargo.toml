@@ -13,7 +13,7 @@ proc-macro = true
 proc-macro2 = "1"
 proc-macro-crate = "3"
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 
 [lints.rust]
 unsafe_code = "forbid"
